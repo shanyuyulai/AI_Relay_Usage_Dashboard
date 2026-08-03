@@ -1,4 +1,27 @@
+# ===== Dependencies =====
 node_modules/
+
+# ===== Build output =====
 dist/
+# 构建调试时 genie-safe-delete 钩子会临时把 dist 改名成 dist_bak_<timestamp>
+dist_bak_*/
+
+# ===== Local tooling / project scratch data (WorkBuddy) =====
+# 含图标设计中间产物、预览图等，非源码，不应入库
+.workbuddy/
+
+# ===== Environment / secrets =====
+.env
+.env.*
+*.local
+
+# ===== Logs =====
 *.log
+
+# ===== TypeScript / Vite build cache =====
+*.tsbuildinfo
+*.cache/
+
+# ===== OS / editor =====
 .DS_Store
+Thumbs.db

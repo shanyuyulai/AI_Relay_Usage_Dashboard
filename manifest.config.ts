@@ -3,7 +3,7 @@ import { defineManifest } from '@crxjs/vite-plugin'
 // MV3 最小权限；站点域走 optional_host_permissions，添加时动态 request（P0-5）
 export default defineManifest({
   manifest_version: 3,
-  name: 'AI 中转站用量趋势',
+  name: 'AI 中转站用量看板',
   version: '0.1.0',
   description: '在一个侧边栏里统一查看多个 AI API 中转站的余额与真实用量',
   permissions: [
@@ -20,6 +20,8 @@ export default defineManifest({
     'unlimitedStorage', // 解除扩展自身 IndexedDB 配额顾虑，采集数据可长期保存
   ],
   icons: {
+    '16': 'icon-16.png',
+    '48': 'icon-48.png',
     '128': 'icon-128.png',
   },
   // 站点域不在此静态声明，由 ADD_SITE 时动态 chrome.permissions.request(origin + '/*')（P0-5 逐站授权）
@@ -31,7 +33,7 @@ export default defineManifest({
     type: 'module',
   },
   action: {
-    default_title: 'AI 中转站用量趋势',
+    default_title: 'AI 中转站用量看板',
   },
   side_panel: {
     default_path: 'src/sidepanel/index.html',

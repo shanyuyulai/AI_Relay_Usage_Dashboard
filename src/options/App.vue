@@ -21,6 +21,8 @@ const toastTimer = ref<number | null>(null)
 // 弹窗状态
 const formVisible = ref(false)
 const editingSite = ref<SiteConfig | null>(null)
+const helpVisible = ref(false)
+const helpUrl = chrome.runtime.getURL('README.html')
 
 // 文件导入
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -56,6 +58,10 @@ function openAdd() {
 function openEdit(site: SiteConfig) {
   editingSite.value = site
   formVisible.value = true
+}
+
+function openHelp() {
+  helpVisible.value = true
 }
 
 function onFormSubmitted() {
@@ -402,7 +408,8 @@ onMounted(async () => {
   <div class="opts-shell">
     <header class="topbar">
       <div class="logo">AI</div>
-      <span class="title">AI 中转站用量趋势 · 设置</span>
+      <span class="title">AI 中转站用量看板 · 设置</span>
+      <button class="btn help-btn" title="查看使用说明" @click="openHelp">❔ 使用说明</button>
     </header>
 
     <main class="opt-main">
@@ -602,6 +609,17 @@ onMounted(async () => {
           <button class="btn" @click="cancelImport">取消</button>
           <button class="btn primary" @click="confirmImport">授权并导入</button>
         </div>
+      </div>
+    </div>
+
+    <!-- 使用说明弹窗 -->
+    <div v-if="helpVisible" class="modal-mask help-mask" @click.self="helpVisible = false">
+      <div class="modal help-modal">
+        <div class="help-head">
+          <h3>使用说明</h3>
+          <button class="btn" @click="helpVisible = false">关闭</button>
+        </div>
+        <iframe :src="helpUrl" class="help-iframe" title="使用说明"></iframe>
       </div>
     </div>
 
@@ -1030,6 +1048,42 @@ body {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+/* 使用说明入口与弹窗 */
+.help-btn {
+  margin-left: auto;
+}
+.help-mask {
+  padding: 40px 0;
+}
+.help-modal {
+  width: 90vw;
+  max-width: 1000px;
+  height: 90vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+.help-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+.help-head h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.help-iframe {
+  flex: 1;
+  border: none;
+  width: 100%;
+  min-height: 0;
+  background: #fff;
 }
 
 .toast {

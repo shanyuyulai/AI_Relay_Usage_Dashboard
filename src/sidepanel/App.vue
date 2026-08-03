@@ -187,7 +187,7 @@ onUnmounted(() => {
     <header class="sp-head">
       <div class="logo">AI</div>
       <div class="head-info">
-        <div class="sp-title">AI 中转站用量趋势</div>
+        <div class="sp-title">AI 中转站用量看板</div>
         <div class="sp-sub">
           {{ siteCount }} 个站点 · {{ lastRefreshed || '—' }}{{ lastRefreshed ? ' 已刷新' : '' }}
         </div>

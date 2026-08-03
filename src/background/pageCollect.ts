@@ -289,7 +289,7 @@ async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notify
     // 提前醒目提醒：在开窗口之前发出（仅自动采集 notifyFlag=true 时），让用户有心理准备且不被打断
     if (notifyFlag) {
       await notify(
-        'AI 中转站用量趋势 即将后台采集',
+        'AI 中转站用量看板 即将后台采集',
         `将在「最小化后台窗口」中静默采集 ${missingByWindow.length} 个未打开的站点，不抢焦点、不打断你的操作，采完自动关闭。`,
         { requireInteraction: true, priority: 2 },
       )
@@ -369,14 +369,14 @@ async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notify
     const expired = results.filter((r) => r.errorKind === 'AUTH_EXPIRED')
     if (expired.length) {
       const names = expired.map((r) => sites.find((s) => s.id === r.siteId)?.name ?? r.siteId)
-      await notify('AI 中转站用量趋势 · 会话过期', `以下站点登录态已失效，请在浏览器打开并登录后继续：${names.join('、')}`)
+      await notify('AI 中转站用量看板 · 会话过期', `以下站点登录态已失效，请在浏览器打开并登录后继续：${names.join('、')}`)
     }
     if (labEnabled) {
       const labFailed = results.filter((r) => !r.ok && (r.message ?? '').includes('实验室'))
       if (labFailed.length) {
         const names = labFailed.map((r) => sites.find((s) => s.id === r.siteId)?.name ?? r.siteId)
         await notify(
-          'AI 中转站用量趋势 · 实验室采集提示',
+          'AI 中转站用量看板 · 实验室采集提示',
           `以下站点零标签采集失败（多为 CORS / 需 Token）：${names.join('、')}；可在设置关闭实验室选项或保持标签登录`,
         )
       }
