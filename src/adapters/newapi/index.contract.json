@@ -1,0 +1,11 @@
+{
+  "sample": {
+    "id": 1,
+    "username": "user_***",
+    "quota": 5,
+    "used_quota": 1.2,
+    "role": 1,
+    "status": 1
+  },
+  "requiredFields": ["id", "quota", "used_quota"]
+}

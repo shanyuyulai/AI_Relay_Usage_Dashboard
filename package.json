@@ -1,0 +1,27 @@
+{
+  "name": "ai-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI 中转站用量趋势 — Chrome MV3 侧边栏插件",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.4.21",
+    "dexie": "^4.0.8",
+    "chart.js": "^4.4.3",
+    "pinia": "^2.1.7"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.4",
+    "@crxjs/vite-plugin": "^2.0.0-beta.0",
+    "@types/chrome": "^0.0.268",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.11",
+    "vue-tsc": "^2.0.19"
+  }
+}
