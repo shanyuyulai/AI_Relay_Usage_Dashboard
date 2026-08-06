@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
-import type { ExportConfig } from '../core/messaging/protocol'
+import type { ExportConfig, ImportResult } from '../core/messaging/protocol'
 import type { SiteConfig, SiteStatus, CustomCaptureRecord, DiagnosticEntry } from '../shared/types'
 import type { ProbeResult } from '../content/probe'
 import type { NetDiscoveryRequest } from '../background/netDiscovery'
@@ -30,18 +30,6 @@ function safeUiError(_e: unknown): string {
 
 // 固定的本地错误文案（仅用于明确的本地场景，避免 catch 块写异常原文）
 const ERR_INVALID_CONFIG = '配置文件格式无效'
-
-// 导入结果结构（与 SW IMPORT_CONFIG 返回一致）
-interface ImportSkip {
-  name: string
-  reason: string
-}
-interface ImportResult {
-  imported: number
-  updated: number
-  skipped: ImportSkip[]
-  fatalError?: string
-}
 
 // 仅配置界面通知：SW 经 runtime 消息推送页内提示（配置界面未打开则无接收端、自动丢弃）
 function onOptionsNotify(msg: { type?: string; title?: string; message?: string }, _sender: unknown, _sendResponse: unknown) {
@@ -227,10 +215,10 @@ async function exportConfig() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `ai-hub-config-${new Date().toISOString().slice(0, 10)}.json`
+    a.download = `ai-hub-backup-${new Date().toISOString().slice(0, 10)}.json`
     a.click()
     URL.revokeObjectURL(url)
-    showToast('配置已导出（不含任何凭证）')
+    showToast(`全量备份已导出（v${config.version}，${config.sites.length} 个站点，不含任何凭证）`)
   } catch (e) {
     showToast(safeUiError(e))
   }
@@ -270,26 +258,11 @@ async function handleFile(e: Event) {
   }
 }
 
-// 发送 IMPORT_CONFIG 并支持一次重试：应对 MV3 SW 冷启动首条消息偶发被丢（快速失败→重试即可到达）
-function isRetryableImportError(error: unknown): boolean {
-  return error instanceof MessagingError && ['TIMEOUT', 'EMPTY', 'RUNTIME'].includes(error.kind)
-}
-
-async function sendImportWithRetry(cfg: ExportConfig, attempt = 1): Promise<ImportResult> {
-  console.info('[AI Relay] 导入：发送 IMPORT_CONFIG（第 ' + attempt + ' 次，超时 12s）')
-  try {
-    return await send<ImportResult>('IMPORT_CONFIG', { config: cfg }, 12_000)
-  } catch (e) {
-    if (attempt < 2 && isRetryableImportError(e)) {
-      console.warn(
-        '[AI Relay] 导入：首次发送未收到响应，300ms 后重试',
-        e instanceof MessagingError ? e.kind : String(e),
-      )
-      await new Promise((r) => setTimeout(r, 300))
-      return sendImportWithRetry(cfg, attempt + 1)
-    }
-    throw e
-  }
+// 发送 IMPORT_CONFIG（超时放宽到 60s，应对全量还原的大事务）。
+// 不自动重试：导入为单事务原子且幂等，超时后用户可手动重导；自动重试会触发重复事务（虽幂等但浪费）。
+async function sendImport(cfg: ExportConfig): Promise<ImportResult> {
+  console.info('[AI Relay] 导入：发送 IMPORT_CONFIG（超时 60s）')
+  return send<ImportResult>('IMPORT_CONFIG', { config: cfg }, 60_000)
 }
 
 async function confirmImport() {
@@ -309,7 +282,7 @@ async function confirmImport() {
         return
       }
     }
-    const res = await sendImportWithRetry(cfg)
+    const res = await sendImport(cfg)
     console.info('[AI Relay] 导入：SW 返回', res)
     if (res.fatalError) {
       showToast(`导入失败：${res.fatalError}`)
@@ -324,6 +297,14 @@ async function confirmImport() {
       const reasons = res.skipped.map((s) => `${s.name}（${s.reason}）`).join('、')
       msg += `；跳过 ${res.skipped.length} 个：${reasons}`
     }
+    // v2 全量：补充各表写入统计
+    if (res.data && Object.keys(res.data).length) {
+      const dataParts = Object.entries(res.data)
+        .filter(([, v]) => v.written > 0 || v.orphanSkipped > 0)
+        .map(([k, v]) => `${k}:${v.written} 条写入${v.orphanSkipped ? `、${v.orphanSkipped} 条跳过` : ''}`)
+      if (dataParts.length) msg += `；数据 ${dataParts.join('，')}`
+    }
+    msg += '。导入后请重新登录各站点以恢复采集。'
     showToast(msg)
     pendingImport.value = null
     await loadSites()
@@ -539,13 +520,13 @@ onUnmounted(() => {
       <template v-if="activeTab === 'settings'">
         <h2>站点管理</h2>
       <div class="desc">
-        每个站点独立授权、独立凭证，删除站点时同步撤销其域名权限。导出的配置默认不含任何凭证。
+        每个站点独立授权、独立凭证，删除站点时同步撤销其域名权限。导出的全量备份（站点 + 采集数据 + 设置）默认不含任何凭证。
       </div>
 
       <div class="toolbar">
         <button class="btn primary" @click="openAdd">＋ 添加站点</button>
-        <button class="btn" @click="exportConfig">⇪ 导出配置</button>
-        <button class="btn" @click="triggerImport">⇩ 导入配置</button>
+        <button class="btn" @click="exportConfig">⇪ 全量备份</button>
+        <button class="btn" @click="triggerImport">⇩ 导入备份</button>
         <div class="theme-switch">
           <button :class="{ on: theme === 'light' }" title="白天" @click="setTheme('light')">☀️</button>
           <button :class="{ on: theme === 'dark' }" title="黑夜" @click="setTheme('dark')">🌙</button>
@@ -732,16 +713,17 @@ onUnmounted(() => {
     <!-- 待导入确认（拆两步：选文件→暂存→用户点按钮→request 权限） -->
     <div v-if="pendingImport" class="modal-mask" @click.self="cancelImport">
       <div class="modal">
-        <h3>确认导入配置</h3>
+        <h3>确认导入备份</h3>
         <div class="import-preview">
           检测到 {{ pendingImport.sites.length }} 个站点，涉及
           {{ pendingOrigins.length }} 个域名：
           <ul>
             <li v-for="o in pendingOrigins" :key="o">{{ o }}</li>
           </ul>
+          <p v-if="pendingImport.version === 2" class="ver-note">全量备份（v2）：将一并还原各站点的采集数据（余额历史 / 每日用量 / 用量明细 / 诊断）与设置。</p>
         </div>
         <div class="steps">
-          点击「授权并导入」后，Chrome 将弹出权限确认对话框。仅授权的站点会被导入，未授权或无效的站点将自动跳过。
+          点击「授权并导入」后，Chrome 将弹出权限确认对话框。仅授权的站点会被导入，未授权或无效的站点将自动跳过。导入后各站点需重新登录以恢复采集。
         </div>
         <div class="foot">
           <button class="btn" @click="cancelImport">取消</button>

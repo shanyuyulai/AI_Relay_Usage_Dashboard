@@ -1,4 +1,4 @@
-import type { Snapshot, SiteConfig, SiteStatus, DailyStat, CustomCaptureRecord, DiagnosticEntry, UsageRecordBatch } from '../../shared/types'
+import type { Snapshot, SiteConfig, SiteStatus, DailyStat, CustomCaptureRecord, DiagnosticEntry, UsageRecordBatch, SettingsRow } from '../../shared/types'
 
 /** 消息信封：所有跨上下文通信统一结构，requestId 全链路透传。 */
 export interface Req<P = unknown> {
@@ -52,11 +52,44 @@ export interface SiteDetailData {
   dailyStats: unknown[]
 }
 
-/** 导出配置：仅站点配置，零凭证/私密（红线：导出剔除 token）。 */
+/**
+ * 导出配置（备份文件格式）。
+ * - version=1：仅站点配置（旧格式，零凭证）。
+ * - version=2：全量备份（站点 + 采集数据 + 设置），见 `tables`。
+ * 红线：绝不导出 credentials（无 secret）/ usageCache（派生）。
+ */
 export interface ExportConfig {
   version: number
   exportedAt: number
+  appVersion?: string
+  schemaVersion?: number
   sites: SiteConfig[]
+  /** v2 全量数据；缺失时为 v1（仅站点）。 */
+  tables?: ExportTables
+}
+
+/** v2 全量备份的 7 类业务表（credentials/usageCache 故意缺失）。 */
+export interface ExportTables {
+  snapshots: Snapshot[]
+  dailyStats: DailyStat[]
+  captures: CustomCaptureRecord[]
+  diagnostics: DiagnosticEntry[]
+  usageRecords: UsageRecordBatch[]
+  settings: SettingsRow[]
+}
+
+/** 导入结果：按原因拆分的摘要（GPT P0-导入摘要）。 */
+export interface ImportResult {
+  imported: number
+  updated: number
+  skipped: { name: string; reason: string }[]
+  /** 按原因归类的跳过计数。 */
+  skippedByReason: Record<string, number>
+  /** 各表写入统计：written=实际写入/幂等覆盖数，orphanSkipped=因站点未导入而跳过的关联行，idRecomputed=重算主键数。 */
+  data: Record<string, { written: number; orphanSkipped: number; idRecomputed: number }>
+  /** 本次导入操作标识（用于进度查询/审计）。 */
+  operationId: string
+  fatalError?: string
 }
 
 // 入参载荷类型

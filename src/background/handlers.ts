@@ -20,6 +20,8 @@ import {
   setClickBehavior,
   usageRecordsRepo,
   usageCache,
+  exportAll,
+  importAll,
 } from '../storage'
 import { applyCorsRules, refreshCorsRules } from './corsRules'
 import { applyIconBehavior } from './popupBehavior'
@@ -34,6 +36,7 @@ import type {
   DashboardData,
   SiteDetailData,
   ExportConfig,
+  ImportResult,
   AddSitePayload,
   UpdateSitePayload,
   DeleteSitePayload,
@@ -785,153 +788,28 @@ export const handlers: Record<string, Handler> = {
     return { deleted: counts }
   },
 
-  // 导出配置：仅站点配置，零凭证/私密（红线）
+  // 全量备份导出（v2：站点 + 采集数据 + 设置）；零凭证/私密（红线 P0-2 排除 credentials/usageCache）
   async EXPORT_CONFIG() {
-    const sites = await siteRepo.list()
-    const config: ExportConfig = {
-      version: 1,
-      exportedAt: Date.now(),
-      sites: sites.map((s) => ({ ...s })),
-    }
-    return config
+    return exportAll()
   },
 
-  // 导入配置：UI 侧已申请权限，SW 逐站校验 + 按 origin 幂等 upsert（P0-2 不信任导入文件字段）。
-  // 任何单站异常都被捕获并计入 skipped，绝不整批抛出 → UI 可给出「成功 N / 更新 M / 跳过 K（原因）」，
-  // 而非笼统的「操作失败」。整函数再包一层 try/catch，DB 致命错误返回 fatalError 引导用户修复。
-  async IMPORT_CONFIG(payload: { config: ExportConfig }): Promise<{
-    imported: number
-    updated: number
-    skipped: { name: string; reason: string }[]
-    fatalError?: string
-  }> {
-    const sites = payload.config?.sites ?? []
-    console.info('[AI Relay] IMPORT_CONFIG 入口', {
-      count: sites.length,
-      adapters: sites.map((s) => s.adapter),
-    })
-
-    // 内部执行体（含逐步日志），外层 try 捕获 DB 致命错误
-    const run = async (): Promise<{
-      imported: number
-      updated: number
-      skipped: { name: string; reason: string }[]
-      fatalError?: string
-    }> => {
-      let added = 0
-      let updated = 0
-      const skipped: { name: string; reason: string }[] = []
-      try {
-        console.info('[AI Relay] 导入：读取现有站点（siteRepo.list）...')
-        const existing = await siteRepo.list()
-        console.info('[AI Relay] 导入：现有站点读取完成', { count: existing.length })
-        const byOrigin = new Map(existing.map((s) => [s.origin, s]))
-        for (const s of sites) {
-          const name = s.name || normalizeOrigin(s.baseUrl)
-          try {
-            if (!registry.has(s.adapter)) {
-              console.warn('[AI Relay] 导入：跳过未知适配器', { name, adapter: s.adapter })
-              skipped.push({ name, reason: '未知适配器类型' })
-              continue
-            }
-            const origin = normalizeOrigin(s.baseUrl)
-            console.info('[AI Relay] 导入：权限检查', { name, origin })
-            const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] })
-            console.info('[AI Relay] 导入：权限检查结果', { name, origin, granted })
-            if (!granted) {
-              console.warn('[AI Relay] 导入：缺 host 权限', { name, origin })
-              skipped.push({ name, reason: '缺少 host 权限（请在导入前允许该域名）' })
-              continue
-            }
-            const found = byOrigin.get(origin)
-            if (found) {
-              await siteRepo.update(found.id, {
-                name: s.name || found.name,
-                baseUrl: s.baseUrl,
-                origin,
-                adapter: s.adapter,
-                color: s.color || found.color,
-                enabled: s.enabled ?? found.enabled,
-                currency: s.currency || found.currency || 'USD',
-                lastStatus: 'unknown',
-                lastCollectAt: null,
-              })
-              await credentialRepo.setAuthorized(found.id, false)
-              updated += 1
-              console.info('[AI Relay] 导入：更新站点完成', { name, origin })
-            } else {
-              // 白名单构造 + 生成新 ID（不信任导入文件的 id，防冲突/伪造）
-              const site: SiteConfig = {
-                id: crypto.randomUUID(),
-                name: s.name || origin,
-                baseUrl: s.baseUrl,
-                origin,
-                adapter: s.adapter,
-                color: s.color || COLORS[Math.floor(Math.random() * COLORS.length)],
-                enabled: s.enabled ?? true,
-                order: await siteRepo.nextOrder(),
-                createdAt: Date.now(),
-                lastCollectAt: null,
-                lastStatus: 'unknown',
-                currency: s.currency || 'USD',
-              }
-              console.info('[AI Relay] 导入：写入新站点（siteRepo.add）', { name, origin })
-              await siteRepo.add(site)
-              await credentialRepo.setAuthorized(site.id, false)
-              added += 1
-              console.info('[AI Relay] 导入：新增站点完成', { name, origin, id: site.id })
-            }
-          } catch (e) {
-            console.error('[AI Relay] 导入：单站写入异常', {
-              name,
-              error: e instanceof Error ? e.message : String(e),
-            })
-            skipped.push({
-              name,
-              reason: '存储写入失败：' + (e instanceof Error ? e.message : String(e)).slice(0, 60),
-            })
-          }
-        }
-        console.info('[AI Relay] IMPORT_CONFIG 内部完成', { imported: added, updated, skipped: skipped.length })
-        return { imported: added, updated, skipped }
-      } catch (e) {
-        console.error('[AI Relay] IMPORT_CONFIG 致命错误', e)
-        return {
-          imported: 0,
-          updated: 0,
-          skipped,
-          fatalError:
-            '存储读写异常，请尝试在扩展管理页「清除站点数据」后重新导入（或重新加载扩展）',
-        }
+  // 全量还原（v1 仅站点 / v2 含采集数据 + 设置）。委托 backup.importAll：
+  // 跨安装 siteId 映射 + recordId 幂等 + 单事务原子（删除 10s 看门狗，杜绝超时误判/并发竞态）。
+  async IMPORT_CONFIG(payload: { config: ExportConfig }): Promise<ImportResult> {
+    try {
+      return await importAll(payload.config)
+    } catch (e) {
+      console.error('[AI Relay] IMPORT_CONFIG 致命错误', e)
+      return {
+        imported: 0,
+        updated: 0,
+        skipped: [],
+        skippedByReason: {},
+        data: {},
+        operationId: crypto.randomUUID(),
+        fatalError:
+          '存储读写异常，请尝试在扩展管理页「清除站点数据」后重新导入（或重新加载扩展）',
       }
     }
-
-    // 看门狗：若 IndexedDB 卡死导致 30s 静默超时，10s 即给出明确结论
-    const watchdog = new Promise<{
-      imported: number
-      updated: number
-      skipped: { name: string; reason: string }[]
-      fatalError?: string
-    }>((resolve) => {
-      setTimeout(() => {
-        console.error('[AI Relay] IMPORT_CONFIG 看门狗触发：处理超过 10s，疑似 IndexedDB 卡死')
-        resolve({
-          imported: 0,
-          updated: 0,
-          skipped: [],
-          fatalError:
-            '导入处理超时（疑似本地数据库 IndexedDB 卡死）。建议：① 扩展管理页「清除站点数据」→ 重新加载扩展 → 再导入；② 或直接卸载重装本扩展后重新添加站点。',
-        })
-      }, 10_000)
-    })
-
-    const result = await Promise.race([run(), watchdog])
-    console.info('[AI Relay] IMPORT_CONFIG 结束（返回给 Options）', {
-      imported: result.imported,
-      updated: result.updated,
-      skipped: result.skipped.length,
-      hasFatal: !!result.fatalError,
-    })
-    return result
   },
 }

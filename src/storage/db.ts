@@ -122,6 +122,35 @@ export class AIHubDB extends Dexie {
             Object.assign(b, outBatch)
           })
       })
+
+    // v5：新增 snapshots/diagnostics 的 recordId 不可变幂等键（唯一索引），用于跨安装备份还原。
+    //   存量数据在 upgrade 中补齐 recordId（缺失则生成 crypto.randomUUID）。
+    this.version(5)
+      .stores({
+        sites: 'id, enabled, order',
+        snapshots: '++id, siteId, takenAt, &recordId',
+        dailyStats: 'id, &[siteId+date], siteId, date',
+        credentials: 'siteId',
+        settings: 'key',
+        captures: 'id, siteId, capturedAt',
+        diagnostics: '++id, siteId, at, &recordId',
+        usageRecords: 'id, siteId, date, takenAt',
+        usageCache: 'cacheKey, siteId, kind, [siteId+kind], accessedAt, fromDate, toDate',
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('snapshots')
+          .toCollection()
+          .modify((s: Record<string, unknown>) => {
+            if (!s.recordId) s.recordId = crypto.randomUUID()
+          })
+        await tx
+          .table('diagnostics')
+          .toCollection()
+          .modify((d: Record<string, unknown>) => {
+            if (!d.recordId) d.recordId = crypto.randomUUID()
+          })
+      })
   }
 }
 

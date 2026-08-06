@@ -12,7 +12,9 @@ import type { DiagnosticEntry } from '../shared/types'
 class DiagnosticsRepo {
   /** 写入一条诊断日志。 */
   async put(entry: Omit<DiagnosticEntry, 'id'>): Promise<void> {
-    await db.diagnostics.add(entry as DiagnosticEntry)
+    const rec = entry as DiagnosticEntry
+    if (!rec.recordId) rec.recordId = crypto.randomUUID()
+    await db.diagnostics.add(rec)
   }
 
   /** 按站点查询（倒序，最新的在前）。 */

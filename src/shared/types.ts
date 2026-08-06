@@ -75,6 +75,8 @@ export type DataQuality = 'verified' | 'partial' | 'unknown'
  */
 export interface Snapshot {
   id?: number
+  /** 不可变幂等键（P0：跨安装还原去重用）。缺失时由写入层/导出层补齐 crypto.randomUUID()。 */
+  recordId?: string
   siteId: string
   takenAt: number
   balance: number | null
@@ -179,6 +181,8 @@ export interface CustomCaptureRecord {
  */
 export interface DiagnosticEntry {
   id?: number // 自增主键
+  /** 不可变幂等键（P0：跨安装还原去重用）。缺失时由写入层/导出层补齐 crypto.randomUUID()。 */
+  recordId?: string
   siteId: string
   /** 采集时间戳 */
   at: number

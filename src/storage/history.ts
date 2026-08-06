@@ -5,6 +5,7 @@ import { dateKey } from '../shared/util'
 // 原始快照仓储
 export const snapshotRepo = {
   async append(snap: Snapshot): Promise<number> {
+    if (!snap.recordId) snap.recordId = crypto.randomUUID()
     return db.snapshots.add(snap)
   },
 
