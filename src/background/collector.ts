@@ -17,6 +17,8 @@ export interface CollectResult {
   errorKind?: CollectErrorKind
   message?: string
   snapshot?: Snapshot
+  /** 当日用量明细 API 是否成功请求并写入本地记录。 */
+  usageApiOk?: boolean
 }
 
 const MAX_RETRIES = 2 // NETWORK/超时指数退避重试上限（P1-2）

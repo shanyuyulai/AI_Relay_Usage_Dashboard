@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
 import type { ExportConfig } from '../core/messaging/protocol'
 import type { SiteConfig, SiteStatus, CustomCaptureRecord, DiagnosticEntry } from '../shared/types'
@@ -8,15 +8,73 @@ import type { NetDiscoveryRequest } from '../background/netDiscovery'
 import { normalizeOrigin } from '../shared/util'
 import { ensureOriginPermission } from '../shared/permissions'
 import { getThemeMode, setThemeMode, type ThemeMode } from '../shared/theme'
+import { getLabShowDashboard } from '../storage'
 import { registry } from '../adapters'
 import { statusBadge } from '../shared/format'
 import SiteForm from './components/SiteForm.vue'
 import DataExplorer from './components/DataExplorer.vue'
+import UsageDashboard from './components/UsageDashboard.vue'
+
+// GPT P0：跨层错误白名单——绝不透传任何 Error.message 原文
+// 异常消息可能包含 URL/响应片段/认证细节/内部实现，统一映射为固定中文文案。
+// 即使是本地 Error（如 JSON 解析失败抛的 Error）也走白名单，避免引入未来字段携带敏感信息。
+function safeUiError(_e: unknown): string {
+  if (_e instanceof MessagingError) {
+    if (_e.kind === 'TIMEOUT') return '请求超时，请稍后重试'
+    if (_e.kind === 'NO_HANDLER') return '当前操作不可用'
+    if (_e.kind === 'BAD_REQUEST') return '请求参数无效'
+  }
+  // 本地或跨层错误一律回退到通用文案；导入/解析错误的固定文案由调用方在 catch 旁显式传入
+  return '操作失败，请检查站点状态后重试'
+}
+
+// 固定的本地错误文案（仅用于明确的本地场景，避免 catch 块写异常原文）
+const ERR_INVALID_CONFIG = '配置文件格式无效'
+
+// 导入结果结构（与 SW IMPORT_CONFIG 返回一致）
+interface ImportSkip {
+  name: string
+  reason: string
+}
+interface ImportResult {
+  imported: number
+  updated: number
+  skipped: ImportSkip[]
+  fatalError?: string
+}
+
+// 仅配置界面通知：SW 经 runtime 消息推送页内提示（配置界面未打开则无接收端、自动丢弃）
+function onOptionsNotify(msg: { type?: string; title?: string; message?: string }, _sender: unknown, _sendResponse: unknown) {
+  if (msg && msg.type === 'AIHUB_OPTIONS_NOTIFY') {
+    showToast(`${msg.title ?? '提示'}：${msg.message ?? ''}`)
+  }
+}
+
+// GPT P0：网络 URL 仅展示 pathname，不含 query/fragment（可能含 token、签名、会话标识）
+function safeRequestPath(raw: string): string {
+  try {
+    const u = new URL(raw)
+    return u.pathname
+  } catch {
+    return '受保护路径'
+  }
+}
 
 const sites = ref<SiteConfig[]>([])
 const loading = ref(false)
 const toast = ref('')
 const toastTimer = ref<number | null>(null)
+
+// 用量看板 Tab 切换（Phase C）：'settings' = 站点管理 + 数据浏览器；'dashboard' = 用量看板
+type OptsTab = 'settings' | 'dashboard'
+const activeTab = ref<OptsTab>('settings')
+const dashboardSiteId = ref<string | null>(null)
+// 实验室「用量看板」开关：关闭时隐藏顶部「📊 用量看板」Tab（含完整用量看板页）
+const labShowDashboard = ref(false)
+// 实验室「用量看板」关闭时，若当前正停留在完整用量看板页，则回退到站点设置，避免无 Tab 可进的空白页
+watch(labShowDashboard, (on) => {
+  if (!on && activeTab.value === 'dashboard') activeTab.value = 'settings'
+})
 
 // 弹窗状态
 const formVisible = ref(false)
@@ -44,7 +102,7 @@ async function loadSites() {
   try {
     sites.value = await send<SiteConfig[]>('GET_SITES')
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   } finally {
     loading.value = false
   }
@@ -84,7 +142,7 @@ async function deleteSite(site: SiteConfig) {
     await loadSites()
     showToast('站点已删除')
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   }
 }
 
@@ -104,7 +162,7 @@ async function authorizeSite(site: SiteConfig) {
       await loadSites()
     }
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   }
 }
 
@@ -128,11 +186,11 @@ async function discoverEndpoints(site: SiteConfig) {
       const storageHint = storageKeys.length
         ? `；存储键：${storageKeys.slice(0, 5).join(', ')}${storageKeys.length > 5 ? '...' : ''}`
         : '；无 localStorage/sessionStorage 键'
-      const tried = res.attempts.map((a) => `${a.url}(${a.status})`).join(', ')
+      const tried = res.attempts.map((a) => `${safeRequestPath(a.url)}(${a.status})`).join(', ')
       showToast(`未探测到用户信息接口。${cookieHint}${storageHint}。已尝试：${tried.slice(0, 100)}…`)
     }
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   }
 }
 
@@ -152,13 +210,13 @@ async function discoverViaNetwork(site: SiteConfig) {
         .slice(0, 6)
         .map((c) => {
           const isJson = (c.contentType ?? '').includes('json')
-          return `${c.method} ${c.url} (${c.statusCode ?? '?'}${isJson ? ',json' : ''})`
+          return `${c.method} ${safeRequestPath(c.url)} (${c.statusCode ?? '?'}${isJson ? ',json' : ''})`
         })
         .join(' ｜ ')
       showToast(`捕获到 ${res.captured.length} 个请求，疑似接口：${pick}`)
     }
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   }
 }
 
@@ -174,7 +232,7 @@ async function exportConfig() {
     URL.revokeObjectURL(url)
     showToast('配置已导出（不含任何凭证）')
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   }
 }
 
@@ -204,31 +262,76 @@ async function handleFile(e: Event) {
     }
     // 只暂存，不在此处请求权限（异步 file.text() 后用户手势已丢失）
     pendingImport.value = config
-  } catch (e) {
-    showToast(e instanceof Error ? e.message : String(e))
+    console.info('[AI Relay] 导入：文件解析成功', { siteN: config.sites.length })
+  } catch {
+    showToast(ERR_INVALID_CONFIG)
   } finally {
     input.value = ''
   }
 }
 
+// 发送 IMPORT_CONFIG 并支持一次重试：应对 MV3 SW 冷启动首条消息偶发被丢（快速失败→重试即可到达）
+function isRetryableImportError(error: unknown): boolean {
+  return error instanceof MessagingError && ['TIMEOUT', 'EMPTY', 'RUNTIME'].includes(error.kind)
+}
+
+async function sendImportWithRetry(cfg: ExportConfig, attempt = 1): Promise<ImportResult> {
+  console.info('[AI Relay] 导入：发送 IMPORT_CONFIG（第 ' + attempt + ' 次，超时 12s）')
+  try {
+    return await send<ImportResult>('IMPORT_CONFIG', { config: cfg }, 12_000)
+  } catch (e) {
+    if (attempt < 2 && isRetryableImportError(e)) {
+      console.warn(
+        '[AI Relay] 导入：首次发送未收到响应，300ms 后重试',
+        e instanceof MessagingError ? e.kind : String(e),
+      )
+      await new Promise((r) => setTimeout(r, 300))
+      return sendImportWithRetry(cfg, attempt + 1)
+    }
+    throw e
+  }
+}
+
 async function confirmImport() {
   if (!pendingImport.value) return
+  const cfg = pendingImport.value
+  const siteN = cfg.sites?.length ?? 0
+  const origins = pendingOrigins.value
+  console.info('[AI Relay] 导入：开始', { siteN, origins })
   try {
-    // 在用户点击按钮的同步路径中请求权限（MV3 用户手势要求）
-    if (pendingOrigins.value.length > 0) {
-      const origins = pendingOrigins.value.map((o) => `${o}/*`)
-      const granted = await chrome.permissions.request({ origins })
+    if (origins.length > 0) {
+      const perms = origins.map((o) => `${o}/*`)
+      console.info('[AI Relay] 导入：请求权限', perms)
+      const granted = await chrome.permissions.request({ origins: perms })
+      console.info('[AI Relay] 导入：权限结果', { granted })
       if (!granted) {
         showToast('未授权站点权限，导入已取消')
         return
       }
     }
-    const res = await send<{ imported: number }>('IMPORT_CONFIG', { config: pendingImport.value })
-    showToast(`成功导入 ${res.imported} 个站点（未授权或无效的站点已跳过）`)
+    const res = await sendImportWithRetry(cfg)
+    console.info('[AI Relay] 导入：SW 返回', res)
+    if (res.fatalError) {
+      showToast(`导入失败：${res.fatalError}`)
+      pendingImport.value = null
+      return
+    }
+    const parts: string[] = []
+    if (res.imported > 0) parts.push(`新增 ${res.imported} 个`)
+    if (res.updated > 0) parts.push(`更新 ${res.updated} 个`)
+    let msg = parts.length ? `成功${parts.join('、')}站点` : '未导入任何站点'
+    if (res.skipped.length) {
+      const reasons = res.skipped.map((s) => `${s.name}（${s.reason}）`).join('、')
+      msg += `；跳过 ${res.skipped.length} 个：${reasons}`
+    }
+    showToast(msg)
     pendingImport.value = null
     await loadSites()
   } catch (e) {
-    showToast(e instanceof Error ? e.message : String(e))
+    // 仅记录固定 kind（不记录 message，避免泄露内部细节）；完整堆栈见控制台
+    console.error('[AI Relay] 导入：异常', e)
+    const kind = e instanceof MessagingError ? e.kind : 'UNKNOWN'
+    showToast(`导入失败（${kind}），请重新加载扩展或查看控制台日志`)
   }
 }
 
@@ -256,7 +359,7 @@ async function toggleEnabled(site: SiteConfig) {
     await send('UPDATE_SITE', { id: site.id, patch: { enabled: !site.enabled } })
     await loadSites()
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   }
 }
 
@@ -276,7 +379,7 @@ async function toggleDiag(site: SiteConfig) {
   try {
     diags.value = await send<DiagnosticEntry[]>('GET_DIAGNOSTICS', { id: site.id })
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
     diags.value = []
   } finally {
     diagsLoading.value = false
@@ -290,7 +393,7 @@ async function clearDiags(site: SiteConfig) {
     diags.value = []
     showToast('诊断日志已清空')
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   }
 }
 
@@ -337,7 +440,7 @@ async function saveCustom(site: SiteConfig) {
     await loadSites()
     showToast('自定义采集请求已保存')
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   }
 }
 
@@ -351,12 +454,12 @@ async function captureCustom(site: SiteConfig) {
   try {
     const res = await send<{ recorded: number; failed: number; errors: string[] }>('CAPTURE_CUSTOM', { id: site.id })
     if (res.failed > 0) {
-      showToast(`已记录 ${res.recorded} 条响应，${res.failed} 条请求未成功；首条：${res.errors[0] ?? ''}`)
+      showToast(`已记录 ${res.recorded} 条响应，${res.failed} 条请求未成功`)
     } else {
       showToast(`已采集并记录 ${res.recorded} 条请求响应`)
     }
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   } finally {
     capturingIds.value[site.id] = false
   }
@@ -378,7 +481,7 @@ async function exportCaptures(site: SiteConfig) {
     URL.revokeObjectURL(url)
     showToast(`已导出 ${records.length} 条采集记录（仅本人会话返回的 JSON）`)
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   }
 }
 
@@ -388,7 +491,7 @@ async function clearCaptures(site: SiteConfig) {
     await send<{ ok: boolean }>('CLEAR_CAPTURES', { id: site.id })
     showToast('已清空该站点采集记录')
   } catch (e) {
-    showToast(e instanceof MessagingError ? e.message : String(e))
+    showToast(safeUiError(e))
   }
 }
 
@@ -401,6 +504,22 @@ async function setTheme(mode: ThemeMode) {
 onMounted(async () => {
   await loadSites()
   theme.value = await getThemeMode()
+  labShowDashboard.value = await getLabShowDashboard()
+  chrome.runtime.onMessage.addListener(onOptionsNotify)
+  // Phase C：尊重 sidebar「📊 用量看板」按钮写入的 session storage 提示
+  try {
+    const sess = await chrome.storage.session?.get?.('aihub.optsTab')
+    if (sess && (sess as Record<string, string>)['aihub.optsTab'] === 'dashboard') {
+      activeTab.value = 'dashboard'
+      await chrome.storage.session?.remove?.('aihub.optsTab')
+    }
+  } catch {
+    /* session storage 不可用 → 静默回退到默认 settings Tab */
+  }
+})
+
+onUnmounted(() => {
+  chrome.runtime.onMessage.removeListener(onOptionsNotify)
 })
 </script>
 
@@ -409,11 +528,16 @@ onMounted(async () => {
     <header class="topbar">
       <div class="logo">AI</div>
       <span class="title">AI 中转站用量看板 · 设置</span>
+      <nav class="tabs">
+        <button :class="{ on: activeTab === 'settings' }" @click="activeTab = 'settings'">⚙ 站点设置</button>
+        <button v-if="labShowDashboard" :class="{ on: activeTab === 'dashboard' }" @click="activeTab = 'dashboard'">📊 用量看板</button>
+      </nav>
       <button class="btn help-btn" title="查看使用说明" @click="openHelp">❔ 使用说明</button>
     </header>
 
     <main class="opt-main">
-      <h2>站点管理</h2>
+      <template v-if="activeTab === 'settings'">
+        <h2>站点管理</h2>
       <div class="desc">
         每个站点独立授权、独立凭证，删除站点时同步撤销其域名权限。导出的配置默认不含任何凭证。
       </div>
@@ -582,6 +706,20 @@ onMounted(async () => {
       </template>
 
       <DataExplorer :sites="sites" />
+      </template>
+
+      <template v-else>
+        <h2>用量看板</h2>
+        <div class="desc">
+          完整复刻 hubway 用量页：4 张指标卡 + 4 张图表（模型/分组/站点分布 + Token 趋势）+ 筛选 + 明细分页。
+          数据来自 v4 GET_USAGE_DASHBOARD / GET_USAGE_DETAILS / GET_USAGE_FILTER_OPTIONS。
+        </div>
+        <UsageDashboard
+          :sites="sites"
+          :selected-site-id="dashboardSiteId"
+          @update:selected-site-id="dashboardSiteId = $event"
+        />
+      </template>
     </main>
 
     <SiteForm
@@ -644,6 +782,70 @@ body {
   background: var(--bg);
   color: var(--text);
   font-size: 13px;
+}
+.settings-card {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 16px;
+  margin-bottom: 18px;
+  background: var(--panel);
+}
+.settings-card > summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+}
+.settings-card > summary::-webkit-details-marker {
+  display: none;
+}
+.settings-card > summary::before {
+  content: '▸';
+  font-size: 11px;
+  color: var(--sub);
+}
+.settings-card[open] > summary::before {
+  content: '▾';
+}
+.settings-card[open] {
+  padding-bottom: 14px;
+}
+.settings-summary-hint {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--sub);
+}
+.settings-desc {
+  margin: 10px 0;
+  color: var(--sub);
+  font-size: 12px;
+}
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.radio-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.radio-item input {
+  margin-top: 3px;
+}
+.radio-item b {
+  font-weight: 600;
+}
+.radio-item small {
+  color: var(--sub);
 }
 .opts-shell {
   max-width: 880px;
@@ -1053,6 +1255,30 @@ body {
 /* 使用说明入口与弹窗 */
 .help-btn {
   margin-left: auto;
+}
+.tabs {
+  display: inline-flex;
+  margin-left: 16px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+}
+.tabs button {
+  border: none;
+  background: var(--panel);
+  padding: 8px 14px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  color: var(--sub);
+}
+.tabs button.on {
+  background: var(--brand);
+  color: #fff;
+  font-weight: 600;
+}
+.tabs button + button {
+  border-left: 1px solid var(--line);
 }
 .help-mask {
   padding: 40px 0;

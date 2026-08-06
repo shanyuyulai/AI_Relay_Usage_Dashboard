@@ -27,3 +27,26 @@ export async function setLabZeroTab(enabled: boolean): Promise<boolean> {
   await settingsRepo.set(LAB_ZEROTAB_KEY, safe)
   return safe
 }
+
+/**
+ * 实验室：图标点击弹极简用量看板（悬浮框）。
+ *
+ * 默认关闭。开启后，点击扩展图标不再打开侧边栏，而是弹出一个极简 popup，
+ * 只列出各中转站的名称与剩余金额（数据来自最新的余额快照）。关闭则回退到侧边栏。
+ *
+ * ⚠️ 注意（MV3 限制）：工具栏图标没有「悬浮(hover)触发自定义浮层」的 API，
+ * 只有原生 tooltip。因此本开关实现的是「点击弹 popup」，无法做到 hover 弹出。
+ */
+export const LAB_SHOWDASHBOARD_KEY = 'aihub.lab.showDashboard'
+export const DEFAULT_LAB_SHOWDASHBOARD = false
+
+export async function getLabShowDashboard(): Promise<boolean> {
+  const raw = await settingsRepo.get<boolean>(LAB_SHOWDASHBOARD_KEY)
+  return raw === true
+}
+
+export async function setLabShowDashboard(enabled: boolean): Promise<boolean> {
+  const safe = enabled === true
+  await settingsRepo.set(LAB_SHOWDASHBOARD_KEY, safe)
+  return safe
+}

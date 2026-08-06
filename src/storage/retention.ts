@@ -1,5 +1,6 @@
 import { db } from './db'
 import { settingsRepo } from './config'
+import { usageRecordsRepo } from './usageRecords'
 import { dateKey } from '../shared/util'
 
 /**
@@ -54,7 +55,7 @@ export async function purgeOlderThan(days: number): Promise<PurgeCounts> {
       db.dailyStats.where('date').below(cutoffDate).delete(),
       db.captures.where('capturedAt').below(cutoffTs).delete(),
       db.diagnostics.where('at').below(cutoffTs).delete(),
-      db.usageRecords.where('takenAt').below(cutoffTs).delete(),
+      usageRecordsRepo.clearOlderThan(cutoffTs),
     ])
     return { snapshots, dailyStats, captures, diagnostics, usageRecords }
   } catch (e) {

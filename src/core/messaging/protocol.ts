@@ -108,6 +108,7 @@ export interface ClearDiagnosticsPayload {
 }
 
 // ── 当日用量明细批次（来自 /api/v1/usage 等用量明细列表端点） ──
+/** @deprecated Phase A 已被 GET_USAGE_DASHBOARD/DETAILS/FILTER_OPTIONS 取代；保留仅为向后兼容，新 UI 请勿调用。 */
 export interface GetUsageRecordsPayload {
   /** 站点 id（必填，且须为已配置站点） */
   id: string
@@ -132,6 +133,129 @@ export interface GetUsageRecordsResponse {
 // ── 保留策略 ──────────────────────────────────────────────
 export interface RetentionPayload {
   days: number
+}
+
+// ── 用量看板（v4 新增；GET_USAGE_RECORDS 保留但标记 deprecated） ──
+/**
+ * 刷新模式：
+ * - 'auto'（默认）：缓存新鲜则直接返回；否则触发一次采集（同站点 60s 内节流）。
+ * - 'force'：忽略缓存，强制触发采集（对应 UI 的「刷新」按钮）。
+ * - 'cache-only'：绝不触发采集（离线 / 只想看已有数据）。
+ */
+export type UsageRefreshMode = 'auto' | 'force' | 'cache-only'
+
+/**
+ * 时间范围（Phase A 仅支持单日聚合）。
+ * date 缺省时由 handler 按站点业务时区取「今天」（hubway_v1 固定 Asia/Shanghai）。
+ * 多日区间（fromDate/toDate）待真实多日聚合、分页语义与缓存键落地后再引入，
+ * 避免对外承诺未实现的能力（GPT P1-protocol）。
+ */
+export interface UsageRangePayload {
+  /** 单日 YYYY-MM-DD */
+  date?: string
+}
+
+export interface UsageDataMetaDto {
+  source: 'api' | 'local_fallback' | 'cache'
+  fetchedAt: number
+  dataAsOf: number | null
+  isStale: boolean
+  staleAgeMinutes: number
+}
+
+export interface GetUsageDashboardPayload extends UsageRangePayload {
+  /** 站点 id（必填，且须为已配置站点） */
+  id: string
+  mode?: UsageRefreshMode
+}
+export interface UsageTopMetricsDto {
+  totalRequests: number
+  totalTokens: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  /** 按币种分组（P1-3：绝不跨币种求和） */
+  totalCostByCurrency: Record<string, number>
+  /** 无精确来源时为 null，UI 显「—」 */
+  avgResponseMs: number | null
+  windowHours: number
+}
+export interface UsageDistributionBucketDto {
+  key: string
+  label: string
+  requests: number
+  tokens: number
+  costByCurrency: Record<string, number>
+  ratio: number
+}
+export interface UsageTrendPointDto {
+  ts: number
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  cacheHitRate: number
+  requests: number
+}
+export interface GetUsageDashboardResponse {
+  siteId: string
+  date: string
+  topMetrics: UsageTopMetricsDto | null
+  distributions: {
+    model: UsageDistributionBucketDto[]
+    group: UsageDistributionBucketDto[]
+    endpoint: UsageDistributionBucketDto[]
+  } | null
+  tokenTrend: UsageTrendPointDto[]
+  records: number
+  meta: UsageDataMetaDto
+}
+
+export interface UsageDetailFilters {
+  apiKeyId?: string
+  model?: string
+  endpoint?: string
+  group?: string
+  type?: string
+  billingMode?: string
+}
+export interface GetUsageDetailsPayload extends UsageRangePayload {
+  id: string
+  mode?: UsageRefreshMode
+  filters?: UsageDetailFilters
+  /** 1-based；默认 1 */
+  page?: number
+  /** 默认 50，服务端硬上限 100（P1-3 分页有界） */
+  pageSize?: number
+}
+export interface GetUsageDetailsResponse {
+  siteId: string
+  date: string
+  rows: UsageRecordBatch['records']
+  total: number
+  page: number
+  pageSize: number
+  /** 当日明细是否完整（false=命中 200 条硬上限被截断，UI 须标「明细不完整」） */
+  isComplete: boolean
+  truncatedReason?: string | null
+  meta: UsageDataMetaDto
+}
+
+export interface GetUsageFilterOptionsPayload extends UsageRangePayload {
+  id: string
+  mode?: UsageRefreshMode
+}
+export interface GetUsageFilterOptionsResponse {
+  siteId: string
+  date: string
+  apiKeyIds: string[]
+  models: string[]
+  endpoints: string[]
+  groups: string[]
+  types: string[]
+  billingModes: string[]
+  meta: UsageDataMetaDto
 }
 export interface RetentionResponse {
   days: number
@@ -159,6 +283,39 @@ export interface LabCorsPayload {
 }
 export interface LabCorsResponse {
   enabled: boolean
+}
+
+// ── 实验室：图标点击弹极简用量看板（实验性，默认关闭） ──────
+export interface LabShowDashboardPayload {
+  enabled: boolean
+}
+export interface LabShowDashboardResponse {
+  enabled: boolean
+}
+
+// ── 单击图标行为（配置界面，非实验室） ─────────────────────
+export interface ClickBehaviorPayload {
+  behavior: 'panel' | 'sidebar'
+}
+export interface ClickBehaviorResponse {
+  behavior: 'panel' | 'sidebar'
+}
+
+// ── 极简用量看板（popup）：各站名称 + 最新余额 ──────────────
+export interface DashboardSummaryItem {
+  siteId: string
+  name: string
+  origin: string
+  balance: number | null
+  currency: string | null
+  updatedAt: number | null // 最新快照时间
+  status: 'ok' | 'auth_expired' | 'error' | 'no_data'
+}
+export interface GetDashboardSummaryPayload {
+  // 留空，便于未来扩展（如仅某站）
+}
+export interface GetDashboardSummaryResponse {
+  items: DashboardSummaryItem[]
 }
 
 // ── 数据查看器：取某站全部已采集数据 ──────────────────────

@@ -41,5 +41,18 @@ export function dateKeyInTz(ts: number, timeZone: string): string {
   return `${y}-${m}-${day}`
 }
 
-/** hubway 业务时区常量（集中定义，避免散落硬编码）。 */
+/** hubway 业务时区（IANA 名，供 dateKeyInTz 等按名解析用）。 */
 export const HUBWAY_TZ = 'Asia/Shanghai'
+/** hubway 业务时区相对 UTC 的偏移分钟数（东八区 = +480），供趋势桶边界 / 缓存键等数值计算用。 */
+export const HUBWAY_TZ_OFFSET_MIN = 480
+
+/**
+ * 严格日历校验：拒绝 2024-02-31 这类会被 Date.parse 归一化的假日期。
+ * 用 UTC 构造后回读比对，确保该日真实存在（GPT P1-date）。
+ */
+export function isValidDateKey(s: string): boolean {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false
+  const [y, m, d] = s.split('-').map(Number)
+  const dt = new Date(Date.UTC(y, m - 1, d))
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d
+}

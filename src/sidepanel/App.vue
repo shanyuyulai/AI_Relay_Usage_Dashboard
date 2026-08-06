@@ -64,7 +64,7 @@ async function loadDashboard() {
     dashboard.value = await send<DashboardData>('GET_DASHBOARD')
     lastRefreshed.value = fmtTime(Date.now())
   } catch (e) {
-    errorMsg.value = e instanceof MessagingError ? e.message : String(e)
+    errorMsg.value = safeUiError(e)
   } finally {
     loading.value = false
   }
@@ -83,7 +83,7 @@ async function syncAll() {
     await send<{ results: CollectResultMsg[] }>('COLLECT_NOW', undefined, 60_000)
     await loadDashboard()
   } catch (e) {
-    errorMsg.value = e instanceof MessagingError ? e.message : String(e)
+    errorMsg.value = safeUiError(e)
   } finally {
     syncing.value = false
   }
@@ -103,7 +103,7 @@ async function syncSite(siteId: string, ev: Event) {
     await send<{ results: CollectResultMsg[] }>('COLLECT_NOW', { siteIds: [siteId] }, 60_000)
     await loadDashboard()
   } catch (e) {
-    errorMsg.value = e instanceof MessagingError ? e.message : String(e)
+    errorMsg.value = safeUiError(e)
   }
 }
 
@@ -117,13 +117,31 @@ function backToDashboard() {
   detailSiteId.value = ''
 }
 
-function openOrigin(url: string, ev: Event) {
-  ev.stopPropagation()
-  chrome.tabs.create({ url })
+// GPT P0：跨层错误白名单——绝不透传 MessagingError.message 原文
+function safeUiError(e: unknown): string {
+  if (e instanceof MessagingError) {
+    if (e.kind === 'TIMEOUT') return '请求超时，请稍后重试'
+    if (e.kind === 'NO_HANDLER') return '当前操作不可用'
+    if (e.kind === 'BAD_REQUEST') return '请求参数无效'
+    return '操作失败，请检查站点状态后重试'
+  }
+  return '操作失败，请稍后重试'
 }
 
 function openOptions() {
   chrome.runtime.openOptionsPage()
+}
+
+// Phase C：把目标 Tab 写入 session storage，Options 挂载时读取并切到 dashboard。
+// 不必关心跨上下文时序：Options 挂载后只需读一次然后清空。
+async function openUsageDashboard() {
+  try {
+    await chrome.storage.session?.set?.({ 'aihub.optsTab': 'dashboard' })
+  } catch {
+    /* session storage 不可用时仍打开设置页 */
+  } finally {
+    chrome.runtime.openOptionsPage()
+  }
 }
 
 // 累计 Token 来源标注（GPT P0-2：绝不冒充；local_history 为插件历史累加）
@@ -197,6 +215,7 @@ onUnmounted(() => {
           {{ syncing ? '⋯' : '⟳' }}
         </button>
         <button class="ibtn" :title="themeIcon + ' 主题（点击切换）'" @click="cycleTheme">{{ themeIcon }}</button>
+        <button class="ibtn" title="用量看板（完整复刻 hubway 用量页）" @click="openUsageDashboard">📊</button>
         <button class="ibtn" title="设置" @click="openOptions">⚙</button>
       </div>
     </header>
@@ -290,8 +309,7 @@ onUnmounted(() => {
               </div>
               <div class="sc-info">
                 <div class="sc-name">
-                  {{ s.site.name }}
-                  <span class="open" @click="openOrigin(s.site.baseUrl, $event)">打开原站 ↗</span>
+                  <a class="sc-link" :href="s.site.baseUrl || undefined" target="_blank" rel="noopener noreferrer" @click.stop>{{ s.site.name }}</a>
                 </div>
                 <div class="sc-url">
                   {{ s.site.origin.replace('https://', '') }} · {{ adapterMap[s.site.adapter] || s.site.adapter }}
@@ -344,8 +362,8 @@ onUnmounted(() => {
             <div v-if="s.lastStatus === 'no_source'" class="authbar info">
               该站点无精确用量接口，今日用量不展示（禁止模拟数据）
             </div>
-            <div v-if="s.lastStatus === 'error' && s.site.lastError" class="authbar err">
-              采集异常：{{ s.site.lastError }}
+            <div v-if="s.lastStatus === 'error'" class="authbar err">
+              采集异常，请检查站点状态后重试
             </div>
           </div>
         </template>
@@ -613,10 +631,14 @@ body {
   align-items: center;
   gap: 6px;
 }
-.sc-name .open {
-  font-size: 10px;
-  color: var(--brand);
+.sc-name .sc-link {
+  color: var(--text);
+  text-decoration: none;
   cursor: pointer;
+}
+.sc-name .sc-link:hover {
+  color: var(--brand);
+  text-decoration: underline;
 }
 .sc-url {
   font-size: 11px;

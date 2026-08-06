@@ -42,6 +42,7 @@ export interface SiteConfig {
     confidence?: string
     /** 当日用量明细列表适配器种类（P0：适配器隔离，禁把 hubway 约定泛化）：hubway_v1 | generic | null */
     usageListKind?: 'hubway_v1' | 'generic' | null
+    usageListPath?: string | null
   }
   /**
    * 用户自定义的采集请求（原样保存，不改写）。
@@ -213,44 +214,181 @@ export interface DiagnosticEntry {
 /**
  * 当日用量明细记录（来自中转站「用量明细列表」接口，如 hubway 的 /api/v1/usage）。
  * ⚠️ P0-2 数据最小化：仅白名单字段，绝不保存服务端原始 id / 嵌套对象 / 响应原文 / 任何凭证。
- * `id` 为本地确定性摘要，非服务端 id；`cost` 必带 `costCurrency`（P1-3，禁跨币种求和）。
+ * `id` 优先用服务端原始 id + 页面 origin 命名空间派生的 SHA-256（稳定可去重）；缺服务端 id 时用内容指纹 SHA-256。
+ * `apiKeyId` 字段存的是 MAIN 世界就地派生的伪标识：`k_<sha256(origin + "|k|" + rawKey).slice(0, 16)>`，
+ *  原值绝不出页面；命名空间仅用页面自身 `origin`（非秘密，仅用于站点间隔离，不含任何扩展密钥）。
+ *  `ip` 同样 hash 化（`ip_<sha256(rawIp).slice(0, 16)>`），原始 IP 永不落库。
+ *  ⚠️ `apiKeyLabel` 在 Phase A 已被强制置 null（P0-I1）：通用分类器无法仅凭字段名判断「可读标签是否含密钥」，故只保留不可逆的哈希假标识。
+ * `cost` 必带 `costCurrency`（P1-3，禁跨币种求和）；`actualCost/standardCost` 可独立带币种。
+ * 限长 / 非负数校验在 MAIN 世界归一化函数里强制执行，不是类型注释。
  */
 export interface UsageRecord {
-  /** 本地确定性摘要（model+ts+tokens 哈希），非服务端 id */
+  /** 本地确定性摘要（siteScope + 服务端 raw id → SHA-256 截前 16 位；无 raw id 时用字段哈希） */
   id: string
   /** 调用时间（ms） */
   ts: number
-  /** 模型名（长度受限，最多 64 字符） */
+  /** 模型名（限 64 字符） */
   model: string
+  /** 提示 token（仅接受有限非负数） */
   promptTokens: number
+  /** 生成 token */
   completionTokens: number
+  /** 总 token（= prompt + completion，或来自服务端 tokens/total_tokens） */
   tokens: number
+  /** 命中缓存的 token（Anthropic prompt caching 读） */
+  cacheReadTokens: number | null
+  /** 写入缓存的 token（Anthropic prompt caching 写） */
+  cacheCreationTokens: number | null
   /** 本笔消耗金额（本币）；无明确字段则 null（UI 显「—」） */
   cost: number | null
-  /** 金额币种（与站点 currency 一致；P1-3 维度） */
+  /** 实际消耗金额（如 hubway "实际" 列）；语义未确认时 null */
+  actualCost: number | null
+  actualCostCurrency: string | null
+  /** 标准消耗金额（按官方牌价）；语义未确认时 null */
+  standardCost: number | null
+  standardCostCurrency: string | null
+  /** cost 字段的币种（与站点 currency 一致；P1-3 维度） */
   costCurrency: string
+  /** 端点 pathname（仅路径，不含 query/fragment/host；如 /v1/responses） */
+  endpoint: string | null
+  /** API Key 的伪标识（MAIN 世界无密钥 SHA-256 派生，绝不含原值；仅对明确的密钥字段计算） */
+  apiKeyId: string | null
+  /** 可读的令牌标签（如 New API 的 token_name），非密钥、不哈希，仅用于筛选/展示区分 */
+  apiKeyLabel: string | null
+  /** IP 的伪哈希（MAIN 世界 SHA-256 截前 16 位；原 IP 不落库） */
+  ipHash: string | null
+  /** 推理强度（hubway "推理强度" 列），如 high/medium/low */
+  reasoningEffort: string | null
+  /** 分组（hubway "分组" 列） */
+  group: string | null
+  /** 类型（hubway "类型" 列） */
+  type: string | null
+  /** 计费模式（hubway "计费模式" 列） */
+  billingMode: string | null
 }
 
 /**
  * 单站单日的用量明细批次（一整日的所有调用记录）。
  * 主键 `siteId:date` —— 同一天多次采集，完整批次优先于不完整批次（P1：防覆盖）。
+ * 与同站采集原子提交于 Dexie 事务（putBatch + revision bump）。
  */
+/** 用量明细记录 schema 版本（pageCollect 写入批次、usageRecords 回填/校验共用，避免版本漂移）。 */
+export const USAGE_RECORD_SCHEMA_VERSION = 2
+
 export interface UsageRecordBatch {
   id: string // pk: `${siteId}:${date}`
   siteId: string
   /** 业务日 YYYY-MM-DD（按站点业务时区，如 hubway=Asia/Shanghai；与接口/主键/查询口径一致） */
   date: string
+  /** 批次采集完成时间（ms） */
+  collectedAt: number
+  /** 兼容字段：等同于 collectedAt（保留旧字段名以减少对历史 UI 引用的大改） */
   takenAt: number
   records: UsageRecord[]
   totalTokens: number
-  /** 按币种分组的金额（P1-3，禁单一 totalCost） */
+  /** 记录条数。Phase A 始终等于 records.length（截断语义下沉到 isComplete + truncatedReason，不再用 count 表示「实际>已存」）。 */
+  recordCount: number
+  /** 按币种分组的金额（cost 字段聚合；P1-3，禁单一 totalCost） */
   costByCurrency: Record<string, number>
+  /** 按币种分组的实际成本（actual 字段聚合） */
+  totalActualCostByCurrency: Record<string, number>
+  /** 按币种分组的标准成本（standard 字段聚合） */
+  totalStandardCostByCurrency: Record<string, number>
   totalRequests: number
   /** 是否完整采集（false=命中上限被截断，UI 须标「明细不完整」） */
   isComplete: boolean
   truncatedReason?: string | null
+  /** 已翻页数（探测/调试用）。Phase A 写入固定为 0（采集上限由 MAX_PAGES/MAX_ITEMS 控制，结果已体现在 isComplete/truncatedReason）。 */
   pageCount: number
   schemaVersion: number
   /** 来源适配器：hubway_v1 | generic */
   source: string
+}
+
+/** usageCache 单条缓存（DB v4 新增）。只缓存昂贵聚合/分页结果，不缓存原始记录。 */
+export interface UsageCacheEntry {
+  /** 主键：sha256(canonical JSON of query params) */
+  cacheKey: string
+  siteId: string
+  /** 缓存类型：dashboard | details | filterOptions */
+  kind: 'dashboard' | 'details' | 'filterOptions'
+  fromDate: string
+  toDate: string
+  /** 该 (siteId, date) 当前的 revision（采集时原子自增）；读取时若与最新 revision 不符视为陈旧 */
+  revision: string
+  /** 缓存生成时间（fetchedAt） */
+  fetchedAt: number
+  /** 最近访问时间（LRU 维护用） */
+  accessedAt: number
+  /** 已规范化的载荷（聚合结果 / 分页 / 过滤项；白名单字段） */
+  payload: unknown
+  schemaVersion: number
+  /** payload 的 canonical JSON 字节数（容量控制用） */
+  size: number
+}
+
+/** 缓存数据来源（用于 UI 标 "实时 / 缓存 X 分钟前 / 记录表聚合"） */
+export type UsageDataSource = 'api' | 'local_fallback' | 'cache'
+
+/** 顶部 4 卡聚合指标（单站单日）。 */
+export interface UsageTopMetrics {
+  totalRequests: number
+  totalTokens: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  totalCostByCurrency: Record<string, number>
+  avgResponseMs: number | null
+  /** 时间跨度（小时）；单日 = 24h，跨日按实际 hours 计算 */
+  windowHours: number
+}
+
+/** 单个分布桶（模型/分组/端点 通用结构）。 */
+export interface UsageDistributionBucket {
+  key: string
+  label: string
+  requests: number
+  tokens: number
+  costByCurrency: Record<string, number>
+  /** 占总 tokens 的百分比（0-1，UI 自行 *100） */
+  ratio: number
+}
+
+/** Token 使用趋势多线数据点（按小时或按日聚合）。 */
+export interface UsageTrendPoint {
+  /** 桶起始时间（ms） */
+  ts: number
+  /** 桶内 input tokens */
+  inputTokens: number
+  /** 桶内 output tokens */
+  outputTokens: number
+  /** 桶内 cache creation tokens */
+  cacheCreationTokens: number
+  /** 桶内 cache read tokens */
+  cacheReadTokens: number
+  /** 桶内命中率（0-1，UI 自行 *100 显示为 %） */
+  cacheHitRate: number
+  requests: number
+}
+
+/** 详情表过滤项。 */
+export interface UsageFilterValues {
+  apiKeyIds: string[]
+  models: string[]
+  endpoints: string[]
+  groups: string[]
+  types: string[]
+  billingModes: string[]
+}
+
+/** 数据源元信息（所有聚合响应都带）。 */
+export interface UsageDataMeta {
+  source: UsageDataSource
+  fetchedAt: number
+  /** 底层 usage 记录最后采集时间（ms）；取自 usageRecordsRepo.getLatest 的 collectedAt */
+  dataAsOf: number | null
+  isStale: boolean
+  /** 陈旧分钟数（isStale=true 时有效；新鲜为 0） */
+  staleAgeMinutes: number
 }

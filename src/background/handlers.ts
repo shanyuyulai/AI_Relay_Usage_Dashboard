@@ -14,13 +14,19 @@ import {
   setLabZeroTab,
   getLabCorsUnblock,
   setLabCorsUnblock,
+  getLabShowDashboard,
+  setLabShowDashboard,
+  getClickBehavior,
+  setClickBehavior,
   usageRecordsRepo,
+  usageCache,
 } from '../storage'
 import { applyCorsRules, refreshCorsRules } from './corsRules'
+import { applyIconBehavior } from './popupBehavior'
 import { collectAllInTabs, collectSpecificInTabs, probeSessionInTab, captureCustomInTab } from './pageCollect'
 import { applyInterval } from './scheduler'
 import { registry } from '../adapters'
-import { normalizeOrigin, todayKey, dateKey, dateKeyInTz, HUBWAY_TZ } from '../shared/util'
+import { normalizeOrigin, todayKey, dateKey, dateKeyInTz, HUBWAY_TZ, HUBWAY_TZ_OFFSET_MIN, isValidDateKey } from '../shared/util'
 import type {
   CollectResultMsg,
   SiteSummary,
@@ -44,8 +50,24 @@ import type {
   LabZeroTabResponse,
   LabCorsPayload,
   LabCorsResponse,
+  LabShowDashboardPayload,
+  LabShowDashboardResponse,
+  ClickBehaviorPayload,
+  ClickBehaviorResponse,
+  GetDashboardSummaryPayload,
+  GetDashboardSummaryResponse,
+  DashboardSummaryItem,
   GetUsageRecordsPayload,
   GetUsageRecordsResponse,
+  UsageRangePayload,
+  UsageRefreshMode,
+  UsageDetailFilters,
+  GetUsageDashboardPayload,
+  GetUsageDashboardResponse,
+  GetUsageDetailsPayload,
+  GetUsageDetailsResponse,
+  GetUsageFilterOptionsPayload,
+  GetUsageFilterOptionsResponse,
   GetSiteDataPayload,
   GetSiteDataResponse,
   ResetSiteDataPayload,
@@ -108,6 +130,71 @@ function broadcastSitesChanged() {
   } catch {
     /* 无接收方时忽略 */
   }
+}
+
+// ── 用量看板公共校验：一律先校验站点存在；date 严格为真实存在的 YYYY-MM-DD ──
+
+/**
+ * 解析用量查询的站点 + 业务日 + 业务时区偏移。
+ * - siteId 必填且必须为已配置站点（禁止全局回退）。
+ * - date 缺省时按站点业务时区取「今天」（hubway_v1 固定 Asia/Shanghai）。
+ * - 已提供的 date 必须是真实存在的日历日（空串视为缺省）。
+ */
+async function resolveUsageScope(
+  siteId: unknown,
+  range: UsageRangePayload,
+): Promise<{ site: SiteConfig; date: string; tzOffsetMinutes: number; isHubway: boolean; isToday: boolean }> {
+  if (typeof siteId !== 'string' || !siteId) throw new Error('缺少站点 id')
+  const site = await siteRepo.get(siteId)
+  if (!site) throw new Error('站点不存在')
+
+  const isHubway = site.discovered?.usageListKind === 'hubway_v1'
+  // 业务时区偏移（东为正）：hubway 固定 +480（Asia/Shanghai）；其余用本机时区。
+  // 注：本机 offset 对历史日期在 DST 切换前后不精确，但 Phase A 仅支持单日且历史日会被
+  // effectiveRefreshMode 降级为 cache-only（不触发采集），故不影响正确性（GPT P1-now-stable）。
+  const tzOffsetMinutes = isHubway ? HUBWAY_TZ_OFFSET_MIN : -new Date().getTimezoneOffset()
+  // 一次性捕获 now，后续所有「是否今天」判定都基于同一时刻，避免跨午夜重复读钟导致
+  // 历史请求被误判为今天、错误触发 force 采集（GPT P1-now-stable）。
+  const now = Date.now()
+  const todayKeyForSite = isHubway ? dateKeyInTz(now, HUBWAY_TZ) : dateKey(now)
+  let date: string
+  if (typeof range.date === 'string' && range.date.length > 0) {
+    if (!isValidDateKey(range.date)) throw new Error('日期非法，应为真实存在的 YYYY-MM-DD')
+    date = range.date
+  } else {
+    date = todayKeyForSite
+  }
+  const isToday = date === todayKeyForSite
+  return { site, date, tzOffsetMinutes, isHubway, isToday }
+}
+
+/**
+ * 刷新模式修正（GPT P1-history-refresh）：Phase A 仅支持采集「当天」。
+ * 若请求的是历史日却用 force，会错误地触发「今天」的采集并误导 meta 标「refreshed」，
+ * 故降级为 cache-only（只返回已有数据，meta.isStale=true）。
+ */
+function effectiveRefreshMode(requested: UsageRefreshMode, isToday: boolean): UsageRefreshMode {
+  if (requested === 'force' && !isToday) return 'cache-only'
+  return requested
+}
+
+function normalizeMode(mode: unknown): UsageRefreshMode {
+  return mode === 'force' || mode === 'cache-only' ? mode : 'auto'
+}
+
+/** 过滤项白名单 + 长度上限 + 去控制字符（P1-3：防超长入参 / 同义等价值撑爆缓存键）。 */
+function sanitizeFilters(f: UsageDetailFilters | undefined): UsageDetailFilters {
+  const out: UsageDetailFilters = {}
+  if (!f) return out
+  const keys: (keyof UsageDetailFilters)[] = ['apiKeyId', 'model', 'endpoint', 'group', 'type', 'billingMode']
+  for (const k of keys) {
+    const v = f[k]
+    if (typeof v !== 'string') continue
+    // 去除首尾空白与不可见控制字符（如换行/制表），避免等价过滤值分裂缓存键
+    const t = v.trim().replace(/[\u0000-\u001f\u007f]/g, '')
+    if (t.length > 0 && t.length <= 200) out[k] = t
+  }
+  return out
 }
 
 export const handlers: Record<string, Handler> = {
@@ -311,7 +398,7 @@ export const handlers: Record<string, Handler> = {
           hasHourlyStructure,
           hasSuccessWrapper: a.hasWrapper,
           successValue: null,
-          hasDataObject: a.topKeys.includes('data') || a.topKeys.some((k) => a.dataFieldTypes?.[k] === 'object'),
+           hasDataObject: a.hasDataArray || a.topKeys.includes('data') || a.topKeys.some((k) => a.dataFieldTypes?.[k] === 'object'),
           dataFieldTypes: a.dataFieldTypes ?? {},
           dataFieldNames: a.dataFieldNames ?? [],
           hasUserId: a.hasUserId ?? false,
@@ -333,6 +420,11 @@ export const handlers: Record<string, Handler> = {
       }
 
       const classification = classifySite(fp)
+      const usageListAttempt = result.attempts.find((a) => {
+        const path = new URL(a.url).pathname
+        return a.status >= 200 && a.status < 300 && (path === '/api/v1/usage' || path === '/api/usage') && (a.hasDataArray || a.dataFieldNames?.length)
+      })
+      const usageListPath = usageListAttempt ? new URL(usageListAttempt.url).pathname : null
 
       await siteRepo.update(site.id, {
         discovered: {
@@ -344,6 +436,7 @@ export const handlers: Record<string, Handler> = {
           capabilities: classification.capabilities,
           confidence: classification.confidence,
           usageListKind: classification.usageListKind ?? null,
+          usageListPath,
         },
       })
     }
@@ -448,6 +541,71 @@ export const handlers: Record<string, Handler> = {
     } satisfies GetUsageRecordsResponse
   },
 
+  // ── 用量看板（v4）：聚合卡片 / 分布 / Token 趋势 ──────────
+  async GET_USAGE_DASHBOARD(payload: GetUsageDashboardPayload): Promise<GetUsageDashboardResponse> {
+    const { site, date, tzOffsetMinutes, isToday } = await resolveUsageScope(payload.id, payload)
+    void site
+    const mode = effectiveRefreshMode(normalizeMode(payload.mode), isToday)
+    const r = await usageCache.getDashboard(payload.id, { date, tzOffsetMinutes, mode })
+    return {
+      siteId: payload.id,
+      date,
+      topMetrics: r.topMetrics,
+      distributions: r.distributions,
+      tokenTrend: r.tokenTrend,
+      records: r.records,
+      meta: r.meta,
+    }
+  },
+
+  // ── 用量看板（v4）：明细表分页 + 过滤 ─────────────────────
+  async GET_USAGE_DETAILS(payload: GetUsageDetailsPayload): Promise<GetUsageDetailsResponse> {
+    const { date, tzOffsetMinutes, isToday } = await resolveUsageScope(payload.id, payload)
+    // 分页边界兜底（P1-handlers）：有限整数校验 + 默认 50（与协议一致），避免 NaN/Infinity 穿透污染缓存键
+    const asFiniteInt = (v: unknown, fallback: number): number =>
+      typeof v === 'number' && Number.isFinite(v) ? Math.floor(v) : fallback
+    const page = Math.max(1, asFiniteInt(payload.page, 1))
+    const pageSize = Math.min(100, Math.max(1, asFiniteInt(payload.pageSize, 50)))
+    const mode = effectiveRefreshMode(normalizeMode(payload.mode), isToday)
+    const r = await usageCache.getDetails(payload.id, {
+      date,
+      tzOffsetMinutes,
+      mode,
+      filters: sanitizeFilters(payload.filters),
+      page,
+      pageSize,
+    })
+    return {
+      siteId: payload.id,
+      date,
+      rows: r.rows,
+      total: r.total,
+      page: r.page,
+      pageSize: r.pageSize,
+      isComplete: r.isComplete,
+      truncatedReason: r.truncatedReason ?? null,
+      meta: r.meta,
+    }
+  },
+
+  // ── 用量看板（v4）：过滤下拉项 ────────────────────────────
+  async GET_USAGE_FILTER_OPTIONS(payload: GetUsageFilterOptionsPayload): Promise<GetUsageFilterOptionsResponse> {
+    const { date, tzOffsetMinutes, isToday } = await resolveUsageScope(payload.id, payload)
+    const mode = effectiveRefreshMode(normalizeMode(payload.mode), isToday)
+    const r = await usageCache.getFilterOptions(payload.id, { date, tzOffsetMinutes, mode })
+    return {
+      siteId: payload.id,
+      date,
+      apiKeyIds: r.apiKeyIds,
+      models: r.models,
+      endpoints: r.endpoints,
+      groups: r.groups,
+      types: r.types,
+      billingModes: r.billingModes,
+      meta: r.meta,
+    }
+  },
+
   // ── 保留策略：读取 / 设置（默认 30 天，0 表示永久） ──
   async GET_RETENTION(): Promise<RetentionResponse> {
     return { days: await getRetentionDays() }
@@ -487,6 +645,59 @@ export const handlers: Record<string, Handler> = {
     const enabled = await setLabCorsUnblock(payload.enabled === true)
     await applyCorsRules(enabled) // 即时添加/移除 declarativeNetRequest 规则
     return { enabled }
+  },
+
+  // ── 实验室：图标点击弹极简用量看板（默认关闭）──
+  async GET_LAB_SHOWDASHBOARD(): Promise<LabShowDashboardResponse> {
+    return { enabled: await getLabShowDashboard() }
+  },
+
+  async SET_LAB_SHOWDASHBOARD(payload: LabShowDashboardPayload): Promise<LabShowDashboardResponse> {
+    const enabled = await setLabShowDashboard(payload.enabled === true)
+    // 实验室开关仅控制设置页顶部 Tab 显隐；图标单击行为由 clickBehavior 独立决定。
+    // 此处重算 applyIconBehavior 保持幂等（结果不受实验室开关影响）。
+    await applyIconBehavior()
+    return { enabled }
+  },
+
+  // ── 单击图标行为（配置界面，非实验室）：'panel' = 极简面板 / 'sidebar' = 侧边栏 ──
+  async GET_CLICK_BEHAVIOR(): Promise<ClickBehaviorResponse> {
+    return { behavior: await getClickBehavior() }
+  },
+
+  async SET_CLICK_BEHAVIOR(payload: ClickBehaviorPayload): Promise<ClickBehaviorResponse> {
+    const behavior = await setClickBehavior(payload.behavior === 'sidebar' ? 'sidebar' : 'panel')
+    // 同步图标点击行为（由 clickBehavior 独立决定，与实验室开关无关）。
+    await applyIconBehavior()
+    return { behavior }
+  },
+
+  /**
+   * 极简用量看板（popup 用）：返回每个中转站的名称 + 最新余额。
+   * 仅读取本地快照，不触网、不回显任何凭证。
+   */
+  async GET_DASHBOARD_SUMMARY(_payload: GetDashboardSummaryPayload): Promise<GetDashboardSummaryResponse> {
+    const [sites, snapshotsAll] = await Promise.all([siteRepo.list(), snapshotRepo.all()])
+    // 取每个站点最新一条快照（snapshotsAll 已新→旧排序）
+    const latestBySite = new Map<string, (typeof snapshotsAll)[number]>()
+    for (const s of snapshotsAll) {
+      if (!latestBySite.has(s.siteId)) latestBySite.set(s.siteId, s)
+    }
+    const items: DashboardSummaryItem[] = sites
+      .filter((site) => site.enabled !== false)
+      .map((site) => {
+        const snap = latestBySite.get(site.id)
+        return {
+          siteId: site.id,
+          name: site.name,
+          origin: site.origin,
+          balance: snap ? snap.balance : null,
+          currency: snap ? snap.currency : null,
+          updatedAt: snap ? snap.takenAt : null,
+          status: !snap ? 'no_data' : snap.status,
+        }
+      })
+    return { items }
   },
 
   /**
@@ -585,34 +796,142 @@ export const handlers: Record<string, Handler> = {
     return config
   },
 
-  // 导入配置：UI 侧已申请权限，SW 逐站 contains 校验 + 白名单构造（P0-2 不信任导入文件字段）
-  async IMPORT_CONFIG(payload: { config: ExportConfig }) {
+  // 导入配置：UI 侧已申请权限，SW 逐站校验 + 按 origin 幂等 upsert（P0-2 不信任导入文件字段）。
+  // 任何单站异常都被捕获并计入 skipped，绝不整批抛出 → UI 可给出「成功 N / 更新 M / 跳过 K（原因）」，
+  // 而非笼统的「操作失败」。整函数再包一层 try/catch，DB 致命错误返回 fatalError 引导用户修复。
+  async IMPORT_CONFIG(payload: { config: ExportConfig }): Promise<{
+    imported: number
+    updated: number
+    skipped: { name: string; reason: string }[]
+    fatalError?: string
+  }> {
     const sites = payload.config?.sites ?? []
-    let imported = 0
-    for (const s of sites) {
-      // 校验适配器类型（不信任导入文件的 adapter 字段）
-      if (!registry.has(s.adapter)) continue
-      const origin = normalizeOrigin(s.baseUrl)
-      const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] })
-      if (!granted) continue
-      // 白名单构造 + 生成新 ID（不信任导入文件的 id，防冲突/伪造）
-      const site: SiteConfig = {
-        id: crypto.randomUUID(),
-        name: s.name || origin,
-        baseUrl: s.baseUrl,
-        origin,
-        adapter: s.adapter,
-        color: s.color || COLORS[Math.floor(Math.random() * COLORS.length)],
-        enabled: s.enabled ?? true,
-        order: await siteRepo.nextOrder(),
-        createdAt: Date.now(),
-        lastCollectAt: null,
-        lastStatus: 'unknown',
+    console.info('[AI Relay] IMPORT_CONFIG 入口', {
+      count: sites.length,
+      adapters: sites.map((s) => s.adapter),
+    })
+
+    // 内部执行体（含逐步日志），外层 try 捕获 DB 致命错误
+    const run = async (): Promise<{
+      imported: number
+      updated: number
+      skipped: { name: string; reason: string }[]
+      fatalError?: string
+    }> => {
+      let added = 0
+      let updated = 0
+      const skipped: { name: string; reason: string }[] = []
+      try {
+        console.info('[AI Relay] 导入：读取现有站点（siteRepo.list）...')
+        const existing = await siteRepo.list()
+        console.info('[AI Relay] 导入：现有站点读取完成', { count: existing.length })
+        const byOrigin = new Map(existing.map((s) => [s.origin, s]))
+        for (const s of sites) {
+          const name = s.name || normalizeOrigin(s.baseUrl)
+          try {
+            if (!registry.has(s.adapter)) {
+              console.warn('[AI Relay] 导入：跳过未知适配器', { name, adapter: s.adapter })
+              skipped.push({ name, reason: '未知适配器类型' })
+              continue
+            }
+            const origin = normalizeOrigin(s.baseUrl)
+            console.info('[AI Relay] 导入：权限检查', { name, origin })
+            const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] })
+            console.info('[AI Relay] 导入：权限检查结果', { name, origin, granted })
+            if (!granted) {
+              console.warn('[AI Relay] 导入：缺 host 权限', { name, origin })
+              skipped.push({ name, reason: '缺少 host 权限（请在导入前允许该域名）' })
+              continue
+            }
+            const found = byOrigin.get(origin)
+            if (found) {
+              await siteRepo.update(found.id, {
+                name: s.name || found.name,
+                baseUrl: s.baseUrl,
+                origin,
+                adapter: s.adapter,
+                color: s.color || found.color,
+                enabled: s.enabled ?? found.enabled,
+                currency: s.currency || found.currency || 'USD',
+                lastStatus: 'unknown',
+                lastCollectAt: null,
+              })
+              await credentialRepo.setAuthorized(found.id, false)
+              updated += 1
+              console.info('[AI Relay] 导入：更新站点完成', { name, origin })
+            } else {
+              // 白名单构造 + 生成新 ID（不信任导入文件的 id，防冲突/伪造）
+              const site: SiteConfig = {
+                id: crypto.randomUUID(),
+                name: s.name || origin,
+                baseUrl: s.baseUrl,
+                origin,
+                adapter: s.adapter,
+                color: s.color || COLORS[Math.floor(Math.random() * COLORS.length)],
+                enabled: s.enabled ?? true,
+                order: await siteRepo.nextOrder(),
+                createdAt: Date.now(),
+                lastCollectAt: null,
+                lastStatus: 'unknown',
+                currency: s.currency || 'USD',
+              }
+              console.info('[AI Relay] 导入：写入新站点（siteRepo.add）', { name, origin })
+              await siteRepo.add(site)
+              await credentialRepo.setAuthorized(site.id, false)
+              added += 1
+              console.info('[AI Relay] 导入：新增站点完成', { name, origin, id: site.id })
+            }
+          } catch (e) {
+            console.error('[AI Relay] 导入：单站写入异常', {
+              name,
+              error: e instanceof Error ? e.message : String(e),
+            })
+            skipped.push({
+              name,
+              reason: '存储写入失败：' + (e instanceof Error ? e.message : String(e)).slice(0, 60),
+            })
+          }
+        }
+        console.info('[AI Relay] IMPORT_CONFIG 内部完成', { imported: added, updated, skipped: skipped.length })
+        return { imported: added, updated, skipped }
+      } catch (e) {
+        console.error('[AI Relay] IMPORT_CONFIG 致命错误', e)
+        return {
+          imported: 0,
+          updated: 0,
+          skipped,
+          fatalError:
+            '存储读写异常，请尝试在扩展管理页「清除站点数据」后重新导入（或重新加载扩展）',
+        }
       }
-      await siteRepo.add(site)
-      await credentialRepo.setAuthorized(site.id, false)
-      imported += 1
     }
-    return { imported }
+
+    // 看门狗：若 IndexedDB 卡死导致 30s 静默超时，10s 即给出明确结论
+    const watchdog = new Promise<{
+      imported: number
+      updated: number
+      skipped: { name: string; reason: string }[]
+      fatalError?: string
+    }>((resolve) => {
+      setTimeout(() => {
+        console.error('[AI Relay] IMPORT_CONFIG 看门狗触发：处理超过 10s，疑似 IndexedDB 卡死')
+        resolve({
+          imported: 0,
+          updated: 0,
+          skipped: [],
+          fatalError:
+            '导入处理超时（疑似本地数据库 IndexedDB 卡死）。建议：① 扩展管理页「清除站点数据」→ 重新加载扩展 → 再导入；② 或直接卸载重装本扩展后重新添加站点。',
+        })
+      }, 10_000)
+    })
+
+    const result = await Promise.race([run(), watchdog])
+    console.info('[AI Relay] IMPORT_CONFIG 结束（返回给 Options）', {
+      imported: result.imported,
+      updated: result.updated,
+      skipped: result.skipped.length,
+      hasFatal: !!result.fatalError,
+    })
+    return result
   },
 }

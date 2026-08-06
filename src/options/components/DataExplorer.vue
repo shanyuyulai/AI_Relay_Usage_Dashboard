@@ -7,10 +7,15 @@ import type {
   CollectIntervalResponse,
   LabZeroTabResponse,
   LabCorsResponse,
+  LabShowDashboardResponse,
+  ClickBehaviorResponse,
   ResetDataResponse,
 } from '../../core/messaging/protocol'
 import type { SiteConfig, Snapshot, DailyStat, CustomCaptureRecord } from '../../shared/types'
 import { fmtBalance, fmtTokens, fmtNum, fmtDateTime } from '../../shared/format'
+import { settingsRepo } from '../../storage/config'
+import { getLabShowDashboard, setLabShowDashboard } from '../../storage/labConfig'
+import { resolveNotifyMode, type NotifyMode } from '../../shared/notify'
 
 const props = defineProps<{ sites: SiteConfig[] }>()
 
@@ -42,6 +47,26 @@ const customValue = ref<number>(30)
 const labEnabled = ref<boolean>(false)
 // 实验室：动态 CORS 放行开关（默认关闭）
 const labCorsEnabled = ref<boolean>(false)
+// 实验室：图标点击弹极简用量看板开关（默认关闭）
+const labShowDashboard = ref<boolean>(false)
+// 配置界面：单击图标行为（默认「极简面板」）
+const clickBehavior = ref<'panel' | 'sidebar'>('panel')
+// 采集通知档位（设置页可切换）
+const notifyMode = ref<NotifyMode>('system')
+async function onNotifyModeChange() {
+  try {
+    await settingsRepo.set('aihub.notifyMode', notifyMode.value)
+  } catch {
+    /* 设置持久化失败静默忽略 */
+  }
+}
+async function loadNotify() {
+  try {
+    notifyMode.value = await resolveNotifyMode()
+  } catch {
+    notifyMode.value = 'system'
+  }
+}
 const data = ref<GetSiteDataResponse | null>(null)
 const loading = ref(false)
 const msg = ref('')
@@ -70,6 +95,17 @@ const selectedSite = computed<SiteConfig | undefined>(() =>
     ? undefined
     : props.sites.find((s) => s.id === selectedSiteId.value),
 )
+
+// 站点 id → 名称 的查询表，用于「余额历史」表格按行显示所属站点。
+// 已删除/不存在的站点回退显示原 id，避免表格留空。
+const siteNameById = computed(() => {
+  const m = new Map<string, string>()
+  for (const s of props.sites) m.set(s.id, s.name)
+  return m
+})
+function siteNameOf(id: string): string {
+  return siteNameById.value.get(id) ?? id
+}
 
 function paginate<T>(list: T[], page: number): T[] {
   const start = (page - 1) * pageSize.value
@@ -185,6 +221,48 @@ async function saveLabCors() {
         ? '已开启动态 CORS 放行（实验性）：扩展会尝试给已启用站点的响应添加 Access-Control-Allow-Origin: *'
         : '已关闭动态 CORS 放行',
     )
+  } catch (e) {
+    showMsg(e instanceof MessagingError ? e.message : String(e))
+  }
+}
+
+async function loadLabShowDashboard() {
+  try {
+    const res = await send<LabShowDashboardResponse>('GET_LAB_SHOWDASHBOARD')
+    labShowDashboard.value = res.enabled
+  } catch {
+    /* 忽略，默认关闭 */
+  }
+}
+
+async function saveLabShowDashboard() {
+  try {
+    const res = await send<LabShowDashboardResponse>('SET_LAB_SHOWDASHBOARD', { enabled: labShowDashboard.value })
+    labShowDashboard.value = res.enabled
+    showMsg(
+      res.enabled
+        ? '已开启实验室「用量看板」：设置页顶部将显示「📊 用量看板」Tab'
+        : '已关闭实验室「用量看板」：设置页顶部「📊 用量看板」Tab 已隐藏',
+    )
+  } catch (e) {
+    showMsg(e instanceof MessagingError ? e.message : String(e))
+  }
+}
+
+async function loadClickBehavior() {
+  try {
+    const res = await send<ClickBehaviorResponse>('GET_CLICK_BEHAVIOR')
+    clickBehavior.value = res.behavior
+  } catch {
+    /* 忽略，默认极简面板 */
+  }
+}
+
+async function saveClickBehavior() {
+  try {
+    const res = await send<ClickBehaviorResponse>('SET_CLICK_BEHAVIOR', { behavior: clickBehavior.value })
+    clickBehavior.value = res.behavior
+    showMsg(res.behavior === 'panel' ? '已设置：单击图标弹极简面板' : '已设置：单击图标打开侧边栏')
   } catch (e) {
     showMsg(e instanceof MessagingError ? e.message : String(e))
   }
@@ -362,6 +440,9 @@ onMounted(() => {
   loadInterval()
   loadLab()
   loadLabCors()
+  loadLabShowDashboard()
+  loadClickBehavior()
+  loadNotify()
 })
 </script>
 
@@ -420,6 +501,44 @@ onMounted(() => {
       </div>
     </div>
 
+    <details class="settings-card">
+      <summary>🔔 采集通知 <span class="settings-summary-hint">（默认折叠）</span></summary>
+      <p class="settings-desc">控制后台自动采集 / 手动同步完成后的通知方式。</p>
+      <div class="radio-group">
+        <label class="radio-item">
+          <input type="radio" value="system" v-model="notifyMode" @change="onNotifyModeChange" />
+          <span><b>系统弹窗通知</b><br /><small>每次采集都弹出系统级通知（默认行为）</small></span>
+        </label>
+        <label class="radio-item">
+          <input type="radio" value="optionsOnly" v-model="notifyMode" @change="onNotifyModeChange" />
+          <span><b>仅配置界面通知</b><br /><small>只在扩展设置页打开时，于页内显示提示（配置界面打开时才有效）</small></span>
+        </label>
+        <label class="radio-item">
+          <input type="radio" value="dailyFirst" v-model="notifyMode" @change="onNotifyModeChange" />
+          <span><b>每天第一次调用时通知</b><br /><small>同一天内仅首次采集弹窗，其余静默</small></span>
+        </label>
+        <label class="radio-item">
+          <input type="radio" value="off" v-model="notifyMode" @change="onNotifyModeChange" />
+          <span><b>完全关闭通知</b><br /><small>任何采集都不发通知</small></span>
+        </label>
+      </div>
+    </details>
+
+    <details class="settings-card">
+      <summary>🖱️ 单击图标行为</summary>
+      <p class="settings-desc">设置单击工具栏图标时的动作（本设置独立生效，与下方实验室「用量看板」开关无关）。</p>
+      <div class="radio-group">
+        <label class="radio-item">
+          <input type="radio" value="panel" v-model="clickBehavior" @change="saveClickBehavior" />
+          <span><b>极简面板</b><br /><small>单击图标弹出只含各中转站名称 + 剩余金额的极简看板（默认）</small></span>
+        </label>
+        <label class="radio-item">
+          <input type="radio" value="sidebar" v-model="clickBehavior" @change="saveClickBehavior" />
+          <span><b>侧边栏</b><br /><small>单击图标打开完整的用量看板侧边栏</small></span>
+        </label>
+      </div>
+    </details>
+
     <details class="lab">
       <summary>🧪 实验室功能（实验性 · 默认关闭）</summary>
       <div class="lab-body">
@@ -461,6 +580,19 @@ onMounted(() => {
           <b>局限与提示：</b>① 该功能依赖 Chrome MV3 的声明式网络请求，部分版本/策略可能不生效；② 仍受
           <code>SameSite</code>、CSRF、内存态 Token（如 ikuncode 的 localStorage Bearer）限制；③
           <strong>如仍失败，可尝试安装浏览器插件「CORS Unblock」作为备选</strong>；④ 本功能仅影响扩展自身发起的请求，不会修改你正常浏览该站时的响应。
+        </p>
+
+        <hr class="lab-hr" />
+
+        <label class="lab-toggle">
+          <input type="checkbox" v-model="labShowDashboard" @change="saveLabShowDashboard" />
+          <span>用量看板（实验性 · 默认关闭）</span>
+        </label>
+        <p class="lab-warn">
+          这是什么：开启后，设置页顶部会显示「📊 用量看板」Tab，可在其中查看完整复刻的用量看板页。关闭则隐藏该 Tab。本开关只控制顶部 Tab 的显隐，与「🖱️ 单击图标行为」相互独立。
+        </p>
+        <p class="lab-warn">
+          关于「悬浮(hover)」：Chrome 扩展的工具栏图标没有「鼠标悬停弹出自定义浮层」的原生 API（只有系统自带的 tooltip 文字）。极简面板是单击触发的原生 popup，这是 MV3 下能做成的形态。
         </p>
       </div>
     </details>
@@ -505,6 +637,7 @@ onMounted(() => {
           <thead>
             <tr>
               <th>时间</th>
+              <th>站点</th>
               <th>余额</th>
               <th>当日用量</th>
               <th>当日请求</th>
@@ -517,9 +650,10 @@ onMounted(() => {
             </tr>
           </thead>
           <tbody>
-            <template v-for="s in snapshotsView" :key="'s' + s.takenAt">
-              <tr @click="toggleExpand('s' + s.takenAt)">
+            <template v-for="s in snapshotsView" :key="'s' + s.siteId + ':' + s.takenAt">
+              <tr @click="toggleExpand('s' + s.siteId + ':' + s.takenAt)">
                 <td>{{ fmtDateTime(s.takenAt) }}</td>
+                <td :title="s.siteId">{{ siteNameOf(s.siteId) }}</td>
                 <td>{{ fmtBalance(s.balance, s.currency) }}</td>
                 <td>{{ fmtTokens(s.todayTokens) }}</td>
                 <td>{{ fmtNum(s.todayRequests) }}</td>
@@ -528,10 +662,10 @@ onMounted(() => {
                 <td>{{ s.channel }}</td>
                 <td>{{ s.quality }}</td>
                 <td>{{ s.status }}</td>
-                <td class="exp">{{ expanded.has('s' + s.takenAt) ? '▾' : '▸' }}</td>
+                <td class="exp">{{ expanded.has('s' + s.siteId + ':' + s.takenAt) ? '▾' : '▸' }}</td>
               </tr>
               <tr v-if="expanded.has('s' + s.takenAt)">
-                <td colspan="10" class="json-cell">
+                <td colspan="11" class="json-cell">
                   <pre>{{ JSON.stringify(s, null, 2) }}</pre>
                 </td>
               </tr>

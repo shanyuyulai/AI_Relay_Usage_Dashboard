@@ -104,6 +104,14 @@ export interface PageCollectResult {
   usageRecordsComplete: boolean
   /** 截断原因（人类可读；无则 null） */
   usageRecordsTruncatedReason: string | null
+  /** 用量明细采集是否真正执行过（true=即使结果为空也应覆盖旧批次；undefined=未尝试，不动旧批次） */
+  usageCollected?: boolean
+  /** 用量采集是否失败（请求/解析/分页异常）。失败时绝不当作「成功空日」覆盖历史批次（GPT P0-I2） */
+  usageFailed?: boolean
+  /** 页面世界实际使用的业务日（YYYY-MM-DD），供 SW 落库批次与缓存失效对齐，避免跨午夜错位 */
+  usageListDay?: string | null
+  usageListPath?: string | null
+  usageListKind?: 'hubway_v1' | 'generic' | null
 }
 
 // ⚠️ 候选路径列表已内联到各页面世界函数体内。
@@ -177,10 +185,26 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
   function isRecord(v: unknown): v is Record<string, unknown> {
     return v != null && typeof v === 'object' && !Array.isArray(v)
   }
-  function unwrap(raw: unknown): Record<string, unknown> | null {
+  function unwrap(raw: unknown): any {
+    if (Array.isArray(raw)) return raw
     if (!isRecord(raw)) return null
-    if ('data' in raw && isRecord((raw as any).data)) return (raw as any).data as Record<string, unknown>
-    return raw as Record<string, unknown>
+    if ('data' in raw && (isRecord((raw as any).data) || Array.isArray((raw as any).data))) return (raw as any).data
+    return raw
+  }
+
+  /** Find a paginated list without assuming the server's exact wrapper depth. */
+  function findList(data: any, depth = 0): any[] | null {
+    if (Array.isArray(data)) return data
+    if (!isRecord(data) || depth > 3) return null
+    for (const key of ['items', 'list', 'records', 'rows', 'results', 'data']) {
+      const value = (data as any)[key]
+      if (Array.isArray(value)) return value
+      if (isRecord(value)) {
+        const nested = findList(value, depth + 1)
+        if (nested) return nested
+      }
+    }
+    return null
   }
 
   const cookiePresent = document.cookie.length > 0
@@ -231,7 +255,7 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
         const text = await res.text()
         try {
           const json = text ? JSON.parse(text) : null
-          if (isRecord(json)) {
+          if (isRecord(json) || Array.isArray(json)) {
             topKeys = Object.keys(json)
             hasWrapper = 'success' in json || 'data' in json
             sample = json
@@ -247,12 +271,24 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
       let hasHourlyStructure = false
       let hasUserId = false
       if (sample != null) {
-        const data = unwrap(sample)
-        if (data) {
-          dataFieldNames = Object.keys(data)
-          const types: Record<string, string> = {}
-          for (const k of dataFieldNames) types[k] = typeof (data as any)[k]
-          dataFieldTypes = types
+      const data = unwrap(sample)
+      const list = findList(data)
+      if (list && list.some((v: unknown) => isRecord(v))) {
+        const first = list.find((v: unknown) => isRecord(v)) as Record<string, unknown> | undefined
+        dataFieldNames = first ? Object.keys(first) : []
+        const types: Record<string, string> = {}
+        for (const k of dataFieldNames) types[k] = typeof first?.[k]
+        dataFieldTypes = types
+        hasDataArray = true
+        hasHourlyStructure =
+          dataFieldNames.includes('created_at') &&
+          (dataFieldNames.includes('token_used') || dataFieldNames.includes('prompt_tokens'))
+        hasUserId = !!first && ID_PATHS.some((p) => getPath(first, p) != null)
+      } else if (data) {
+        dataFieldNames = Object.keys(data)
+        const types: Record<string, string> = {}
+        for (const k of dataFieldNames) types[k] = typeof (data as any)[k]
+        dataFieldTypes = types
           // 数组特征：data 第一个值为数组，或 data 仅一个数组字段
           hasDataArray =
             Array.isArray(Object.values(data)[0]) ||
@@ -306,7 +342,11 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
   }
 
   // 第二遍：用量候选（GPT P0-1 自动主动探测，不 break，记录全部指纹供分类）
+  const probeDay = new Date(Date.now() + 480 * 60 * 1000)
+  const probeDayKey = `${probeDay.getUTCFullYear()}-${String(probeDay.getUTCMonth() + 1).padStart(2, '0')}-${String(probeDay.getUTCDate()).padStart(2, '0')}`
   const USAGE_CANDIDATE_PATHS = [
+    `/api/v1/usage?page=1&page_size=20&start_date=${probeDayKey}&end_date=${probeDayKey}&sort_by=created_at&sort_order=desc&timezone=Asia%2FShanghai`,
+    '/api/usage?page=1&page_size=50',
     '/api/data/self',
     '/api/v1/data/self',
     '/api/user/usage',
@@ -397,10 +437,26 @@ export async function collectInPage(
   function isRecord(v: unknown): v is Record<string, unknown> {
     return v != null && typeof v === 'object' && !Array.isArray(v)
   }
-  function unwrap(raw: unknown): Record<string, unknown> | null {
+  function unwrap(raw: unknown): any {
+    if (Array.isArray(raw)) return raw
     if (!isRecord(raw)) return null
-    if ('data' in raw && isRecord((raw as any).data)) return (raw as any).data as Record<string, unknown>
-    return raw as Record<string, unknown>
+    if ('data' in raw && (isRecord((raw as any).data) || Array.isArray((raw as any).data))) return (raw as any).data
+    return raw
+  }
+
+  /** Find a paginated list without assuming the server's exact wrapper depth. */
+  function findList(data: any, depth = 0): any[] | null {
+    if (Array.isArray(data)) return data
+    if (!isRecord(data) || depth > 3) return null
+    for (const key of ['items', 'list', 'records', 'rows', 'results', 'data']) {
+      const value = (data as any)[key]
+      if (Array.isArray(value)) return value
+      if (isRecord(value)) {
+        const nested = findList(value, depth + 1)
+        if (nested) return nested
+      }
+    }
+    return null
   }
   async function fetchJson(url: string): Promise<{ status: number; json: any; isJson: boolean }> {
     const controller = new AbortController()
@@ -460,7 +516,9 @@ export async function collectInPage(
       const modelMap = new Map<string, number>()
       for (const item of data) {
         if (!isRecord(item)) continue
-        const t = findNumber(item, ['tokens', 'token', 'consumption', 'cost', 'usage', 'used', 'total_tokens', 'totalTokens'])
+        const t = findNumber(item, [
+          'tokens', 'token', 'token_used', 'consumption', 'cost', 'usage', 'used', 'total_tokens', 'totalTokens',
+        ])
         const r = findNumber(item, ['requests', 'request', 'count', 'calls', 'total_requests', 'totalRequests'])
         const m =
           typeof item['model'] === 'string'
@@ -488,8 +546,9 @@ export async function collectInPage(
       getPath(data, 'list') ??
       getPath(data, 'data.items') ??
       getPath(data, 'data.list')
-    if (Array.isArray(list)) {
-      const sub = extractUsage(list)
+    const nestedList = Array.isArray(list) ? list : findList(data)
+    if (Array.isArray(nestedList)) {
+      const sub = extractUsage(nestedList)
       if (sub && (sub.tokens != null || sub.requests != null)) {
         return { tokens: tokens ?? sub.tokens, requests: requests ?? sub.requests, byModel: sub.byModel }
       }
@@ -540,6 +599,14 @@ export async function collectInPage(
   let usageRecords: UsageRecord[] = []
   let usageRecordsComplete = false
   let usageRecordsTruncatedReason: string | null = null
+  // 是否真正进入过 usage_list 采集（供 SW 区分「成功但空」与「未尝试」，GPT P1-scope）
+  let usageCollected = false
+  // 用量采集是否失败（请求/解析/分页异常）：失败时绝不当作「成功空日」覆盖历史批次（GPT P0-I2）
+  let usageFailed = false
+  // 页面世界实际使用的业务日（跨午夜时与 SW 的 now 可能不同，供 SW 落库对齐）
+  let targetDay: string | null = null
+  let selectedUsageListPath: string | null = null
+  let selectedUsageListKind: 'hubway_v1' | 'generic' | null = null
 
   // ===== 诊断日志（脱敏指纹，P0-1/P0-4）=====
   const diags: Array<{
@@ -823,6 +890,16 @@ export async function collectInPage(
           let itemCount = 0
           const seen = new Set<string>()
 
+          function logTs(item: any): number | null {
+            const raw = item?.created_at ?? item?.timestamp ?? item?.created_at_unixtime ?? item?.time
+            if (raw == null) return null
+            if (typeof raw === 'number') return raw < 1e12 ? raw * 1000 : raw
+            const numeric = Number(String(raw).replace(/,/g, '').trim())
+            if (Number.isFinite(numeric)) return numeric < 1e12 ? numeric * 1000 : numeric
+            const parsed = Date.parse(String(raw))
+            return Number.isNaN(parsed) ? null : parsed
+          }
+
           // 去重键：优先用 log.id，否则组合键
           function dedupKey(item: any): string | null {
             if (typeof item.id === 'number' || typeof item.id === 'string') return `id:${item.id}`
@@ -831,7 +908,8 @@ export async function collectInPage(
             const pt = String(item.prompt_tokens ?? item.input_tokens ?? '')
             const ct = String(item.completion_tokens ?? item.output_tokens ?? '')
             if (!model && !ts) return null // 无法去重，仍计入
-            return `${model}|${ts}|${pt}|${ct}`
+            const tk = String(item.token_used ?? item.total_tokens ?? item.tokens ?? '')
+            return `${model}|${ts}|${pt}|${ct}|${tk}`
           }
 
           for (let p = 0; p < MAX_PAGES; p++) {
@@ -843,7 +921,7 @@ export async function collectInPage(
             const d = unwrap(json)
             if (!d) { recordDiag('usage', lUrl, status, 'application/json', Math.round(lDt), null, `日志分页 p=${p} 无法 unwrap`); break }
             recordDiag('usage', lUrl, status, 'application/json', Math.round(lDt), d, `日志分页 p=${p}`)
-            const arr: any[] = (Array.isArray(d) ? d : (Array.isArray((d as any).data) ? (d as any).data : (Array.isArray((d as any).items) ? (d as any).items : (Array.isArray((d as any).list) ? (d as any).list : []))))
+            const arr: any[] = findList(d) ?? []
             if (arr.length === 0) break
             pageCount++
 
@@ -851,11 +929,7 @@ export async function collectInPage(
             let earliestBeyondToday = false
             for (const item of arr) {
               if (!isRecord(item)) continue
-              const ts = typeof item.created_at === 'number'
-                ? item.created_at * 1000
-                : typeof item.created_at === 'string'
-                  ? new Date(item.created_at).getTime()
-                  : null
+              const ts = logTs(item)
               if (ts != null && ts < fromMs) {
                 earliestBeyondToday = true
                 break // 此条已越过今天，但同页后续可能还有今天的
@@ -869,11 +943,7 @@ export async function collectInPage(
               if (itemType !== 2 && typeof (item as any).model_name !== 'string') continue
 
               // 时间过滤：只算今天的
-              const itemTs = typeof item.created_at === 'number'
-                ? item.created_at * 1000
-                : typeof item.created_at === 'string'
-                  ? new Date(item.created_at).getTime()
-                  : null
+              const itemTs = logTs(item)
               if (itemTs != null && (itemTs < fromMs || itemTs > toMs)) continue
 
               // 去重
@@ -883,8 +953,9 @@ export async function collectInPage(
 
               const pt = toNumber((item as any).prompt_tokens ?? (item as any).input_tokens)
               const ct = toNumber((item as any).completion_tokens ?? (item as any).output_tokens)
-              if (!Number.isNaN(pt)) totalTokens += pt
-              if (!Number.isNaN(ct)) totalTokens += ct
+              const tk = toNumber((item as any).token_used ?? (item as any).total_tokens ?? (item as any).tokens)
+              const splitTokens = (!Number.isNaN(pt) ? pt : 0) + (!Number.isNaN(ct) ? ct : 0)
+              totalTokens += splitTokens > 0 || Number.isNaN(tk) ? splitTokens : tk
               const c = extractCost(item)
               if (c != null) totalCost += c
               totalReqs++
@@ -963,9 +1034,64 @@ export async function collectInPage(
 
     // ===== 当日用量明细列表（usage_list）：采集 /api/v1/usage 等，供详情页「当日使用趋势」画图 =====
     // 完全自包含；仅白名单字段落账（P0-2）；按业务日过滤；分页读到终点或上限（P1：完整性）。
-    const usageListEp = endpoints.find((e: any) => e.role === 'usage_list')
+    const configuredUsageListEps = endpoints.filter((e: any) => e.role === 'usage_list' && e.path)
+    const usageListCandidates = [...configuredUsageListEps]
+    const candidatePaths = new Set(usageListCandidates.map((e: any) => e.path))
+    for (const fallback of [
+      { role: 'usage_list', endpointId: 'usageV1', path: '/api/v1/usage', usageListKind: 'hubway_v1' },
+      { role: 'usage_list', endpointId: 'usageList', path: '/api/usage', usageListKind: 'generic' },
+    ]) {
+      if (!candidatePaths.has(fallback.path)) {
+        usageListCandidates.push(fallback)
+        candidatePaths.add(fallback.path)
+      }
+    }
+
+    // 先探测候选接口，避免旧配置把第一个路径写死后直接放弃另一条可用路径。
+    // 这里只判断 HTTP/JSON/列表结构，正式请求仍由下方统一分页和字段白名单解析。
+    const probeUsageListArray = (raw: any): any[] | null => findList(unwrap(raw))
+    const usageProbeDate = (kind: string): { target: string; end: string; offset: number } => {
+      const offset = kind === 'hubway_v1' ? 480 : -(new Date().getTimezoneOffset())
+      const fmt = (d: Date) => {
+        const y = d.getUTCFullYear()
+        const m = String(d.getUTCMonth() + 1).padStart(2, '0')
+        const day = String(d.getUTCDate()).padStart(2, '0')
+        return `${y}-${m}-${day}`
+      }
+      const target = fmt(new Date(Date.now() + offset * 60000))
+      const end = fmt(new Date(Date.now() + 86400000 + offset * 60000))
+      return { target, end, offset }
+    }
+    let usageListEp: any = null
+    let firstValidUsageListEp: any = null
+    for (const candidate of usageListCandidates) {
+      const kind = candidate.usageListKind === 'hubway_v1' ? 'hubway_v1' : 'generic'
+      const probeDate = usageProbeDate(kind)
+      const q = kind === 'hubway_v1'
+        ? `page=1&page_size=20&start_date=${probeDate.target}&end_date=${probeDate.end}&sort_by=created_at&sort_order=desc&timezone=Asia%2FShanghai`
+        : 'page=1&page_size=50'
+      try {
+        const probe = await fetchJson(`${origin}${candidate.path}?${q}`)
+        const list = probe.json ? probeUsageListArray(probe.json) : null
+        if (probe.status >= 200 && probe.status < 300 && probe.isJson && list !== null) {
+          firstValidUsageListEp ??= candidate
+          // A reachable empty endpoint is valid, but prefer another candidate that
+          // actually contains today's records when one is available.
+          if (list.length > 0) {
+            usageListEp = candidate
+            break
+          }
+        }
+      } catch {
+        // 当前候选网络失败，继续尝试下一个路径。
+      }
+    }
+    usageListEp ??= firstValidUsageListEp ?? usageListCandidates[0] ?? null
     if (usageListEp && usageListEp.path) {
-      const kind: string = usageListEp.usageListKind === 'hubway_v1' ? 'hubway_v1' : 'generic'
+      usageCollected = true
+      const kind: 'hubway_v1' | 'generic' = usageListEp.usageListKind === 'hubway_v1' ? 'hubway_v1' : 'generic'
+      selectedUsageListPath = usageListEp.path
+      selectedUsageListKind = kind
       const MAX_PAGES = 5
       const MAX_ITEMS = 200
       // 业务日时区偏移（分钟）：hubway 固定 +8；未知回落浏览器本地
@@ -977,7 +1103,7 @@ export async function collectInPage(
         return `${y}-${m}-${day}`
       }
       const dayKeyOf = (ts: number) => fmtDate(new Date(ts + tzOffMin * 60000))
-      const targetDay = dayKeyOf(Date.now())
+      targetDay = dayKeyOf(Date.now())
       const endDay = dayKeyOf(Date.now() + 86400000) // 多取一天，规避 end 独占/排他歧义，再客户端按业务日过滤
       const seenRec = new Set<string>()
       let recTotalTokens = 0
@@ -994,6 +1120,8 @@ export async function collectInPage(
         const raw = it?.created_at ?? it?.timestamp ?? it?.created_at_unixtime ?? it?.time
         if (raw == null) return null
         if (typeof raw === 'number') return raw < 1e12 ? raw * 1000 : raw
+        const numeric = Number(String(raw).replace(/,/g, '').trim())
+        if (Number.isFinite(numeric)) return numeric < 1e12 ? numeric * 1000 : numeric
         const n = Date.parse(String(raw))
         return Number.isNaN(n) ? null : n
       }
@@ -1024,7 +1152,7 @@ export async function collectInPage(
         const model = recModel(it)
         const pt = recNum(it, ['prompt_tokens', 'input_tokens']) ?? 0
         const ct = recNum(it, ['completion_tokens', 'output_tokens']) ?? 0
-        const tk = recNum(it, ['total_tokens', 'tokens']) ?? pt + ct
+        const tk = recNum(it, ['token_used', 'total_tokens', 'tokens']) ?? pt + ct
         const s = `${model}|${ts}|${pt}|${ct}|${tk}`
         let h = 0x811c9dc5
         for (let i = 0; i < s.length; i++) {
@@ -1032,6 +1160,86 @@ export async function collectInPage(
           h = Math.imul(h, 0x01000193)
         }
         return (h >>> 0).toString(16)
+      }
+
+      // —— 假名化（P0-2 / GPT P0-MAIN-WORLD-KEY）：敏感原文绝不回传 SW，页面世界就地无密钥 SHA-256 ——
+      // 命名空间只用页面自身 origin（非秘密）：按站点隔离假名，且任何扩展密钥都不进入不可信的 MAIN 世界。
+      const pseudoSalt: string = typeof origin === 'string' && origin ? origin : ''
+
+      /** 标准 SHA-256（hex）。无 WebCrypto（http 页面）时返回 null：敏感维度直接省略，而非降级为弱哈希。 */
+      async function sha256Hex(s: string): Promise<string | null> {
+        const subtle = (globalThis as any).crypto?.subtle
+        if (!subtle) return null
+        try {
+          const buf = await subtle.digest('SHA-256', new TextEncoder().encode(s))
+          const bytes = new Uint8Array(buf)
+          let out = ''
+          for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, '0')
+          return out
+        } catch {
+          return null
+        }
+      }
+
+      /**
+       * 有限并发 SHA-256：同值只算一次（缓存），12 路并发 Promise.all，保持输入顺序。
+       * 解决「每条记录串行 3 次 digest、200 条≈600 次串行 await」的采集卡顿（GPT P1-hash-perf）。
+       * helper 全部留在 collectInPage 内（MAIN 世界自包含约束）。
+       */
+      async function sha256Many(inputs: string[]): Promise<(string | null)[]> {
+        const cache = new Map<string, string | null>()
+        const out: (string | null)[] = new Array(inputs.length)
+        let cursor = 0
+        const CONCURRENCY = 12
+        async function worker(): Promise<void> {
+          while (true) {
+            const idx = cursor++
+            if (idx >= inputs.length) return
+            const input = inputs[idx]
+            const cached = cache.get(input)
+            if (cached !== undefined) {
+              out[idx] = cached
+              continue
+            }
+            const h = await sha256Hex(input)
+            cache.set(input, h)
+            out[idx] = h
+          }
+        }
+        const workers: Promise<void>[] = []
+        const n = Math.min(CONCURRENCY, inputs.length)
+        for (let w = 0; w < n; w++) workers.push(worker())
+        await Promise.all(workers)
+        return out
+      }
+
+      /** 只保留 pathname，剔除 query/hash/host（避免密钥挂在 query 上被泄漏）。解析失败或非 http(s) 一律返回 null。 */
+      function recEndpoint(it: any): string | null {
+        const raw = it?.endpoint ?? it?.api_path ?? it?.path ?? it?.route ?? it?.url
+        if (raw == null) return null
+        const s = String(raw).trim()
+        if (!s) return null
+        try {
+          const u = s.startsWith('http') ? new URL(s) : new URL(s, origin)
+          if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
+          const p = u.pathname
+          return p && p.length ? p.slice(0, 128) : null
+        } catch {
+          return null
+        }
+      }
+      function recStr(it: any, keys: string[], max: number): string | null {
+        for (const k of keys) {
+          const v = it?.[k]
+          if (v == null) continue
+          if (typeof v === 'string' && v.trim()) return v.trim().slice(0, max)
+          if (typeof v === 'number' || typeof v === 'boolean') return String(v).slice(0, max)
+        }
+        return null
+      }
+      function recCurrency(it: any, keys: string[]): string | null {
+        const c = recStr(it, keys, 8)
+        return c ? c.toUpperCase() : null
       }
 
       for (let p = 1; p <= MAX_PAGES; p++) {
@@ -1046,76 +1254,229 @@ export async function collectInPage(
         const { status, json, isJson } = await fetchJson(rUrl)
         const rDt = performance.now() - rt0
         if (!status || status >= 400 || !isJson || !json) {
+          usageFailed = true
           recordDiag('usage', rUrl, status || 0, 'application/json', Math.round(rDt), null, `用量明细 p=${p} 失败`)
+          break
+        }
+        if (isRecord(json) && (json as any).success === false) {
+          usageFailed = true
+          recordDiag('usage', rUrl, status, 'application/json', Math.round(rDt), null, `用量明细 p=${p} 业务失败`)
           break
         }
         const d: any = unwrap(json)
         if (!d) {
+          usageFailed = true
           recordDiag('usage', rUrl, status, 'application/json', Math.round(rDt), null, `用量明细 p=${p} 无法 unwrap`)
           break
         }
         recordDiag('usage', rUrl, status, 'application/json', Math.round(rDt), d, `用量明细 p=${p}`)
         // 兼容多种包裹形态：items / data.items / list / data.list
-        const arr: any[] = Array.isArray(d)
-          ? d
-          : Array.isArray(d.items)
-            ? d.items
-            : Array.isArray(d.data?.items)
-              ? d.data.items
-              : Array.isArray(d.list)
-                ? d.list
-                : Array.isArray(d.data?.list)
-                  ? d.data.list
-                  : []
+        const arr: any[] | null = findList(d)
+        if (arr === null) {
+          usageFailed = true
+          recordDiag('usage', rUrl, status, 'application/json', Math.round(rDt), d, `用量明细 p=${p} 响应格式不支持`)
+          break
+        }
         if (arr.length === 0) break
         recPageCount++
+        // 仅在 hubway_v1 适配器下采用服务端请求日志主键；通用站点一律用内容指纹，
+        // 避免把 user/token/model 等 id 误当请求主键导致去重漏数（GPT P1-record-id）。
+        const idKeys: string[] | null = kind === 'hubway_v1' ? ['id', 'request_id', 'log_id', 'trace_id', 'uuid'] : null
+
+        // ── 步骤 1：同步提取候选 + 待哈希原文（不触网、不串行 await） ──
+        interface Cand {
+          raw: any
+          ts: number
+          recHashVal: string
+          rawId: string | null
+          rawKey: string | null
+          rawIp: string | null
+          apiKeyLabel: string | null
+          pt: number
+          ct: number
+          tk: number
+          cost: number | null
+          costCurrency: string
+          endpoint: string | null
+          group: string | null
+          type: string | null
+          norm: string
+          hubway: {
+            cacheReadTokens: number | null
+            cacheCreationTokens: number | null
+            actualCost: number | null
+            actualCostCurrency: string | null
+            standardCost: number | null
+            standardCostCurrency: string | null
+            reasoningEffort: string | null
+            billingMode: string | null
+          } | null
+        }
+        const cands: Cand[] = []
         for (const item of arr) {
           if (!isRecord(item)) continue
           const ts = recTs(item)
           if (ts == null) continue
           // 业务日过滤：仅保留命中目标业务日的记录
           if (dayKeyOf(ts) !== targetDay) continue
-          const key = recHash(item)
-          if (seenRec.has(key)) continue
-          seenRec.add(key)
           const pt = recNum(item, ['prompt_tokens', 'input_tokens']) ?? 0
           const ct = recNum(item, ['completion_tokens', 'output_tokens']) ?? 0
-          const tk = recNum(item, ['total_tokens', 'tokens']) ?? pt + ct
+          // token 口径固定为 输入+输出（GPT P1-tokens）：服务端 total_tokens 可能含缓存/推理等计费 token，
+          // 与看板指标单列 cache token 的口径冲突；统一以 prompt+completion 为准。
+          const tk = recNum(item, ['token_used', 'total_tokens', 'tokens']) ?? pt + ct
           if (tk <= 0 && item.model_name == null && item.model == null) continue
           const cost = recCost(item)
+          // 跨币种防护（GPT P0-cost-currency）：普通 cost 也要按记录自身币种归属，绝不统一标策略币种后相加。
+          const costCurrency = cost != null ? recCurrency(item, ['cost_currency', 'currency']) ?? stratCurrency : stratCurrency
+          // 规范化内容串：用于强内容指纹（SHA-256）作主键，避免 32 位弱指纹碰撞漏数（GPT P1-weak-hash）
+          // 规范化内容串：结构化 JSON 编码所有影响行语义/筛选/聚合的字段（含 group/type/缓存 token/计费模式/密钥哈希输入），
+          // 杜绝分隔符拼接导致的歧义与维度缺失（GPT P1-weak-norm）。仅作 SHA-256 内容指纹输入，绝不以原文落库。
+          const norm = JSON.stringify({
+            m: recModel(item),
+            ts,
+            pt,
+            ct,
+            tk,
+            c: cost ?? null,
+            cur: costCurrency,
+            ep: recEndpoint(item) ?? null,
+            key: recStr(item, ['api_key', 'key', 'token'], 128),
+            grp: recStr(item, ['group', 'group_name', 'user_group'], 64),
+            typ: recStr(item, ['type', 'log_type', 'request_type'], 32),
+            cR: recNum(item, ['cache_read_input_tokens', 'cache_read_tokens', 'cached_tokens']),
+            cW: recNum(item, ['cache_creation_input_tokens', 'cache_creation_tokens', 'cache_write_tokens']),
+            bm: recStr(item, ['billing_mode', 'billingMode'], 32),
+            re: recStr(item, ['reasoning_effort', 'reasoning'], 16),
+          })
+          cands.push({
+            raw: item,
+            ts,
+            recHashVal: recHash(item),
+            rawId: idKeys ? recStr(item, idKeys, 128) : null,
+            // 仅对明确的密钥字段做假名化；token_name 等可读标签单独保留（见 apiKeyLabel，GPT P1-token-name）
+            rawKey: recStr(item, ['api_key', 'key', 'token'], 128),
+            rawIp: recStr(item, ['ip', 'client_ip', 'remote_ip'], 64),
+            // GPT P0-I1：绝不回传 token_name/apiKeyName/key_name 等「疑似可读标签」——通用分类器面对不受信的
+            // 接口响应，这些字段名不能证明值一定非敏感（服务端完全可能把真实 Token/Key 放在其中）。
+            // 只保留页面内派生的不可逆假标识 apiKeyId（哈希），标签一律置 null；如需标签展示，
+            // 只能为契约确认的专用适配器单独增加字段并做严格白名单。
+            apiKeyLabel: null,
+            pt,
+            ct,
+            tk,
+            cost,
+            costCurrency,
+            endpoint: recEndpoint(item),
+            group: recStr(item, ['group', 'group_name', 'user_group'], 64),
+            type: recStr(item, ['type', 'log_type', 'request_type'], 32),
+            norm,
+            hubway:
+              kind === 'hubway_v1'
+                ? {
+                    cacheReadTokens: recNum(item, ['cache_read_input_tokens', 'cache_read_tokens', 'cached_tokens']),
+                    cacheCreationTokens: recNum(item, ['cache_creation_input_tokens', 'cache_creation_tokens', 'cache_write_tokens']),
+                    actualCost: recNum(item, ['actual_cost', 'real_cost', 'charged_cost']),
+                    actualCostCurrency:
+                      recNum(item, ['actual_cost', 'real_cost', 'charged_cost']) != null
+                        ? recCurrency(item, ['actual_cost_currency', 'currency']) ?? stratCurrency
+                        : null,
+                    standardCost: recNum(item, ['standard_cost', 'origin_cost', 'list_cost']),
+                    standardCostCurrency:
+                      recNum(item, ['standard_cost', 'origin_cost', 'list_cost']) != null
+                        ? recCurrency(item, ['standard_cost_currency', 'currency']) ?? stratCurrency
+                        : null,
+                    reasoningEffort: recStr(item, ['reasoning_effort', 'reasoning'], 16),
+                    billingMode: recStr(item, ['billing_mode', 'billing_type', 'charge_mode'], 32),
+                  }
+                : null,
+          })
+        }
+
+        // ── 步骤 2：有限并发哈希（同值缓存；无 WebCrypto 时敏感维度返回 null → 降级省略） ──
+        const jobIndex = new Map<string, number>()
+        const jobInputs: string[] = []
+        const need = (input: string): number => {
+          let idx = jobIndex.get(input)
+          if (idx === undefined) {
+            idx = jobInputs.length
+            jobInputs.push(input)
+            jobIndex.set(input, idx)
+          }
+          return idx
+        }
+        const cRid: (number | null)[] = cands.map((c) => (c.rawId ? need(pseudoSalt + '|rid|' + c.rawId) : null))
+        const cKey: (number | null)[] = cands.map((c) => (c.rawKey ? need(pseudoSalt + '|k|' + c.rawKey) : null))
+        const cIp: (number | null)[] = cands.map((c) => (c.rawIp ? need(pseudoSalt + '|ip|' + c.rawIp) : null))
+        // 强内容指纹：规范化字段 SHA-256（无 WebCrypto 时返回 null，fallback 到 FNV 32 位）
+        const cHash: (number | null)[] = cands.map((c) => need(pseudoSalt + '|h|' + c.norm))
+        const jobResults = await sha256Many(jobInputs)
+
+        // ── 步骤 3：组装落库（保持顺序；按 (siteId, 业务日) 去重；累计） ──
+        for (let ci = 0; ci < cands.length; ci++) {
+          const c = cands[ci]
+          const ridH = cRid[ci] != null ? jobResults[cRid[ci] as number] : null
+          const keyH = cKey[ci] != null ? jobResults[cKey[ci] as number] : null
+          const ipH = cIp[ci] != null ? jobResults[cIp[ci] as number] : null
+          const hashH = cHash[ci] != null ? jobResults[cHash[ci] as number] : null
+          // 主键：hubway 用服务端主键（再哈希防明文）；通用站点用强内容指纹 SHA-256。
+          // 任一哈希在无 WebCrypto 时回退 FNV 32 位（弱，仅 http 页面降级，可接受的隐私权衡）。
+          const key =
+            c.rawId
+              ? 'r_' + (ridH ? ridH.slice(0, 24) : hashH ? hashH.slice(0, 32) : c.recHashVal)
+              : 'h_' + (hashH ? hashH.slice(0, 32) : c.recHashVal)
+          if (seenRec.has(key)) continue
+          seenRec.add(key)
+          const apiKeyId = keyH ? 'k_' + keyH.slice(0, 16) : null
+          const ipHash = ipH ? 'ip_' + ipH.slice(0, 16) : null
+
           const rec: UsageRecord = {
             id: key,
-            ts,
-            model: recModel(item),
-            promptTokens: pt,
-            completionTokens: ct,
-            tokens: tk,
-            cost,
-            costCurrency: stratCurrency,
+            ts: c.ts,
+            model: recModel(c.raw),
+            promptTokens: c.pt,
+            completionTokens: c.ct,
+            tokens: c.tk,
+            cacheReadTokens: c.hubway?.cacheReadTokens ?? null,
+            cacheCreationTokens: c.hubway?.cacheCreationTokens ?? null,
+            cost: c.cost,
+            actualCost: c.hubway?.actualCost ?? null,
+            actualCostCurrency: c.hubway?.actualCostCurrency ?? null,
+            standardCost: c.hubway?.standardCost ?? null,
+            standardCostCurrency: c.hubway?.standardCostCurrency ?? null,
+            costCurrency: c.costCurrency,
+            endpoint: c.endpoint,
+            apiKeyId,
+            apiKeyLabel: c.apiKeyLabel,
+            ipHash,
+            reasoningEffort: c.hubway?.reasoningEffort ?? null,
+            group: c.group,
+            type: c.type,
+            billingMode: c.hubway?.billingMode ?? null,
           }
           recList.push(rec)
-          recTotalTokens += tk
+          recTotalTokens += c.tk
           recTotalReqs++
-          if (cost != null) recCostByCurrency[stratCurrency] = (recCostByCurrency[stratCurrency] || 0) + cost
+          // 跨币种防护（GPT P1-cross-currency）：按记录自身币种累加，绝不归入策略币种
+          if (c.cost != null) recCostByCurrency[c.costCurrency] = (recCostByCurrency[c.costCurrency] || 0) + c.cost
           recItemCount++
           if (recItemCount >= MAX_ITEMS) break
         }
+        if (recItemCount >= MAX_ITEMS) {
+          recComplete = false
+          recTruncated = `明细超 ${MAX_ITEMS} 条上限，已截断`
+          break
+        }
+
         // 分页完整性：hubway 读 has_more/total；其余以「本页满页」判断可能还有下一页
         let more = true
         if (kind === 'hubway_v1') {
-          const total = recNum(d, ['total']) ?? recNum(d.data, ['total'])
-          const hasMore = d.has_more ?? d.data?.has_more
+          const total = recNum(d, ['total', 'data.total', 'data.data.total'])
+          const hasMore = d.has_more ?? d.data?.has_more ?? d.data?.data?.has_more
           more = hasMore === true || (total != null && recList.length < total)
         } else {
           more = arr.length >= 50
         }
-        if (!more || recItemCount >= MAX_ITEMS) {
-          if (recItemCount >= MAX_ITEMS) {
-            recComplete = false
-            recTruncated = `明细超 ${MAX_ITEMS} 条上限，已截断`
-          }
-          break
-        }
+        if (!more) break
       }
       recList.sort((a, b) => a.ts - b.ts) // 升序，便于画图
       usageRecords = recList
@@ -1130,7 +1491,8 @@ export async function collectInPage(
       }
     }
   } catch {
-    /* 用量接口可选，不影响余额采集 */
+    // 用量接口可选，不影响余额采集；但须标记采集失败，避免把「空结果」误当「成功空日」覆盖历史批次（GPT P0-I2）
+    usageFailed = true
   }
 
   // Task #24：若余额端点未拿到累计Token/平均响应，但用量端点拿到了 → 回填（来源标注为 dashboard，因为来自站点权威接口）
@@ -1158,6 +1520,11 @@ export async function collectInPage(
     path: matchedPath,
     rawKeys,
     usageSource: usageSource ?? (todayTokens == null ? 'unavailable' : undefined),
+    usageCollected,
+    usageFailed,
+    usageListDay: targetDay,
+    usageListPath: selectedUsageListPath,
+    usageListKind: selectedUsageListKind,
     isPartial: isPartial || undefined,
     collectorVersion: collectorVersion || undefined,
     cumulativeTokens: finalCumulativeTokens,

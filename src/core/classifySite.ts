@@ -25,6 +25,7 @@ export interface SiteClassification {
   userSelfPath: string | null
   /** 当日用量明细适配器种类；仅当 capabilities 含 'usageList' 时非 null */
   usageListKind?: UsageListKind | null
+  usageListPath?: string | null
 }
 
 export interface EndpointActivation {
@@ -224,13 +225,32 @@ export function buildStrategy(
   }
 
   // 当日用量明细列表（hubway_v1 = /api/v1/usage，generic = /api/usage）
-  if (classification.capabilities.includes('usageList') && classification.usageListKind) {
-    const kind = classification.usageListKind
+  const usageListCandidates: Array<{ path: string; kind: UsageListKind }> = []
+  const addUsageListCandidate = (path: string, kind: UsageListKind) => {
+    const normalized = path.startsWith('/') ? path : `/${path}`
+    if (!usageListCandidates.some((c) => c.path === normalized)) usageListCandidates.push({ path: normalized, kind })
+  }
+  const discoveredKind = classification.usageListKind ?? null
+  const discoveredPath = classification.usageListPath?.trim() || ''
+  if (discoveredPath) {
+    addUsageListCandidate(
+      discoveredPath,
+      discoveredKind ?? (discoveredPath === '/api/v1/usage' ? 'hubway_v1' : 'generic'),
+    )
+  }
+  if (discoveredKind === 'generic') {
+    addUsageListCandidate('/api/usage', 'generic')
+    addUsageListCandidate('/api/v1/usage', 'hubway_v1')
+  } else {
+    addUsageListCandidate('/api/v1/usage', 'hubway_v1')
+    addUsageListCandidate('/api/usage', 'generic')
+  }
+  for (const candidate of usageListCandidates) {
     endpoints.push({
       role: 'usage_list',
-      endpointId: kind === 'hubway_v1' ? 'usageV1' : 'usageList',
-      path: kind === 'hubway_v1' ? '/api/v1/usage' : '/api/usage',
-      usageListKind: kind,
+      endpointId: candidate.kind === 'hubway_v1' ? 'usageV1' : 'usageList',
+      path: candidate.path,
+      usageListKind: candidate.kind,
     })
   }
 

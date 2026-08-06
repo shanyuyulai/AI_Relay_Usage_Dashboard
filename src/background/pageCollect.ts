@@ -7,8 +7,9 @@
  *
  * 本模块负责：找/开站点标签页 → 注入 collectInPage → 把解析结果落库（不存任何 Cookie/Token 原文，P0-2）。
  */
-import { siteRepo, snapshotRepo, dailyStatRepo, captureRepo, purgeOlderThan, getRetentionDays, getLabZeroTab, diagnosticsRepo, usageRecordsRepo } from '../storage'
-import { notify } from '../shared/notify'
+import { siteRepo, snapshotRepo, dailyStatRepo, captureRepo, purgeOlderThan, getRetentionDays, getLabZeroTab, diagnosticsRepo, usageRecordsRepo, usageCache } from '../storage'
+import { USAGE_RECORD_SCHEMA_VERSION } from '../shared/types'
+import { maybeNotify, resolveNotifyMode } from '../shared/notify'
 import { collectViaSw } from './swCollect'
 import {
   collectInPage,
@@ -20,7 +21,7 @@ import {
 import { buildStrategy, type CollectStrategy } from '../core/classifySite'
 import type { SiteConfig, Snapshot, CustomCaptureRecord, UsageRecordBatch } from '../shared/types'
 import type { CollectResult } from './collector'
-import { dateKeyInTz, HUBWAY_TZ, todayKey } from '../shared/util'
+import { dateKeyInTz, HUBWAY_TZ, todayKey, isValidDateKey } from '../shared/util'
 
 /** 等待标签页加载完成（最多 10s）。 */
 function waitForTabLoad(tabId: number): Promise<void> {
@@ -57,18 +58,21 @@ export async function collectSiteInTab(site: SiteConfig, tabId: number): Promise
   }
 
   let res: PageCollectResult | undefined
+  let usageApiOk = false
   try {
     // 从 discovered 构建采集策略（若有分类信息则按 capabilities 激活端点）
     const discovered = site.discovered
     let strategyArg: any = null
-    if (discovered && discovered.family && discovered.capabilities && discovered.userSelfPath) {
+    if (discovered?.userSelfPath) {
       const strategy = buildStrategy(
         {
-          family: discovered.family as any,
+          family: (discovered.family as any) || 'unknown',
           routeProfile: (discovered.routeProfile as any) || 'standard',
-          capabilities: discovered.capabilities as any[],
+          capabilities: (discovered.capabilities as any[]) || [],
           confidence: (discovered.confidence as any) || 'medium',
           userSelfPath: discovered.userSelfPath,
+          usageListKind: discovered.usageListKind ?? null,
+          usageListPath: discovered.usageListPath ?? null,
         },
         discovered.userSelfPath,
         site.currency ?? undefined,
@@ -80,6 +84,7 @@ export async function collectSiteInTab(site: SiteConfig, tabId: number): Promise
         confidence: strategy.confidence,
         currency: strategy.currency,
         collectorVersion: strategy.collectorVersion,
+        // 注意：不注入任何扩展密钥到 MAIN 世界。假名化在页面内以无密钥 SHA-256 + 页面 origin 命名空间完成（GPT P0-MAIN-WORLD-KEY）。
       }
     }
     const [frame] = await chrome.scripting.executeScript({
@@ -111,6 +116,16 @@ export async function collectSiteInTab(site: SiteConfig, tabId: number): Promise
     const kind = expired ? ('AUTH_EXPIRED' as const) : ('NOT_FOUND' as const)
     await siteRepo.update(site.id, { lastStatus: status, lastCollectAt: Date.now(), lastError: res.reason })
     return { siteId: site.id, ok: false, errorKind: kind, message: res.reason }
+  }
+
+  if (res.usageListPath && res.usageListKind) {
+    await siteRepo.update(site.id, {
+      discovered: {
+        ...(site.discovered ?? {}),
+        usageListPath: res.usageListPath,
+        usageListKind: res.usageListKind,
+      },
+    })
   }
 
   const now = Date.now()
@@ -197,39 +212,79 @@ export async function collectSiteInTab(site: SiteConfig, tabId: number): Promise
     }
   }
 
-  // 写入当日用量明细批次（来自 usage_list 端点，如 hubway /api/v1/usage）
-  if (res.usageRecords && res.usageRecords.length > 0) {
+  // 写入当日用量明细批次（来自 usage_list 端点，如 hubway /api/v1/usage）。
+  // 三态处理（GPT P0-I2 / P1-empty-overwrite / P1-cross-midnight）：
+  //  - 未尝试采集（usageCollected 假/缺）：不动旧批次，避免误删已物化的历史数据。
+  //  - 采集失败（usageFailed 真）：不动旧批次、不失效缓存（空数组可能是请求/分页异常导致，绝非「成功空日」）。
+  //  - 尝试且成功但为空（usageCollected 真、usageFailed 假、records 空）：写 records:[] 的「完整空批次」以新 revision 覆盖旧批次。
+  //  - 尝试且有数据：正常写批次。
+  if (res.usageCollected && !res.usageFailed) {
+    // 业务日以页面世界实际使用的 targetDay 为准——跨午夜时 SW 的 now 可能与页面不一致，
+    // 用页面返回值才能与缓存失效键、聚合日界对齐（GPT P1-cross-midnight）。
     const isHubway = site.discovered?.usageListKind === 'hubway_v1'
-    const bizDate = isHubway ? dateKeyInTz(now, HUBWAY_TZ) : todayKey()
+    const fallbackDate = isHubway ? dateKeyInTz(now, HUBWAY_TZ) : todayKey()
+    const bizDate = res.usageListDay && isValidDateKey(res.usageListDay) ? res.usageListDay : fallbackDate
+    const records = res.usageRecords ?? []
+
+    // 币种分维度累计（P1-3：绝不跨币种求和）
     const costByCurrency: Record<string, number> = {}
+    const totalActualCostByCurrency: Record<string, number> = {}
+    const totalStandardCostByCurrency: Record<string, number> = {}
     let totalTokens = 0
-    for (const r of res.usageRecords) {
+    for (const r of records) {
       totalTokens += r.tokens
       if (r.cost != null) costByCurrency[r.costCurrency] = (costByCurrency[r.costCurrency] || 0) + r.cost
+      if (r.actualCost != null && r.actualCostCurrency) {
+        totalActualCostByCurrency[r.actualCostCurrency] = (totalActualCostByCurrency[r.actualCostCurrency] || 0) + r.actualCost
+      }
+      if (r.standardCost != null && r.standardCostCurrency) {
+        totalStandardCostByCurrency[r.standardCostCurrency] =
+          (totalStandardCostByCurrency[r.standardCostCurrency] || 0) + r.standardCost
+      }
     }
+    // 空结果但确实采集过 → 视为「完整空日」（接口确认无记录），isComplete=true；有数据时用端点返回值。
+    const isComplete = records.length > 0 ? !!res.usageRecordsComplete : true
     const batch: UsageRecordBatch = {
       id: `${site.id}:${bizDate}`,
       siteId: site.id,
       date: bizDate,
+      collectedAt: now,
       takenAt: now,
-      records: res.usageRecords,
+      records,
       totalTokens,
+      recordCount: records.length,
       costByCurrency,
-      totalRequests: res.usageRecords.length,
-      isComplete: res.usageRecordsComplete,
-      truncatedReason: res.usageRecordsTruncatedReason,
+      totalActualCostByCurrency,
+      totalStandardCostByCurrency,
+      totalRequests: records.length,
+      isComplete,
+      truncatedReason: records.length > 0 ? res.usageRecordsTruncatedReason : null,
       pageCount: 0,
-      schemaVersion: 1,
-      source: site.discovered?.usageListKind ?? 'generic',
+      schemaVersion: USAGE_RECORD_SCHEMA_VERSION,
+      source: res.usageListKind ?? site.discovered?.usageListKind ?? 'generic',
     }
+
+    // 仅在写库真正成功后，才视为「已持久化」并失效缓存（GPT P1-invalidate-after-write）：
+    // 写库失败（如事务冲突/配额）时绝不动缓存，避免把「未写入」当成「已刷新」。
+    let persisted = false
     try {
       await usageRecordsRepo.putBatch(batch)
+      persisted = true
     } catch (e) {
-      console.warn('[AI Relay] 当日用量明细批次写入失败（不阻断采集）', e)
+      console.warn('[AI Relay] 当日用量明细批次写入失败', e)
+    }
+    if (persisted) {
+      usageApiOk = true
+      // 与写库分离错误处理：写库成功但失效失败属于「缓存一致性」问题，下次读取以最新 revision 绕过旧缓存。
+      try {
+        await usageCache.invalidate(site.id, [bizDate])
+      } catch (e) {
+        console.warn('[AI Relay] 聚合缓存失效失败（缓存一致性），下次读取将绕过旧缓存', e)
+      }
     }
   }
 
-  return { siteId: site.id, ok: true, snapshot: snap }
+  return { siteId: site.id, ok: true, snapshot: snap, usageApiOk }
 }
 
 /** 采集全部启用站点。定时 alarm 传 autoOpen=true + notify=true；手动传 notify=false。 */
@@ -255,6 +310,7 @@ export async function collectSpecificInTabs(siteIds: string[], autoOpen: boolean
  */
 async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notifyFlag: boolean): Promise<CollectResult[]> {
   const labEnabled = await getLabZeroTab()
+  const notifyMode = await resolveNotifyMode()
 
   // 1) 查已有标签
   const existingBySite = new Map<string, number>()
@@ -288,18 +344,20 @@ async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notify
   if (missingByWindow.length && autoOpen) {
     // 提前醒目提醒：在开窗口之前发出（仅自动采集 notifyFlag=true 时），让用户有心理准备且不被打断
     if (notifyFlag) {
-      await notify(
+      await maybeNotify(
         'AI 中转站用量看板 即将后台采集',
         `将在「最小化后台窗口」中静默采集 ${missingByWindow.length} 个未打开的站点，不抢焦点、不打断你的操作，采完自动关闭。`,
         { requireInteraction: true, priority: 2 },
       )
-      try {
-        chrome.runtime.sendMessage({
-          type: 'COLLECT_NOTICE',
-          detail: `后台采集即将在最小化窗口静默进行（不抢焦点、不打断你的操作），采完自动关闭`,
-        })
-      } catch {
-        /* 侧边栏未打开时忽略（无接收端） */
+      if (notifyMode === 'system' || notifyMode === 'dailyFirst') {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'COLLECT_NOTICE',
+            detail: `后台采集即将在最小化窗口静默进行（不抢焦点、不打断你的操作），采完自动关闭`,
+          })
+        } catch {
+          /* 侧边栏未打开时忽略（无接收端） */
+        }
       }
     }
     // 记录用户当前聚焦的窗口，开完临时窗口后把焦点还回去，确保绝不打断
@@ -369,13 +427,13 @@ async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notify
     const expired = results.filter((r) => r.errorKind === 'AUTH_EXPIRED')
     if (expired.length) {
       const names = expired.map((r) => sites.find((s) => s.id === r.siteId)?.name ?? r.siteId)
-      await notify('AI 中转站用量看板 · 会话过期', `以下站点登录态已失效，请在浏览器打开并登录后继续：${names.join('、')}`)
+      await maybeNotify('AI 中转站用量看板 · 会话过期', `以下站点登录态已失效，请在浏览器打开并登录后继续：${names.join('、')}`)
     }
     if (labEnabled) {
       const labFailed = results.filter((r) => !r.ok && (r.message ?? '').includes('实验室'))
       if (labFailed.length) {
         const names = labFailed.map((r) => sites.find((s) => s.id === r.siteId)?.name ?? r.siteId)
-        await notify(
+        await maybeNotify(
           'AI 中转站用量看板 · 实验室采集提示',
           `以下站点零标签采集失败（多为 CORS / 需 Token）：${names.join('、')}；可在设置关闭实验室选项或保持标签登录`,
         )
