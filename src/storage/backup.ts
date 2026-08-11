@@ -16,7 +16,7 @@
  */
 import { db } from './db'
 import { registry } from '../adapters'
-import { normalizeOrigin } from '../shared/util'
+import { normalizeOrigin, isValidSiteUrl } from '../shared/util'
 import type {
   SiteConfig,
   Snapshot,
@@ -205,6 +205,11 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
     try {
       if (!s.baseUrl) {
         bumpSkip(name, '站点缺少 baseUrl')
+        continue
+      }
+      // P0 修复（评审驳回项）：导入落库前显式协议白名单，拒绝 javascript:/data:/file: 等危险 scheme
+      if (!isValidSiteUrl(s.baseUrl)) {
+        bumpSkip(name, '站点地址协议不支持（仅 http/https）')
         continue
       }
       if (!registry.has(s.adapter)) {

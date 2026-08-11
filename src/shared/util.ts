@@ -4,6 +4,21 @@ export function normalizeOrigin(input: string): string {
   return u.origin
 }
 
+/**
+ * 站点地址白名单校验：仅允许 http/https 绝对 URL（P0-1 安全边界）。
+ * 用于用户配置 baseUrl 的写入校验，避免 javascript:/data:/file: 等危险 scheme 被写入，
+ * 并最终作为 <a :href> 点击执行。注意：不改动 normalizeOrigin 行为（其被展示/分组/导入等多处复用），
+ * 协议校验由本函数单独承担。
+ */
+export function isValidSiteUrl(input: string): boolean {
+  try {
+    const u = new URL(input.trim())
+    return u.protocol === 'http:' || u.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
 /** 本地时区的日期键 YYYY-MM-DD（P0-4：明确日界语义）。 */
 export function dateKey(ts: number): string {
   const d = new Date(ts)

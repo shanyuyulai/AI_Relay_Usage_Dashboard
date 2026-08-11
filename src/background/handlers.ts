@@ -16,6 +16,7 @@ import {
   setLabCorsUnblock,
   getLabShowDashboard,
   setLabShowDashboard,
+  LAB_SHOWDASHBOARD_CHANGED,
   getClickBehavior,
   setClickBehavior,
   usageRecordsRepo,
@@ -28,7 +29,7 @@ import { applyIconBehavior } from './popupBehavior'
 import { collectAllInTabs, collectSpecificInTabs, probeSessionInTab, captureCustomInTab } from './pageCollect'
 import { applyInterval } from './scheduler'
 import { registry } from '../adapters'
-import { normalizeOrigin, todayKey, dateKey, dateKeyInTz, HUBWAY_TZ, HUBWAY_TZ_OFFSET_MIN, isValidDateKey } from '../shared/util'
+import { normalizeOrigin, isValidSiteUrl, todayKey, dateKey, dateKeyInTz, HUBWAY_TZ, HUBWAY_TZ_OFFSET_MIN, isValidDateKey } from '../shared/util'
 import type {
   CollectResultMsg,
   SiteSummary,
@@ -268,6 +269,8 @@ export const handlers: Record<string, Handler> = {
   // 新增站点：权限由 UI 侧（用户手势）申请，SW 仅校验是否已授予（P0-5 逐站授权）
   async ADD_SITE(payload: AddSitePayload) {
     if (!registry.has(payload.type)) throw new Error(`未知站点类型: ${payload.type}`)
+    // P0-1：写入边界协议白名单，拒绝 javascript:/data:/file: 等危险 scheme
+    if (!isValidSiteUrl(payload.baseUrl)) throw new Error('面板地址仅支持 http/https 链接（如 https://example.com）')
     const origin = normalizeOrigin(payload.baseUrl)
     const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] })
     if (!granted) throw new Error('未获得该站点的 host 权限，请在设置页添加并授权')
@@ -275,7 +278,7 @@ export const handlers: Record<string, Handler> = {
     const site: SiteConfig = {
       id,
       name: payload.name || origin,
-      baseUrl: payload.baseUrl,
+      baseUrl: payload.baseUrl.trim(),
       origin,
       adapter: payload.type,
       color: COLORS[Math.floor(Math.random() * COLORS.length)],
@@ -300,10 +303,12 @@ export const handlers: Record<string, Handler> = {
     if (payload.patch.name != null) patch.name = payload.patch.name
     // baseUrl 变化时：后台单向派生 origin 并校验权限（P0-5，不信任 UI 传来的 origin）
     if (payload.patch.baseUrl != null && payload.patch.baseUrl !== existing.baseUrl) {
+      // P0-1：编辑写入边界同样校验协议白名单
+      if (!isValidSiteUrl(payload.patch.baseUrl)) throw new Error('面板地址仅支持 http/https 链接（如 https://example.com）')
       const origin = normalizeOrigin(payload.patch.baseUrl)
       const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] })
       if (!granted) throw new Error('未获得新地址的 host 权限，请在编辑时授权')
-      patch.baseUrl = payload.patch.baseUrl
+      patch.baseUrl = payload.patch.baseUrl.trim()
       patch.origin = origin
     }
     if (payload.patch.enabled != null) patch.enabled = payload.patch.enabled
@@ -660,6 +665,9 @@ export const handlers: Record<string, Handler> = {
     // 实验室开关仅控制设置页顶部 Tab 显隐；图标单击行为由 clickBehavior 独立决定。
     // 此处重算 applyIconBehavior 保持幂等（结果不受实验室开关影响）。
     await applyIconBehavior()
+    // 跨上下文实时联动：广播给侧边栏/设置页，使其「📊 用量看板」入口同步显隐
+    // （开关存于 Dexie，非 chrome.storage，故用运行时消息广播而非 storage.onChanged）。
+    chrome.runtime.sendMessage({ type: LAB_SHOWDASHBOARD_CHANGED, enabled }).catch(() => {})
     return { enabled }
   },
 
@@ -694,6 +702,12 @@ export const handlers: Record<string, Handler> = {
           siteId: site.id,
           name: site.name,
           origin: site.origin,
+          // P0 修复（评审驳回项）：摘要下发的跳转链接必须经由协议白名单；baseUrl 合法→trim 值，否则回退已校验的 origin，二者皆非法→空串（UI 不渲染链接）
+          baseUrl: isValidSiteUrl(site.baseUrl)
+            ? site.baseUrl.trim()
+            : isValidSiteUrl(site.origin)
+              ? site.origin
+              : '',
           balance: snap ? snap.balance : null,
           currency: snap ? snap.currency : null,
           updatedAt: snap ? snap.takenAt : null,

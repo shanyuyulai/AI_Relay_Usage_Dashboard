@@ -40,6 +40,14 @@ export async function setLabZeroTab(enabled: boolean): Promise<boolean> {
 export const LAB_SHOWDASHBOARD_KEY = 'aihub.lab.showDashboard'
 export const DEFAULT_LAB_SHOWDASHBOARD = false
 
+/**
+ * 开关变更广播类型：在 SET_LAB_SHOWDASHBOARD 改完后由 SW 广播，
+ * 让侧边栏/设置页的「📊 用量看板」入口实时联动显隐（开关存于 Dexie，
+ * 不走 chrome.storage，故无法用 storage.onChanged；沿用既有
+ * chrome.runtime.sendMessage 广播惯例）。
+ */
+export const LAB_SHOWDASHBOARD_CHANGED = 'LAB_SHOWDASHBOARD_CHANGED'
+
 export async function getLabShowDashboard(): Promise<boolean> {
   const raw = await settingsRepo.get<boolean>(LAB_SHOWDASHBOARD_KEY)
   return raw === true

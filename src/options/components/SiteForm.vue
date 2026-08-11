@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { send, MessagingError } from '../../core/messaging/client'
-import { normalizeOrigin } from '../../shared/util'
+import { normalizeOrigin, isValidSiteUrl } from '../../shared/util'
 import { registry } from '../../adapters'
 import type { SiteConfig } from '../../shared/types'
 
@@ -79,6 +79,12 @@ function handleSubmit() {
   }
   if (!form.value.baseUrl.trim()) {
     formError.value = '请输入面板地址'
+    return
+  }
+
+  // P0-1：主 UX 边界显式校验协议白名单，给出清晰报错（不依赖下方 normalizeOrigin 的间接拦截）
+  if (!isValidSiteUrl(form.value.baseUrl)) {
+    formError.value = '面板地址仅支持 http/https 链接（如 https://example.com）'
     return
   }
 

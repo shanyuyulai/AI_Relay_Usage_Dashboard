@@ -7,6 +7,8 @@ import { getThemeMode, setThemeMode, type ThemeMode } from '../shared/theme'
 import { fmtBalance, fmtTokens, fmtNum, fmtTime, fmtMs, fmtMsClass, statusBadge } from '../shared/format'
 import { registry } from '../adapters'
 import { ensureOriginPermission, ensureOriginPermissions } from '../shared/permissions'
+import { isValidSiteUrl } from '../shared/util'
+import { getLabShowDashboard, LAB_SHOWDASHBOARD_CHANGED } from '../storage/labConfig'
 import SiteDetail from './components/SiteDetail.vue'
 
 const loading = ref(false)
@@ -158,6 +160,9 @@ function cumSrcTitle(src: string | null | undefined): string {
 
 const theme = ref<ThemeMode>('light')
 const themeIcon = computed(() => (theme.value === 'dark' ? '🌙' : theme.value === 'auto' ? '🔄' : '☀️'))
+
+// 实验性「📊 用量看板」开关：控制侧边栏「📊」按钮显隐（与设置页 Tab 同源、实时联动）
+const labShowDashboard = ref(false)
 function cycleTheme() {
   const next: ThemeMode = theme.value === 'light' ? 'dark' : theme.value === 'dark' ? 'auto' : 'light'
   theme.value = next
@@ -166,7 +171,7 @@ function cycleTheme() {
 
 const notice = ref('')
 let noticeTimer: number | null = null
-function onRuntimeMessage(msg: { type?: string; detail?: string }) {
+function onRuntimeMessage(msg: { type?: string; detail?: string; enabled?: boolean }) {
   if (msg?.type === 'COLLECT_DONE' || msg?.type === 'SITES_CHANGED') {
     // 采集完成 / 设置页增删改站点后：实时刷新仪表盘
     void loadDashboard().then(() => {
@@ -180,6 +185,9 @@ function onRuntimeMessage(msg: { type?: string; detail?: string }) {
         backToDashboard()
       }
     })
+  } else if (msg?.type === LAB_SHOWDASHBOARD_CHANGED) {
+    // 设置页切换实验性「用量看板」开关：侧边栏「📊」按钮实时显隐
+    labShowDashboard.value = msg.enabled === true
   } else if (msg?.type === 'COLLECT_NOTICE') {
     // 自动后台采集即将开窗口：在侧边栏给出醒目横幅提醒（不打断用户）
     notice.value = msg.detail ?? '后台采集即将在最小化窗口进行（不打断你的操作），采完自动关闭'
@@ -191,6 +199,7 @@ function onRuntimeMessage(msg: { type?: string; detail?: string }) {
 onMounted(async () => {
   await loadDashboard()
   theme.value = await getThemeMode()
+  labShowDashboard.value = await getLabShowDashboard()
   chrome.runtime.onMessage.addListener(onRuntimeMessage)
 })
 
@@ -215,7 +224,7 @@ onUnmounted(() => {
           {{ syncing ? '⋯' : '⟳' }}
         </button>
         <button class="ibtn" :title="themeIcon + ' 主题（点击切换）'" @click="cycleTheme">{{ themeIcon }}</button>
-        <button class="ibtn" title="用量看板（完整复刻 hubway 用量页）" @click="openUsageDashboard">📊</button>
+        <button v-if="labShowDashboard" class="ibtn" aria-label="用量看板" title="用量看板（完整复刻 hubway 用量页）" @click="openUsageDashboard">📊</button>
         <button class="ibtn" title="设置" @click="openOptions">⚙</button>
       </div>
     </header>
@@ -309,7 +318,7 @@ onUnmounted(() => {
               </div>
               <div class="sc-info">
                 <div class="sc-name">
-                  <a class="sc-link" :href="s.site.baseUrl || undefined" target="_blank" rel="noopener noreferrer" @click.stop>{{ s.site.name }}</a>
+                  <a class="sc-link" :href="isValidSiteUrl(s.site.baseUrl) ? s.site.baseUrl : undefined" target="_blank" rel="noopener noreferrer" @click.stop>{{ s.site.name }}</a>
                 </div>
                 <div class="sc-url">
                   {{ s.site.origin.replace('https://', '') }} · {{ adapterMap[s.site.adapter] || s.site.adapter }}

@@ -6,6 +6,7 @@ import type { SiteDetailData, GetUsageDetailsResponse } from '../../core/messagi
 import type { UsageRecord, SiteConfig, Snapshot, DailyStat, ModelUsage } from '../../shared/types'
 import { fmtBalance, fmtTokens, fmtNum, fmtTime, fmtMs, fmtMsClass, statusBadge } from '../../shared/format'
 import { ensureOriginPermission } from '../../shared/permissions'
+import { isValidSiteUrl } from '../../shared/util'
 
 const props = defineProps<{ siteId: string }>()
 const emit = defineEmits<{ back: [] }>()
@@ -486,6 +487,7 @@ onBeforeUnmount(() => {
 })
 
 function openOrigin(url: string) {
+  if (!isValidSiteUrl(url)) return
   chrome.tabs.create({ url })
 }
 </script>

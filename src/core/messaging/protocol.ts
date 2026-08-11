@@ -339,6 +339,8 @@ export interface DashboardSummaryItem {
   siteId: string
   name: string
   origin: string
+  // 用户配置时填写的完整链接（含路径）；极简面板名称跳转优先用此，缺失时回退 origin。
+  baseUrl: string
   balance: number | null
   currency: string | null
   updatedAt: number | null // 最新快照时间

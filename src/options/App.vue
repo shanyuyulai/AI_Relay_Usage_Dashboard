@@ -5,10 +5,10 @@ import type { ExportConfig, ImportResult } from '../core/messaging/protocol'
 import type { SiteConfig, SiteStatus, CustomCaptureRecord, DiagnosticEntry } from '../shared/types'
 import type { ProbeResult } from '../content/probe'
 import type { NetDiscoveryRequest } from '../background/netDiscovery'
-import { normalizeOrigin } from '../shared/util'
+import { normalizeOrigin, isValidSiteUrl } from '../shared/util'
 import { ensureOriginPermission } from '../shared/permissions'
 import { getThemeMode, setThemeMode, type ThemeMode } from '../shared/theme'
-import { getLabShowDashboard } from '../storage'
+import { getLabShowDashboard, LAB_SHOWDASHBOARD_CHANGED } from '../storage'
 import { registry } from '../adapters'
 import { statusBadge } from '../shared/format'
 import SiteForm from './components/SiteForm.vue'
@@ -32,9 +32,12 @@ function safeUiError(_e: unknown): string {
 const ERR_INVALID_CONFIG = '配置文件格式无效'
 
 // 仅配置界面通知：SW 经 runtime 消息推送页内提示（配置界面未打开则无接收端、自动丢弃）
-function onOptionsNotify(msg: { type?: string; title?: string; message?: string }, _sender: unknown, _sendResponse: unknown) {
+function onOptionsNotify(msg: { type?: string; title?: string; message?: string; enabled?: boolean }, _sender: unknown, _sendResponse: unknown) {
   if (msg && msg.type === 'AIHUB_OPTIONS_NOTIFY') {
     showToast(`${msg.title ?? '提示'}：${msg.message ?? ''}`)
+  } else if (msg && msg.type === LAB_SHOWDASHBOARD_CHANGED) {
+    // 设置页内切换实验性「用量看板」开关：顶部 Tab 实时显隐（与侧边栏同源）
+    labShowDashboard.value = msg.enabled === true
   }
 }
 
@@ -144,7 +147,7 @@ async function authorizeSite(site: SiteConfig) {
     const res = await send<{ status: 'ok' | 'expired' }>('AUTHORIZE_SITE', { id: site.id })
     if (res.status === 'expired') {
       showToast('登录态已过期，正在打开原站，请登录后回到插件重新授权')
-      chrome.tabs.create({ url: site.baseUrl })
+      if (isValidSiteUrl(site.baseUrl)) chrome.tabs.create({ url: site.baseUrl })
     } else {
       showToast('授权成功，登录态有效')
       await loadSites()
@@ -326,6 +329,7 @@ function statusText(status: SiteStatus): string {
 }
 
 function openOrigin(url: string) {
+  if (!isValidSiteUrl(url)) return
   chrome.tabs.create({ url })
 }
 
@@ -490,7 +494,9 @@ onMounted(async () => {
   // Phase C：尊重 sidebar「📊 用量看板」按钮写入的 session storage 提示
   try {
     const sess = await chrome.storage.session?.get?.('aihub.optsTab')
-    if (sess && (sess as Record<string, string>)['aihub.optsTab'] === 'dashboard') {
+    // 仅当实验性「用量看板」开关开启时，才尊重侧边栏写入的「打开 dashboard Tab」请求；
+    // 否则（开关已关）落到已隐藏的 Tab，回退到默认设置页。
+    if (sess && (sess as Record<string, string>)['aihub.optsTab'] === 'dashboard' && labShowDashboard.value) {
       activeTab.value = 'dashboard'
       await chrome.storage.session?.remove?.('aihub.optsTab')
     }

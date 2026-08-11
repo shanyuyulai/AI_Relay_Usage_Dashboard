@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
 import type { GetDashboardSummaryResponse, DashboardSummaryItem } from '../core/messaging/protocol'
 import { fmtBalance } from '../shared/format'
+import { isValidSiteUrl } from '../shared/util'
 
 const items = ref<DashboardSummaryItem[]>([])
 const loading = ref(true)
@@ -23,6 +24,13 @@ function relTime(ts: number | null): string {
   if (h < 24) return `${h} 小时前`
   const d = Math.floor(h / 24)
   return `${d} 天前`
+}
+
+function safeHref(it: DashboardSummaryItem): string | undefined {
+  // P0 修复（评审驳回项）：href sink 最终协议校验，杜绝脏数据/绕过进入 <a :href>
+  if (isValidSiteUrl(it.baseUrl)) return it.baseUrl
+  if (isValidSiteUrl(it.origin)) return it.origin
+  return undefined
 }
 
 async function load() {
@@ -73,7 +81,7 @@ onMounted(() => {
       <li v-for="it in items" :key="it.siteId" class="pop-row">
         <div class="pop-name">
           <span class="dot" :class="'st-' + it.status"></span>
-          <a class="pop-link" :href="it.origin || undefined" target="_blank" rel="noopener noreferrer">{{ it.name }}</a>
+          <a class="pop-link" :href="safeHref(it)" target="_blank" rel="noopener noreferrer" :title="`打开 ${it.name}`">{{ it.name }}</a>
         </div>
         <div class="pop-bal" :class="balClass(it)">
           {{ it.balance == null ? '—' : fmtBalance(it.balance, it.currency) }}

@@ -299,12 +299,17 @@
       <div class="card"><div class="ico">⟳</div><h3>手动同步</h3><p>侧边栏右上角 ⟳ 刷新全部；每张站点卡右下角「刷新 ⟳」可单独刷新某一站。</p></div>
       <div class="card"><div class="ico">🕒</div><h3>自动采集</h3><p>后台按设定间隔（默认 30 分钟）静默采集；Service Worker 休眠时由 <code>chrome.alarms</code> 唤醒。</p></div>
       <div class="card"><div class="ico">📈</div><h3>趋势详情</h3><p>点站点卡片进入详情：近 7/30/90 天 Token 与请求趋势、余额曲线、按模型消耗分布。</p></div>
-      <div class="card"><div class="ico">↗</div><h3>跳转原站</h3><p>卡片上的「打开原站 ↗」一键在新标签打开对应中转站后台，不做 iframe 嵌页。</p></div>
+      <div class="card"><div class="ico">↗</div><h3>跳转原站</h3><p>卡片上的「打开原站 ↗」或<b>点击站点名称</b>，都会在新标签打开你配置时保存的站点地址（含路径，而非仅官网根地址），不做 iframe 嵌页。</p></div>
       <div class="card"><div class="ico">🔔</div><h3>过期通知</h3><p>会话失效时发浏览器通知并标黄「需重新授权」，引导你去原站重新登录后再刷新。</p></div>
       <div class="card"><div class="ico">🌗</div><h3>主题切换</h3><p>侧边栏右上角太阳/月亮图标循环切换 浅色 → 深色 → 跟随系统。</p></div>
       <div class="card"><div class="ico">🗂️</div><h3>数据浏览与保留</h3><p>在设置页查看快照、每日统计和自定义采集记录；可设置 7 / 30 / 90 天或永久保留。</p></div>
       <div class="card"><div class="ico">📦</div><h3>备份与还原</h3><p>「全量备份」会保存站点、历史和可移植设置；导入前会请求涉及域名的权限，导入后需重新登录站点。</p></div>
       <div class="card"><div class="ico">🧪</div><h3>自定义采集与诊断</h3><p>可为单站配置同源 GET 采集路径；诊断日志只保存脱敏指纹，均支持导出或清空。</p></div>
+    </div>
+    <div class="callout info"><b>实验性功能与单击行为</b><br>
+      • <b>实验性「📊 用量看板」开关</b>（设置 → 数据采集库区域）：开启后，设置页顶部出现「📊 用量看板」Tab，侧边栏也显示「📊」按钮可直达完整用量看板；<b>关闭则两者同时隐藏</b>（侧边栏按钮与设置页 Tab 实时联动）。<br>
+      • <b>「🖱️ 单击图标行为」</b>（侧边栏 / 极简面板）：选「极简面板」时，单击工具栏图标弹出极简用量看板（仅显示各中转站名称 + 余额）。<br>
+      • 极简面板与完整面板中<b>点击站点名称</b>都会在新标签打开你配置时保存的站点地址（含路径，而非仅官网根地址）。站点地址仅接受 <code>http/https</code>；导入备份时若某站点地址协议不被支持，该站点会被跳过。
     </div>
   </div>
 </section>
@@ -402,6 +407,47 @@
     <details><summary>支持 Edge 吗？</summary><div class="ans">插件基于 Manifest V3 + sidePanel API，理论上兼容 Edge 116+。建议优先在 Chrome 上使用，Edge 可作为加分项验证。</div></details>
     <details><summary>我的数据会传到云端吗？</summary><div class="ans">不会。所有快照、日聚合都保存在你本机的 IndexedDB（chrome.storage.local），不做任何云端同步（一期）。</div></details>
     <details><summary>导入备份后为什么仍要重新登录？重复导入会出错吗？</summary><div class="ans">备份不会包含 Cookie、Token、密码或授权状态，因此导入后需要在各站点重新登录。相同站点按 origin 合并，快照和诊断记录按稳定标识更新；重复导入同一份 v2 备份不会产生重复记录。</div></details>
+  </div>
+</section>
+
+<!-- ===== 10. 更新记录 ===== -->
+<section id="changelog">
+  <div class="wrap">
+    <h2><span class="num">10</span>更新记录</h2>
+    <p class="sub">下方为「当前代码线」（Vite 工程）的版本变动；早期独立原型构建单列于后，便于追溯。</p>
+
+    <h3 style="margin:20px 0 8px;font-size:17px">当前代码线</h3>
+    <table>
+      <thead><tr><th>版本</th><th>状态</th><th>主要变动</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><b>0.3.2</b></td>
+          <td>未发布</td>
+          <td>① 侧边栏「📊 用量看板」按钮随实验性开关联动隐藏（关闭则同时隐藏设置页 Tab 与侧边栏按钮，并支持运行中实时同步）；② 更新使用说明，新增「实验性功能与单击行为」说明；③ 使用说明新增「更新记录」章节。</td>
+        </tr>
+        <tr>
+          <td><b>0.3.1</b></td>
+          <td>已发布</td>
+          <td>① 极简面板（popup）点击站点名称改为打开你配置时保存的完整站点地址（baseUrl），与完整面板统一；② 新增协议白名单校验，为所有跳转点（popup / 侧边栏 / 设置页 / 用量看板）加固，拦截 <code>javascript:</code> 等危险 scheme；③ 备份导入增加协议校验，跳过不被支持的地址。</td>
+        </tr>
+        <tr>
+          <td><b>0.3.0</b></td>
+          <td>已发布</td>
+          <td>M1 Step1–Step5 收口：类型检查 0 错、构建成功；侧边栏仪表盘（总览 / 站点卡 / 趋势详情）、可配置自动采集调度、设置页站点管理与数据浏览器、隐私红线（不存凭证 / 最小权限 / 备份不含凭证）落地。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3 style="margin:22px 0 8px;font-size:17px">历史原型构建（非当前代码线，不提供连续升级）</h3>
+    <table>
+      <thead><tr><th>版本</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>0.2.1 / 0.2.0 / 0.1.0</td>
+          <td>早期独立原型打包（工作区根目录 <code>AI_Relay_Usage_Dashboard_v0.x.x</code>），用于采集与 UI 形态的早期验证；与当前 Vite 工程非同一代码线，日期待考。</td>
+        </tr>
+      </tbody>
+    </table>
   </div>
 </section>
 
