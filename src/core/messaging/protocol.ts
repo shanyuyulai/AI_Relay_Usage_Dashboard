@@ -1,4 +1,4 @@
-import type { Snapshot, SiteConfig, SiteStatus, DailyStat, CustomCaptureRecord, DiagnosticEntry, UsageRecordBatch, SettingsRow } from '../../shared/types'
+import type { Snapshot, SiteConfig, SiteStatus, DailyStat, CustomCaptureRecord, DiagnosticEntry, UsageRecordBatch, SettingsRow, SiteCollectionProfile } from '../../shared/types'
 
 /** 消息信封：所有跨上下文通信统一结构，requestId 全链路透传。 */
 export interface Req<P = unknown> {
@@ -111,6 +111,21 @@ export interface SiteIdPayload {
 }
 export interface CollectNowPayload {
   siteIds?: string[]
+}
+
+// ── 站点手动排序（设置页拖拽手柄 / ▲▼ 按钮，完整集合重排） ──
+/**
+ * 完整集合重排载荷（GPT P0-1 修正：禁止"部分重排"）。
+ * `orderedIds` 必须是**当前全部站点 id 的一个完整排列**——
+ * 与 DB 现有集合大小一致、无重复、无未知 id。handler 运行时校验，不通过则整体拒绝。
+ */
+export interface ReorderSitesPayload {
+  orderedIds: string[]
+}
+export interface ReorderSitesResponse {
+  ok: boolean
+  /** 失败错误码：'INVALID_SITE_ORDER'（数组非法/含空串/重复 id/未知 id/与 DB 集合不一致） */
+  code?: string
 }
 
 /** 自定义采集请求：采集某站用户配置的自定义请求（按需按钮触发）。 */
@@ -353,6 +368,15 @@ export interface GetDashboardSummaryResponse {
   items: DashboardSummaryItem[]
 }
 
+// ── 站点类型与采集方案可视化（方案 028）──
+/** 请求体留空：一次性返回所有站点的只读展示模型（按 siteId 索引）。 */
+export interface GetSiteCollectionProfilesPayload {
+  // 无载荷
+}
+export interface GetSiteCollectionProfilesResponse {
+  profiles: Record<string, SiteCollectionProfile>
+}
+
 // ── 数据查看器：取某站全部已采集数据 ──────────────────────
 export interface GetSiteDataPayload {
   siteId: string // 单站 id；传 '__all__' 表示聚合全部站点
@@ -370,6 +394,17 @@ export interface GetSiteDataResponse {
   dailyStats: DailyStat[]
   captures: CustomCaptureRecord[]
   summary: SiteDataSummary
+}
+
+// ── 余额历史：删除单条 / 批量删除 ─────────────────────────
+export interface DeleteSnapshotPayload {
+  id: number
+}
+export interface DeleteSnapshotsPayload {
+  ids: number[]
+}
+export interface DeleteSnapshotsResponse {
+  deleted: number
 }
 
 // ── 手动重置：单站 / 全局 ─────────────────────────────────

@@ -10,6 +10,9 @@ dist_bak_*/
 # 含图标设计中间产物、预览图等，非源码，不应入库
 .workbuddy/
 
+# ===== AI generated project documentation =====
+AI_documentation/
+
 # ===== Environment / secrets =====
 .env
 .env.*

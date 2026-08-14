@@ -37,6 +37,9 @@ const SNAPSHOT_KEYS: (keyof Snapshot)[] = [
   'apiVersion', 'responseHash', 'quality', 'family', 'routeProfile', 'confidence',
   'balanceSource', 'usageSource', 'isPartial', 'collectorVersion', 'cumulativeTokens',
   'cumulativeTokensSource', 'apiRoundTripMs', 'avgResponseTimeMs', 'metricsPartial',
+  // 统计接口 + IKunCode provider 采集字段（方案 §2/§7）
+  'cumulativeInputTokens', 'cumulativeOutputTokens', 'totalConsumedCost', 'recent24hCost',
+  'recent24hTokens', 'usageWindow', 'todayCostSource', 'usageStatsSource',
 ]
 const DAILY_KEYS: (keyof DailyStat)[] = [
   'siteId', 'date', 'tokens', 'requests', 'cost', 'currency', 'byModel', 'source',
@@ -364,6 +367,21 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
         }
       },
     )
+
+  // —— order 归一化（GPT P0-3 修正）——
+  // 导入语义为「合并」：已有站点保留各自本地相对序（found.order），新站点按导入顺序追加（nextOrder++）。
+  // 导出的 order 视为不可信、一律不采用，避免跨安装 id 漂移 + 重复 order 造成排序错乱。
+  // 写库后统一归一化为 0..n-1 连续序列：消除空隙/重复，保证 siteRepo.list() 稳定有序。
+  // 按 order 升序后重排，自然得到"本地站点相对序在前、新站点按导入序在后"的结果。
+  await db.transaction('rw', db.sites, async () => {
+    const all = await db.sites.toArray()
+    all.sort((a, b) => a.order - b.order)
+    let i = 0
+    for (const s of all) {
+      if (s.order !== i) await db.sites.update(s.id, { order: i })
+      i++
+    }
+  })
 
   return {
     imported,

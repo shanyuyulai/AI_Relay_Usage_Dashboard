@@ -7,7 +7,7 @@
  *
  * 本模块负责：找/开站点标签页 → 注入 collectInPage → 把解析结果落库（不存任何 Cookie/Token 原文，P0-2）。
  */
-import { siteRepo, snapshotRepo, dailyStatRepo, captureRepo, purgeOlderThan, getRetentionDays, getLabZeroTab, diagnosticsRepo, usageRecordsRepo, usageCache } from '../storage'
+import { siteRepo, snapshotRepo, dailyStatRepo, captureRepo, purgeOlderThan, getRetentionDays, getLabZeroTab, diagnosticsRepo, usageRecordsRepo, usageCache, authStateRepo } from '../storage'
 import { USAGE_RECORD_SCHEMA_VERSION } from '../shared/types'
 import { maybeNotify, resolveNotifyMode } from '../shared/notify'
 import { collectViaSw } from './swCollect'
@@ -18,10 +18,11 @@ import {
   type PageCollectResult,
   type CustomCaptureItem,
 } from '../content/probe'
-import { buildStrategy, type CollectStrategy } from '../core/classifySite'
-import type { SiteConfig, Snapshot, CustomCaptureRecord, UsageRecordBatch } from '../shared/types'
+import { buildEffectiveStrategy, type CollectStrategy } from '../core/classifySite'
+import type { SiteConfig, Snapshot, CustomCaptureRecord, UsageRecordBatch, AuthEvidence, AuthState } from '../shared/types'
 import type { CollectResult } from './collector'
 import { dateKeyInTz, HUBWAY_TZ, todayKey, isValidDateKey } from '../shared/util'
+import { authReasonToFailure } from '../core/authState'
 
 /** 等待标签页加载完成（最多 10s）。 */
 function waitForTabLoad(tabId: number): Promise<void> {
@@ -45,10 +46,63 @@ function waitForTabLoad(tabId: number): Promise<void> {
 }
 
 /**
+ * 无论采集成功或失败，都持久化页面主世界返回的脱敏诊断。
+ * 这一步绝不记录 Token、Cookie、用户 ID 或响应正文。
+ */
+async function persistPageDiagnostics(siteId: string, res: PageCollectResult, at: number): Promise<void> {
+  const extracted = {
+    balance: res.balance != null,
+    todayTokens: res.todayTokens != null,
+    todayRequests: res.todayRequests != null,
+    cumulativeTokens: res.cumulativeTokens != null,
+    cumulativeInputTokens: res.cumulativeInputTokens != null,
+    cumulativeOutputTokens: res.cumulativeOutputTokens != null,
+    totalRequests: res.totalRequests != null,
+    avgResponseTimeMs: res.avgResponseTimeMs != null,
+    todayCost: res.todayCost != null,
+  }
+  const auth = res.authContext
+  const contextNote = `请求上下文(脱敏): userKey=${auth.userStoragePresent}, userJson=${auth.userStorageParseable}, userId=${auth.userIdPresent}, bearer=${auth.bearerTokenPresent}, browserId=${auth.browserIdPresent}, NewApiUser=${auth.newApiUserHeaderSent}, BrowserIdHeader=${auth.browserIdHeaderSent}`
+
+  try {
+    for (const d of res.diags) {
+      await diagnosticsRepo.put({
+        siteId,
+        at,
+        phase: d.phase,
+        url: d.url,
+        status: d.status,
+        contentType: d.contentType,
+        elapsedMs: d.elapsedMs,
+        fieldFingerprint: d.fieldFingerprint,
+        extracted,
+        note: `${d.note}; ${contextNote}`,
+      })
+    }
+    await diagnosticsRepo.put({
+      siteId,
+      at,
+      phase: 'overall',
+      url: res.path ?? '(none)',
+      status: res.ok ? 200 : (res.authEvidence?.httpStatus ?? 0),
+      contentType: '',
+      elapsedMs: res.apiRoundTripMs ?? 0,
+      fieldFingerprint: {},
+      extracted,
+      note: `采集${res.ok ? '完成' : '失败'}: ok=${res.ok}, reason=${res.reason || 'N/A'}, path=${res.path ?? 'N/A'}, diags=${res.diags.length}; ${contextNote}`,
+    })
+  } catch (e) {
+    console.warn('[AI Relay] 诊断日志写入失败（不阻断采集）', e)
+  }
+}
+
+/**
  * 单站采集（标签已解析）：在页面主世界注入 collectInPage 并落库（不存凭证，P0-2）。
  * 仅负责「注入 + 落库」；标签的查找/创建/关闭由编排函数 collectOrchestrate 统一处理。
  */
-export async function collectSiteInTab(site: SiteConfig, tabId: number): Promise<CollectResult> {
+export async function collectSiteInTab(site: SiteConfig, tabId: number, manual = false): Promise<CollectResult> {
+  const collectRunId = crypto.randomUUID()
+  await siteRepo.update(site.id, { lastCollectRunId: collectRunId })
   // 仅做 contains 检查（不主动 request，避免 SW 中弹授权窗）；缺权限则报错
   const hasPerm = await chrome.permissions.contains({ origins: [`${site.origin}/*`] })
   if (!hasPerm) {
@@ -60,32 +114,21 @@ export async function collectSiteInTab(site: SiteConfig, tabId: number): Promise
   let res: PageCollectResult | undefined
   let usageApiOk = false
   try {
-    // 从 discovered 构建采集策略（若有分类信息则按 capabilities 激活端点）
-    const discovered = site.discovered
-    let strategyArg: any = null
-    if (discovered?.userSelfPath) {
-      const strategy = buildStrategy(
-        {
-          family: (discovered.family as any) || 'unknown',
-          routeProfile: (discovered.routeProfile as any) || 'standard',
-          capabilities: (discovered.capabilities as any[]) || [],
-          confidence: (discovered.confidence as any) || 'medium',
-          userSelfPath: discovered.userSelfPath,
-          usageListKind: discovered.usageListKind ?? null,
-          usageListPath: discovered.usageListPath ?? null,
-        },
-        discovered.userSelfPath,
-        site.currency ?? undefined,
-      )
-      // 序列化为普通对象给 executeScript（args 会 JSON 序列化）
-      strategyArg = {
-        endpoints: strategy.endpoints,
-        family: strategy.family,
-        confidence: strategy.confidence,
-        currency: strategy.currency,
-        collectorVersion: strategy.collectorVersion,
-        // 注意：不注入任何扩展密钥到 MAIN 世界。假名化在页面内以无密钥 SHA-256 + 页面 origin 命名空间完成（GPT P0-MAIN-WORLD-KEY）。
-      }
+    // 从 discovered 构建实际生效策略（方案 028 §5.2：与 collectionProfile 共用同一函数，避免默认值漂移）。
+    const strategy = buildEffectiveStrategy(site, manual)
+    // 序列化为普通对象给 executeScript（args 会 JSON 序列化）
+    const strategyArg = {
+      endpoints: strategy.endpoints,
+      family: strategy.family,
+      confidence: strategy.confidence,
+      currency: strategy.currency,
+      collectorVersion: strategy.collectorVersion,
+      // 账户快照语义契约（方案 027 §3.1）：透传给页面主世界，驱动字段口径。
+      accountSemantics: strategy.accountSemantics ?? null,
+      collectRunId,
+      // 受控手动流程标志：仅用户「立即同步」时为 true，允许 IKunCode refresh 这类有副作用端点（方案 §4.6）
+      manualCollect: manual,
+      // 注意：不注入任何扩展密钥到 MAIN 世界。假名化在页面内以无密钥 SHA-256 + 页面 origin 命名空间完成（GPT P0-MAIN-WORLD-KEY）。
     }
     const [frame] = await chrome.scripting.executeScript({
       target: { tabId },
@@ -110,11 +153,22 @@ export async function collectSiteInTab(site: SiteConfig, tabId: number): Promise
     return { siteId: site.id, ok: false, errorKind: 'NETWORK', message: '采集脚本未返回结果' }
   }
 
+  const diagnosticAt = Date.now()
+  await persistPageDiagnostics(site.id, res, diagnosticAt)
+
   if (!res.ok) {
-    const expired = res.authExpired || !res.cookiePresent
-    const status = expired ? 'auth_expired' : 'error'
-    const kind = expired ? ('AUTH_EXPIRED' as const) : ('NOT_FOUND' as const)
-    await siteRepo.update(site.id, { lastStatus: status, lastCollectAt: Date.now(), lastError: res.reason })
+    const authState = res.authState ?? (res.authExpired ? 'unauthorized' : 'indeterminate')
+    const evidence = res.authEvidence ?? undefined
+    const failureReason = evidence ? authReasonToFailure(evidence.reason) : 'ENDPOINT_UNAVAILABLE'
+    const kind = authState === 'unauthorized' ? ('AUTH_EXPIRED' as const) : ('NOT_FOUND' as const)
+    await authStateRepo.apply(site.id, {
+      state: authState,
+      evidence,
+      failureReason,
+      error: res.reason,
+      runId: collectRunId,
+      collectedAt: diagnosticAt,
+    })
     return { siteId: site.id, ok: false, errorKind: kind, message: res.reason }
   }
 
@@ -128,7 +182,19 @@ export async function collectSiteInTab(site: SiteConfig, tabId: number): Promise
     })
   }
 
-  const now = Date.now()
+  // 持久化本次采集识别到的账户快照语义契约（方案 027 §3.1）。
+  // 仅当探针确实识别出契约、且不同于已存值时写入，避免无谓的写放大。
+  if (res.accountSemantics && res.accountSemantics !== 'unknown' && res.accountSemantics !== site.discovered?.accountSemantics) {
+    await siteRepo.update(site.id, {
+      discovered: {
+        ...(site.discovered ?? {}),
+        accountSemantics: res.accountSemantics,
+        accountContractVersion: 4,
+      },
+    })
+  }
+
+  const now = diagnosticAt
   const snap: Snapshot = {
     siteId: site.id,
     takenAt: now,
@@ -156,61 +222,40 @@ export async function collectSiteInTab(site: SiteConfig, tabId: number): Promise
     apiRoundTripMs: res.apiRoundTripMs,
     avgResponseTimeMs: res.avgResponseTimeMs,
     metricsPartial: res.metricsPartial,
+    // ===== 统计接口（Hubway 类 usage/dashboard/stats 等）采集字段 =====
+    cumulativeInputTokens: res.cumulativeInputTokens,
+    cumulativeOutputTokens: res.cumulativeOutputTokens,
+    totalConsumedCost: res.totalConsumedCost,
+    recent24hCost: res.recent24hCost,
+    recent24hTokens: res.recent24hTokens,
+    usageWindow: res.usageWindow,
+    todayCostSource: res.todayCostSource,
+    usageStatsSource: res.usageStatsSource,
   }
   await snapshotRepo.append(snap)
   if (snap.todayTokens != null) await dailyStatRepo.upsertForDay(snap)
-  await siteRepo.update(site.id, { lastCollectAt: now, lastStatus: 'ok' })
-
-  // 写入诊断日志（脱敏指纹，P0-1/P0-4 安全边界）
-  if (res.diags && res.diags.length > 0) {
-    try {
-      for (const d of res.diags) {
-        await diagnosticsRepo.put({
-          siteId: site.id,
-          at: now,
-          phase: d.phase,
-          url: d.url,
-          status: d.status,
-          contentType: d.contentType,
-          elapsedMs: d.elapsedMs,
-          fieldFingerprint: d.fieldFingerprint,
-          extracted: {
-            balance: snap.balance != null,
-            todayTokens: snap.todayTokens != null,
-            todayRequests: snap.todayRequests != null,
-            cumulativeTokens: snap.cumulativeTokens != null,
-            totalRequests: snap.totalRequests != null,
-            avgResponseTimeMs: snap.avgResponseTimeMs != null,
-            todayCost: snap.todayCost != null,
-          },
-          note: d.note,
-        })
-      }
-      // 汇总诊断
-      await diagnosticsRepo.put({
-        siteId: site.id,
-        at: now,
-        phase: 'overall',
-        url: res.path ?? '(none)',
-        status: 200,
-        contentType: '',
-        elapsedMs: snap.apiRoundTripMs ?? 0,
-        fieldFingerprint: {},
-        extracted: {
-          balance: snap.balance != null,
-          todayTokens: snap.todayTokens != null,
-          todayRequests: snap.todayRequests != null,
-          cumulativeTokens: snap.cumulativeTokens != null,
-          totalRequests: snap.totalRequests != null,
-          avgResponseTimeMs: snap.avgResponseTimeMs != null,
-          todayCost: snap.todayCost != null,
-        },
-        note: `采集完成: ok=${res.ok}, usageSource=${res.usageSource ?? 'N/A'}, path=${res.path ?? 'N/A'}, diags=${res.diags.length}条`,
-      })
-    } catch (e) {
-      console.warn('[AI Relay] 诊断日志写入失败（不阻断采集）', e)
+  const successfulRunAuthState = res.authEvidence?.state === 'unauthorized' ? 'unauthorized' : 'authenticated'
+  const successfulRunEvidence: AuthEvidence = res.authEvidence?.state === 'authenticated' || res.authEvidence?.state === 'unauthorized'
+    ? res.authEvidence
+    : {
+      state: 'authenticated',
+      reason: 'ACCOUNT_AUTHENTICATED',
+      endpointRole: 'candidate',
+      path: res.path,
+      httpStatus: 200,
+      provider: 'unknown',
+      contextComplete: false,
+      collectRunId,
+      observedAt: now,
     }
-  }
+  await authStateRepo.apply(site.id, {
+    state: successfulRunAuthState,
+    evidence: successfulRunEvidence,
+    failureReason: successfulRunAuthState === 'unauthorized' ? 'ACCOUNT_UNAUTHORIZED' : undefined,
+    error: successfulRunAuthState === 'unauthorized' ? '权威账户端点明确返回未授权' : undefined,
+    runId: collectRunId,
+  })
+  await siteRepo.update(site.id, { lastCollectAt: now })
 
   // 写入当日用量明细批次（来自 usage_list 端点，如 hubway /api/v1/usage）。
   // 三态处理（GPT P0-I2 / P1-empty-overwrite / P1-cross-midnight）：
@@ -288,15 +333,15 @@ export async function collectSiteInTab(site: SiteConfig, tabId: number): Promise
 }
 
 /** 采集全部启用站点。定时 alarm 传 autoOpen=true + notify=true；手动传 notify=false。 */
-export async function collectAllInTabs(autoOpen: boolean, notify = false): Promise<CollectResult[]> {
+export async function collectAllInTabs(autoOpen: boolean, notify = false, manual = false): Promise<CollectResult[]> {
   const sites = (await siteRepo.list()).filter((s) => s.enabled)
-  return collectOrchestrate(sites, autoOpen, notify)
+  return collectOrchestrate(sites, autoOpen, notify, manual)
 }
 
 /** 采集指定站点（侧边栏选择性同步）。 */
-export async function collectSpecificInTabs(siteIds: string[], autoOpen: boolean, notify = false): Promise<CollectResult[]> {
+export async function collectSpecificInTabs(siteIds: string[], autoOpen: boolean, notify = false, manual = false): Promise<CollectResult[]> {
   const sites = (await siteRepo.list()).filter((s) => siteIds.includes(s.id) && s.enabled)
-  return collectOrchestrate(sites, autoOpen, notify)
+  return collectOrchestrate(sites, autoOpen, notify, manual)
 }
 
 /**
@@ -308,7 +353,7 @@ export async function collectSpecificInTabs(siteIds: string[], autoOpen: boolean
  * - notify=true 且本轮确实要开临时窗口时，先发一条「醒目 + 需手动关闭」的系统通知与侧边栏横幅（提前提醒），再开窗口；
  *   会话过期、实验室失败也分别通知。
  */
-async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notifyFlag: boolean): Promise<CollectResult[]> {
+async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notifyFlag: boolean, manual = false): Promise<CollectResult[]> {
   const labEnabled = await getLabZeroTab()
   const notifyMode = await resolveNotifyMode()
 
@@ -328,7 +373,7 @@ async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notify
   for (const site of sites) {
     const tabId = existingBySite.get(site.id)
     if (tabId != null) {
-      tasks.push(collectSiteInTab(site, tabId)) // 复用已有标签
+      tasks.push(collectSiteInTab(site, tabId, manual)) // 复用已有标签
       continue
     }
     if (labEnabled) {
@@ -387,7 +432,7 @@ async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notify
     }
     for (const site of missingByWindow) {
       const tabId = tempBySite.get(site.id)
-      if (tabId != null) tasks.push(collectSiteInTab(site, tabId))
+      if (tabId != null) tasks.push(collectSiteInTab(site, tabId, manual))
       else {
         const msg = '站点标签页未打开，且未开启自动开窗口采集'
         tasks.push(
@@ -462,6 +507,8 @@ async function pruneAfterCollect(): Promise<void> {
 export async function probeSessionInTab(site: SiteConfig): Promise<{
   ok: boolean
   reason: string
+  authState: AuthState
+  authEvidence: AuthEvidence | null
   status: number | null
   cookiePresent: boolean
   localStorageKeys: string[]
@@ -470,29 +517,58 @@ export async function probeSessionInTab(site: SiteConfig): Promise<{
   const existing = await chrome.tabs.query({ url: `${site.origin}/*` })
   const tabId = existing[0]?.id
   if (tabId == null) {
-    return { ok: false, reason: '站点标签页未打开，请在浏览器中打开并登录该站点后再试', status: null, cookiePresent: false, localStorageKeys: [], sessionStorageKeys: [] }
+    return {
+      ok: false,
+      reason: '站点标签页未打开，请在浏览器中打开并登录该站点后再试',
+      authState: 'indeterminate',
+      authEvidence: null,
+      status: null,
+      cookiePresent: false,
+      localStorageKeys: [],
+      sessionStorageKeys: [],
+    }
   }
   try {
     const [frame] = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
       func: probeSessionInPage,
-      args: [site.origin, site.discovered?.userSelfPath ?? null],
+      args: [site.origin, site.discovered?.userSelfPath ?? null, true],
     })
     const res = frame?.result as any
     if (!res || typeof res !== 'object') {
-      return { ok: false, reason: '会话探测脚本未返回结果', status: null, cookiePresent: false, localStorageKeys: [], sessionStorageKeys: [] }
+      return {
+        ok: false,
+        reason: '会话探测脚本未返回结果',
+        authState: 'indeterminate',
+        authEvidence: null,
+        status: null,
+        cookiePresent: false,
+        localStorageKeys: [],
+        sessionStorageKeys: [],
+      }
     }
     return {
       ok: res.ok,
       reason: res.reason,
+      authState: res.authState ?? (res.authExpired ? 'unauthorized' : 'indeterminate'),
+      authEvidence: res.authEvidence ?? null,
       status: res.status ?? null,
       cookiePresent: res.cookiePresent,
       localStorageKeys: res.localStorageKeys ?? [],
       sessionStorageKeys: res.sessionStorageKeys ?? [],
     }
   } catch (e) {
-    return { ok: false, reason: e instanceof Error ? e.message : String(e), status: null, cookiePresent: false, localStorageKeys: [], sessionStorageKeys: [] }
+    return {
+      ok: false,
+      reason: e instanceof Error ? e.message : String(e),
+      authState: 'indeterminate',
+      authEvidence: null,
+      status: null,
+      cookiePresent: false,
+      localStorageKeys: [],
+      sessionStorageKeys: [],
+    }
   }
 }
 

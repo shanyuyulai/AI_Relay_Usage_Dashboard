@@ -7,7 +7,7 @@
  * 不能引用函数外部的任何符号，否则页面里会 ReferenceError、函数无返回 → 「探测脚本未返回结果」。
  */
 
-import type { UsageRecord } from '../shared/types'
+import type { UsageRecord, AccountSemantics, AuthEvidence, AuthState } from '../shared/types'
 
 export interface ProbeAttempt {
   url: string
@@ -26,6 +26,10 @@ export interface ProbeAttempt {
   hasHourlyStructure?: boolean
   /** 是否有用户标识字段（id/user_id/username/email 任一） */
   hasUserId?: boolean
+  /** 是否命中 data.user.{quota,used_quota,request_count} 账户结构 */
+  hasAccountSnapshot?: boolean
+  /** success wrapper 的业务结果；undefined 表示响应没有 success 字段 */
+  successValue?: boolean | null
 }
 
 export interface ProbeMatch {
@@ -53,6 +57,20 @@ export interface PageCollectResult {
   ok: boolean
   reason: string
   authExpired: boolean
+  /** 三态授权结论；authExpired 仅为兼容字段。 */
+  authState: AuthState
+  /** 最近一次脱敏授权证据，不含 Cookie / Token / 用户 ID。 */
+  authEvidence: AuthEvidence | null
+  /** 页面请求上下文的脱敏状态；只用于诊断，绝不包含凭证原文。 */
+  authContext: {
+    userStoragePresent: boolean
+    userStorageParseable: boolean
+    userIdPresent: boolean
+    bearerTokenPresent: boolean
+    browserIdPresent: boolean
+    newApiUserHeaderSent: boolean
+    browserIdHeaderSent: boolean
+  }
   cookiePresent: boolean
   cookieNames: string[]
   localStorageKeys: string[]
@@ -86,6 +104,23 @@ export interface PageCollectResult {
   avgResponseTimeMs: number | null
   /** 指标是否不完整 */
   metricsPartial?: boolean
+  // ===== 统计接口 + IKunCode provider 采集字段（方案 §2/§7）=====
+  /** 账户累计输入 Token（仅权威 total_input_tokens；否则 null） */
+  cumulativeInputTokens: number | null
+  /** 账户累计输出 Token（仅权威 total_output_tokens；否则 null） */
+  cumulativeOutputTokens: number | null
+  /** 账户累计消费额度/费用（如 IKunCode used_quota 经 quotaToCurrency；否则 null） */
+  totalConsumedCost: number | null
+  /** 滚动 24h 使用金额（range_usage rolling_24h；否则 null） */
+  recent24hCost: number | null
+  /** 滚动 24h Token（range_usage rolling_24h；否则 null） */
+  recent24hTokens: number | null
+  /** 指标时间窗口：calendar_day / rolling_24h / range */
+  usageWindow: 'calendar_day' | 'rolling_24h' | 'range' | null
+  /** 今日使用金额来源：dashboard_stats(权威) / range_usage / logs(降级) */
+  todayCostSource: 'dashboard_stats' | 'range_usage' | 'logs' | null
+  /** 统计/账户指标来源：dashboard_stats / account_snapshot / range_usage / null */
+  usageStatsSource: 'dashboard_stats' | 'account_snapshot' | 'range_usage' | null
   // ===== 诊断日志（脱敏指纹，P0-1/P0-4 安全边界）=====
   /** 每个端点请求的脱敏诊断条目（不含任何私密值原文） */
   diags: Array<{
@@ -112,6 +147,8 @@ export interface PageCollectResult {
   usageListDay?: string | null
   usageListPath?: string | null
   usageListKind?: 'hubway_v1' | 'generic' | null
+  /** 本次采集识别到的账户快照语义契约（方案 027 §3.1）。仅回传枚举，不回传数值/原文。 */
+  accountSemantics?: AccountSemantics | null
 }
 
 // ⚠️ 候选路径列表已内联到各页面世界函数体内。
@@ -185,17 +222,126 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
   function isRecord(v: unknown): v is Record<string, unknown> {
     return v != null && typeof v === 'object' && !Array.isArray(v)
   }
+  function isBusinessAuthFailure(raw: unknown): boolean {
+    if (!isRecord(raw)) return false
+    const error = isRecord(raw.error) ? raw.error : null
+    return (
+      raw.success === false ||
+      raw.code === 'AUTH_UNAUTHORIZED' ||
+      raw.code === 'UNAUTHORIZED' ||
+      error?.code === 'AUTH_UNAUTHORIZED' ||
+      error?.code === 'UNAUTHORIZED'
+    )
+  }
+  /**
+   * 明确未授权（方案 027 §3.2）：仅识别显式未授权业务码。
+   * 普通 success:false（功能关闭 / 参数错误 / 不支持的路径）属业务失败，不得据此判定登录失效。
+   * HTTP 401/403 由调用处按状态码单独判定。
+   */
+  function isExplicitUnauthorized(raw: unknown): boolean {
+    if (!isRecord(raw)) return false
+    const error = isRecord(raw.error) ? raw.error : null
+    return (
+      raw.code === 'AUTH_UNAUTHORIZED' ||
+      raw.code === 'UNAUTHORIZED' ||
+      error?.code === 'AUTH_UNAUTHORIZED' ||
+      error?.code === 'UNAUTHORIZED'
+    )
+  }
   function unwrap(raw: unknown): any {
     if (Array.isArray(raw)) return raw
     if (!isRecord(raw)) return null
-    if ('data' in raw && (isRecord((raw as any).data) || Array.isArray((raw as any).data))) return (raw as any).data
-    return raw
+    if (isBusinessAuthFailure(raw)) return null
+    let value: any = raw
+    for (let depth = 0; depth < 5; depth++) {
+      if (!isRecord(value) || isBusinessAuthFailure(value)) return null
+      let advanced = false
+      for (const key of ['data', 'payload', 'response', 'result']) {
+        const nested = (value as any)[key]
+        if (isRecord(nested) || Array.isArray(nested)) {
+          value = nested
+          advanced = true
+          break
+        }
+      }
+      if (!advanced) break
+    }
+    return value
+  }
+
+  /** 在有限深度的常见响应 wrapper 中定位字段对象，仅回传字段名和类型。 */
+  function findNestedObject(raw: any, keys: string[], depth = 0): Record<string, unknown> | null {
+    if (depth > 5 || !isRecord(raw)) return null
+    if (keys.some((key) => Object.prototype.hasOwnProperty.call(raw, key))) return raw
+    for (const key of ['data', 'stats', 'summary', 'result', 'usage', 'payload', 'response']) {
+      const nested = findNestedObject((raw as any)[key], keys, depth + 1)
+      if (nested) return nested
+    }
+    return null
+  }
+
+  function hasAccountSnapshot(data: any): boolean {
+    const root = findNestedObject(data, ['user'])
+    const nestedUser = root && isRecord((root as any).user) ? (root as any).user : null
+    // DoCode 当前部署的 /api/user/self 在 data 下直接返回用户字段，不再包一层 data.user。
+    // 只有同时具备身份字段与账户额度字段时才作为快照，避免把普通统计对象误认成用户。
+    const direct = unwrap(data)
+    const user = nestedUser ?? (isRecord(direct) ? direct : null)
+    if (!user) return false
+    const hasIdentity = ['id', 'user_id', 'username', 'email'].some((key) => user[key] !== undefined && user[key] !== null)
+    const hasAccountFields = ['quota', 'used_quota', 'request_count'].some((key) => user[key] !== undefined && user[key] !== null)
+    return hasIdentity && hasAccountFields
+  }
+
+  function buildPageAuthContext() {
+    const headers: Record<string, string> = { Accept: 'application/json', 'Cache-Control': 'no-store' }
+    let user: Record<string, unknown> | null = null
+    let userStoragePresent = false
+    let userStorageParseable = false
+    try {
+      const raw = localStorage.getItem('user')
+      userStoragePresent = raw != null
+      const parsed = raw ? JSON.parse(raw) : null
+      userStorageParseable = raw != null
+      if (isRecord(parsed)) user = parsed
+    } catch {}
+    const idRaw = user?.id
+    const userId = (typeof idRaw === 'number' && Number.isFinite(idRaw)) ||
+      (typeof idRaw === 'string' && idRaw.trim().length > 0) ? String(idRaw) : null
+    const nestedToken = user?.token
+    let token: string | null = typeof nestedToken === 'string' && nestedToken.trim().length > 8 ? nestedToken.trim() : null
+    if (!token) {
+      try {
+        for (const key of ['token', 'access_token', 'auth_token', 'userToken', 'Authorization', 'auth', 'accessToken', 'id_token']) {
+          const value = localStorage.getItem(key)
+          if (value && value.length > 8) { token = value.trim(); break }
+        }
+      } catch {}
+    }
+    if (token?.startsWith('Bearer ')) token = token.slice(7).trim()
+    let browserId: string | null = null
+    try {
+      const value = localStorage.getItem('docode_browser_id')
+      if (value && value.length >= 16 && value.length <= 128) browserId = value
+      if (!browserId) {
+        const generated = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+        localStorage.setItem('docode_browser_id', generated)
+        browserId = generated
+      }
+    } catch {}
+    // 与 DoCode 官方 Axios 拦截器一致：用户 ID、Bearer 和浏览器 ID 是独立头部。
+    if (userId) headers['New-API-User'] = userId
+    if (token) headers.Authorization = 'Bearer ' + token
+    if (browserId) headers['X-Docode-Browser-Id'] = browserId
+    return { headers, token, provider: userId ? 'new_api_user_object' : 'generic_cookie_or_token' }
   }
 
   /** Find a paginated list without assuming the server's exact wrapper depth. */
   function findList(data: any, depth = 0): any[] | null {
     if (Array.isArray(data)) return data
-    if (!isRecord(data) || depth > 3) return null
+    if (!isRecord(data) || depth > 5) return null
     for (const key of ['items', 'list', 'records', 'rows', 'results', 'data']) {
       const value = (data as any)[key]
       if (Array.isArray(value)) return value
@@ -203,6 +349,10 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
         const nested = findList(value, depth + 1)
         if (nested) return nested
       }
+    }
+    for (const key of ['payload', 'response', 'result', 'usage']) {
+      const nested = findList((data as any)[key], depth + 1)
+      if (nested) return nested
     }
     return null
   }
@@ -217,6 +367,7 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
 
   const attempts: ProbeAttempt[] = []
   let match: ProbeMatch | undefined
+  const pageAuthContext = buildPageAuthContext()
 
   // 同一标签页/页面内共享的探测逻辑（自包含）：fetch + 脱敏指纹。
   // 不回传任何 JSON 原文/Token/Cookie（P0-4 安全边界）。
@@ -224,45 +375,36 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
     try {
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), 5000)
-      const headers: Record<string, string> = { Accept: 'application/json' }
-      try {
-        const lsToken = (function () {
+      const headers: Record<string, string> = { ...pageAuthContext.headers }
+      const fetchOnce = async (requestHeaders: Record<string, string>) => {
+        const response = await fetch(url, { credentials: 'include', headers: requestHeaders, signal: controller.signal })
+        const responseContentType = response.headers.get('content-type') || ''
+        let responseJson: any = undefined
+        if (responseContentType.includes('json')) {
           try {
-            const ks = ['token', 'access_token', 'auth_token', 'userToken', 'Authorization', 'auth', 'accessToken', 'id_token']
-            for (const k of ks) {
-              const v = localStorage.getItem(k)
-              if (v && v.length > 8) return v.startsWith('Bearer ') ? v.slice(7) : v
-            }
-            for (let i = 0; i < localStorage.length; i++) {
-              const k = localStorage.key(i)
-              const v = k ? localStorage.getItem(k) : null
-              if (v && v.startsWith('eyJ')) return v
-            }
-          } catch {}
-          return null
-        })()
-        if (lsToken) headers['Authorization'] = 'Bearer ' + lsToken
-      } catch {}
-      const res = await fetch(url, { credentials: 'include', headers, signal: controller.signal })
+            const text = await response.text()
+            responseJson = text ? JSON.parse(text) : null
+          } catch {
+            responseJson = null
+          }
+        }
+        return { response, responseContentType, responseJson }
+      }
+      let fetched = await fetchOnce(headers)
+      if (pageAuthContext.token && pageAuthContext.provider !== 'new_api_user_object' &&
+        (fetched.response.status === 401 || fetched.response.status === 403 || isBusinessAuthFailure(fetched.responseJson))) {
+        fetched = await fetchOnce({ Accept: 'application/json' })
+      }
+      const res = fetched.response
       clearTimeout(timer)
 
-      const contentType = res.headers.get('content-type') || ''
+      const contentType = fetched.responseContentType
       let topKeys: string[] = []
       let hasWrapper = false
-      let sample: unknown = undefined
-
-      if (contentType.includes('json')) {
-        const text = await res.text()
-        try {
-          const json = text ? JSON.parse(text) : null
-          if (isRecord(json) || Array.isArray(json)) {
-            topKeys = Object.keys(json)
-            hasWrapper = 'success' in json || 'data' in json
-            sample = json
-          }
-        } catch {
-          /* ignore */
-        }
+      const sample: unknown = fetched.responseJson
+      if (isRecord(sample) || Array.isArray(sample)) {
+        topKeys = Object.keys(sample)
+        hasWrapper = isRecord(sample) && ('success' in sample || 'data' in sample || 'payload' in sample || 'response' in sample)
       }
 
       let dataFieldTypes: Record<string, string> | undefined
@@ -270,8 +412,13 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
       let hasDataArray = false
       let hasHourlyStructure = false
       let hasUserId = false
+      let hasAccount = false
+      let probeData: any = null
+      let successValue: boolean | null | undefined
       if (sample != null) {
+      if (isRecord(sample) && typeof (sample as any).success === 'boolean') successValue = (sample as any).success
       const data = unwrap(sample)
+      probeData = data
       const list = findList(data)
       if (list && list.some((v: unknown) => isRecord(v))) {
         const first = list.find((v: unknown) => isRecord(v)) as Record<string, unknown> | undefined
@@ -285,9 +432,17 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
           (dataFieldNames.includes('token_used') || dataFieldNames.includes('prompt_tokens'))
         hasUserId = !!first && ID_PATHS.some((p) => getPath(first, p) != null)
       } else if (data) {
-        dataFieldNames = Object.keys(data)
+        const metric = findNestedObject(data, [
+          'today_actual_cost',
+          'total_tokens',
+          'total_input_tokens',
+          'total_output_tokens',
+          'average_duration_ms',
+        ])
+        const fieldData = metric ?? data
+        dataFieldNames = Object.keys(fieldData)
         const types: Record<string, string> = {}
-        for (const k of dataFieldNames) types[k] = typeof (data as any)[k]
+        for (const k of dataFieldNames) types[k] = typeof (fieldData as any)[k]
         dataFieldTypes = types
           // 数组特征：data 第一个值为数组，或 data 仅一个数组字段
           hasDataArray =
@@ -301,13 +456,17 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
             dataFieldNames.includes('total_tokens') ||
             dataFieldNames.includes('tokens') ||
             dataFieldNames.includes('data')
-          hasUserId = ID_PATHS.some((p) => getPath(data, p) != null)
+          hasUserId = ID_PATHS.some((p) => getPath(data, p) != null) || ID_PATHS.some((p) => getPath(fieldData, p) != null)
         }
       }
 
+      hasAccount = hasAccountSnapshot(probeData)
       return {
         url, status: res.status, contentType, topKeys, hasWrapper,
-        dataFieldTypes, dataFieldNames, hasDataArray, hasHourlyStructure, hasUserId,
+        dataFieldTypes, dataFieldNames, hasDataArray, hasHourlyStructure,
+        hasUserId: hasUserId || hasAccount,
+        hasAccountSnapshot: hasAccount,
+        successValue,
       }
     } catch (e) {
       return { url, status: 0, contentType: '', topKeys: [], hasWrapper: false, error: (e as Error).message }
@@ -325,14 +484,21 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
       const hasIdType = ID_PATHS.some((p) => Object.prototype.hasOwnProperty.call(dt, p))
       const hasBalanceType =
         dt['quota'] !== undefined || dt['balance'] !== undefined || dt['used_quota'] !== undefined || dt['used'] !== undefined
-      if (hasIdType && hasBalanceType) {
+      if ((hasIdType && hasBalanceType) || attempt.hasAccountSnapshot) {
+        const accountBalancePath = attempt.hasAccountSnapshot
+          ? 'user.quota'
+          : dt['quota'] !== undefined
+            ? 'quota'
+            : dt['balance'] !== undefined
+              ? 'balance'
+              : 'used_quota'
         match = {
           url,
           path,
           topKeys: attempt.topKeys,
           idValue: null,
-          idPath: ID_PATHS.find((p) => Object.prototype.hasOwnProperty.call(dt, p)) || 'id',
-          balancePath: dt['quota'] !== undefined ? 'quota' : dt['balance'] !== undefined ? 'balance' : 'used_quota',
+          idPath: ID_PATHS.find((p) => Object.prototype.hasOwnProperty.call(dt, p)) || 'user',
+          balancePath: accountBalancePath,
           usedPath: dt['used_quota'] !== undefined ? 'used_quota' : dt['used'] !== undefined ? 'used' : null,
           wrapped: attempt.hasWrapper,
         }
@@ -347,12 +513,16 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
   const USAGE_CANDIDATE_PATHS = [
     `/api/v1/usage?page=1&page_size=20&start_date=${probeDayKey}&end_date=${probeDayKey}&sort_by=created_at&sort_order=desc&timezone=Asia%2FShanghai`,
     '/api/usage?page=1&page_size=50',
+    // 统计接口（Hubway 类 usage/dashboard/stats），按结构指纹识别，不按域名硬编码（方案 §3.1）
+    '/api/v1/usage/dashboard/stats?timezone=Asia%2FShanghai',
     '/api/data/self',
     '/api/v1/data/self',
     '/api/user/usage',
     '/api/v1/user/usage',
     '/api/log/self',
     '/api/v1/log/self',
+    // IKunCode 类计价/公共配置接口（只读，不作为用户指标）
+    '/api/status',
   ]
   for (const path of USAGE_CANDIDATE_PATHS) {
     const url = origin + path
@@ -413,6 +583,9 @@ export async function collectInPage(
     ? [strategy.endpoints.find((e: any) => e.role === 'balance').path]
     : []).concat(CANDIDATE_PATHS)
 
+  // 账户快照语义契约（方案 027 §3.1）：由 SW 侧 buildStrategy 透传，驱动字段口径。
+  const strategyAccountSemantics: AccountSemantics | null = strategy?.accountSemantics ?? null
+
   function getPath(obj: any, path: string): any {
     return path.split('.').reduce((o: any, k: string) => (o && typeof o === 'object' ? o[k] : undefined), obj)
   }
@@ -437,17 +610,68 @@ export async function collectInPage(
   function isRecord(v: unknown): v is Record<string, unknown> {
     return v != null && typeof v === 'object' && !Array.isArray(v)
   }
+  function isBusinessAuthFailure(raw: unknown): boolean {
+    if (!isRecord(raw)) return false
+    const error = isRecord(raw.error) ? raw.error : null
+    return (
+      raw.success === false ||
+      raw.code === 'AUTH_UNAUTHORIZED' ||
+      raw.code === 'UNAUTHORIZED' ||
+      error?.code === 'AUTH_UNAUTHORIZED' ||
+      error?.code === 'UNAUTHORIZED'
+    )
+  }
+  /**
+   * 明确未授权（方案 027 §3.2）：仅识别显式未授权业务码。
+   * 普通 success:false（功能关闭 / 参数错误 / 不支持的路径）属业务失败，不得据此判定登录失效。
+   * HTTP 401/403 由调用处按状态码单独判定。
+   */
+  function isExplicitUnauthorized(raw: unknown): boolean {
+    if (!isRecord(raw)) return false
+    const error = isRecord(raw.error) ? raw.error : null
+    return (
+      raw.code === 'AUTH_UNAUTHORIZED' ||
+      raw.code === 'UNAUTHORIZED' ||
+      error?.code === 'AUTH_UNAUTHORIZED' ||
+      error?.code === 'UNAUTHORIZED'
+    )
+  }
   function unwrap(raw: unknown): any {
     if (Array.isArray(raw)) return raw
     if (!isRecord(raw)) return null
-    if ('data' in raw && (isRecord((raw as any).data) || Array.isArray((raw as any).data))) return (raw as any).data
-    return raw
+    if (isBusinessAuthFailure(raw)) return null
+    let value: any = raw
+    for (let depth = 0; depth < 5; depth++) {
+      if (!isRecord(value) || isBusinessAuthFailure(value)) return null
+      let advanced = false
+      for (const key of ['data', 'payload', 'response', 'result']) {
+        const nested = (value as any)[key]
+        if (isRecord(nested) || Array.isArray(nested)) {
+          value = nested
+          advanced = true
+          break
+        }
+      }
+      if (!advanced) break
+    }
+    return value
+  }
+
+  /** 在有限深度的常见响应 wrapper 中定位目标字段对象。 */
+  function findNestedObject(raw: any, keys: string[], depth = 0): Record<string, unknown> | null {
+    if (depth > 5 || !isRecord(raw)) return null
+    if (keys.some((key) => Object.prototype.hasOwnProperty.call(raw, key))) return raw
+    for (const key of ['data', 'stats', 'summary', 'result', 'usage', 'payload', 'response']) {
+      const nested = findNestedObject((raw as any)[key], keys, depth + 1)
+      if (nested) return nested
+    }
+    return null
   }
 
   /** Find a paginated list without assuming the server's exact wrapper depth. */
   function findList(data: any, depth = 0): any[] | null {
     if (Array.isArray(data)) return data
-    if (!isRecord(data) || depth > 3) return null
+    if (!isRecord(data) || depth > 5) return null
     for (const key of ['items', 'list', 'records', 'rows', 'results', 'data']) {
       const value = (data as any)[key]
       if (Array.isArray(value)) return value
@@ -456,48 +680,130 @@ export async function collectInPage(
         if (nested) return nested
       }
     }
+    for (const key of ['payload', 'response', 'result', 'usage']) {
+      const nested = findList((data as any)[key], depth + 1)
+      if (nested) return nested
+    }
     return null
   }
+  /**
+   * DoCode / New API 类站点把用户会话放在 localStorage.user，官方前端请求会同时发送
+   * New-API-User 和 Bearer。所有敏感值仅留在当前页面函数闭包内，绝不返回给 SW。
+   */
+  function buildPageAuthContext() {
+    const headers: Record<string, string> = { Accept: 'application/json', 'Cache-Control': 'no-store' }
+    let user: Record<string, unknown> | null = null
+    let userStoragePresent = false
+    let userStorageParseable = false
+    try {
+      const raw = localStorage.getItem('user')
+      userStoragePresent = raw != null
+      const parsed = raw ? JSON.parse(raw) : null
+      userStorageParseable = raw != null
+      if (isRecord(parsed)) user = parsed
+    } catch {}
+    const idRaw = user?.id
+    const userId = (typeof idRaw === 'number' && Number.isFinite(idRaw)) ||
+      (typeof idRaw === 'string' && idRaw.trim().length > 0)
+      ? String(idRaw)
+      : null
+    let token: string | null = null
+    const nestedToken = user?.token
+    if (typeof nestedToken === 'string' && nestedToken.trim().length > 8) token = nestedToken.trim()
+    if (!token) {
+      try {
+        const keys = ['token', 'access_token', 'auth_token', 'userToken', 'Authorization', 'auth', 'accessToken', 'id_token']
+        for (const key of keys) {
+          const value = localStorage.getItem(key)
+          if (value && value.length > 8) {
+            token = value.trim()
+            break
+          }
+        }
+      } catch {}
+    }
+    if (token?.startsWith('Bearer ')) token = token.slice(7).trim()
+    let browserId: string | null = null
+    try {
+      const value = localStorage.getItem('docode_browser_id')
+      if (value && value.length >= 16 && value.length <= 128) browserId = value
+      if (!browserId) {
+        const generated = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+        localStorage.setItem('docode_browser_id', generated)
+        browserId = generated
+      }
+    } catch {}
+    // 对齐 DoCode 官方 Axios：这三个请求头彼此独立，不以 user.token 作为前置条件。
+    if (userId) headers['New-API-User'] = userId
+    if (token) headers.Authorization = 'Bearer ' + token
+    if (browserId) headers['X-Docode-Browser-Id'] = browserId
+    return {
+      headers,
+      token,
+      provider: userId ? ('new_api_user_object' as const) : ('generic_cookie_or_token' as const),
+      // 官方客户端可用的 DoCode 请求上下文由用户 ID + 浏览器标识构成；Bearer 为可选增强。
+      contextComplete: !!userId && !!browserId,
+      authContext: {
+        userStoragePresent,
+        userStorageParseable,
+        userIdPresent: !!userId,
+        bearerTokenPresent: !!token,
+        browserIdPresent: !!browserId,
+        newApiUserHeaderSent: !!headers['New-API-User'],
+        browserIdHeaderSent: !!headers['X-Docode-Browser-Id'],
+      },
+    }
+  }
+  const pageAuthContext = buildPageAuthContext()
   async function fetchJson(url: string): Promise<{ status: number; json: any; isJson: boolean }> {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 6000)
-    // 携带 localStorage 中的 token 作为 Bearer 头（不读取/回传 token 值，红线 P0-2）
-    const headers: Record<string, string> = { Accept: 'application/json' }
+    const headers: Record<string, string> = { ...pageAuthContext.headers }
+    const bearerToken = sessionAccessToken ?? pageAuthContext.token
+    if (bearerToken) headers.Authorization = 'Bearer ' + bearerToken
     try {
-      const lsToken = (function () {
-        try {
-          const ks = ['token', 'access_token', 'auth_token', 'userToken', 'Authorization', 'auth', 'accessToken', 'id_token']
-          for (const k of ks) {
-            const v = localStorage.getItem(k)
-            if (v && v.length > 8) return v.startsWith('Bearer ') ? v.slice(7) : v
+      const fetchOnce = async (requestHeaders: Record<string, string>) => {
+        const res = await fetch(url, {
+          credentials: 'include',
+          headers: requestHeaders,
+          signal: controller.signal,
+        })
+        const ct = res.headers.get('content-type') || ''
+        const isJson = ct.includes('json')
+        let json: any = null
+        if (isJson) {
+          try {
+            json = JSON.parse(await res.text())
+          } catch {
+            json = null
           }
-          for (let i = 0; i < localStorage.length; i++) {
-            const k = localStorage.key(i)
-            const v = k ? localStorage.getItem(k) : null
-            if (v && v.startsWith('eyJ')) return v
-          }
-        } catch {}
-        return null
-      })()
-      if (lsToken) headers['Authorization'] = 'Bearer ' + lsToken
-    } catch {}
-    try {
-      const res = await fetch(url, {
-        credentials: 'include',
-        headers,
-        signal: controller.signal,
-      })
-      const ct = res.headers.get('content-type') || ''
-      const isJson = ct.includes('json')
-      let json: any = null
-      if (isJson) {
-        try {
-          json = JSON.parse(await res.text())
-        } catch {
-          json = null
+        }
+        return { status: res.status, json, isJson }
+      }
+      let result = await fetchOnce(headers)
+      // 某些 SPA 同时保留了过期 localStorage token 和有效 HttpOnly Cookie。
+      // 先按站点常规 Bearer 流程请求，401/403 时去掉 Bearer 再用 Cookie 重试，避免误判为登录失效。
+      let rejectedByAuth = false
+      if (isRecord(result.json)) {
+        const error = isRecord(result.json.error) ? result.json.error : null
+        rejectedByAuth =
+          result.json.success === false ||
+          result.json.code === 'AUTH_UNAUTHORIZED' ||
+          result.json.code === 'UNAUTHORIZED' ||
+          error?.code === 'AUTH_UNAUTHORIZED' ||
+          error?.code === 'UNAUTHORIZED'
+      }
+      // New API 的完整上下文不仅是 Bearer；不能去掉 New-API-User 后再把失败误判为登出。
+      if ((sessionAccessToken || pageAuthContext.token) && pageAuthContext.provider !== 'new_api_user_object') {
+        const bearerRejected = result.status === 401 || result.status === 403 || rejectedByAuth
+        if (bearerRejected) {
+          const cookieHeaders = { Accept: 'application/json' }
+          result = await fetchOnce(cookieHeaders)
         }
       }
-      return { status: res.status, json, isJson }
+      return result
     } finally {
       clearTimeout(timer)
     }
@@ -517,7 +823,7 @@ export async function collectInPage(
       for (const item of data) {
         if (!isRecord(item)) continue
         const t = findNumber(item, [
-          'tokens', 'token', 'token_used', 'consumption', 'cost', 'usage', 'used', 'total_tokens', 'totalTokens',
+          'tokens', 'token', 'token_used', 'total_tokens', 'totalTokens',
         ])
         const r = findNumber(item, ['requests', 'request', 'count', 'calls', 'total_requests', 'totalRequests'])
         const m =
@@ -539,7 +845,7 @@ export async function collectInPage(
       modelMap.forEach((v, k) => byModel.push({ model: k, tokens: v }))
       return hit ? { tokens, requests, byModel } : null
     }
-    const tokens = findNumber(data, ['total_tokens', 'tokens', 'consumption', 'total_consumption', 'total_cost', 'used', 'total', 'usage'])
+    const tokens = findNumber(data, ['total_tokens', 'tokens'])
     const requests = findNumber(data, ['total_requests', 'requests', 'total_request', 'request_count', 'total_request_count', 'count', 'total_count'])
     const list =
       getPath(data, 'items') ??
@@ -586,11 +892,87 @@ export async function collectInPage(
   const usageEps = endpoints.filter((e: any) => e.role === 'usage')
   const stratCurrency = strategy?.currency || 'USD'
   const collectorVersion = strategy?.collectorVersion ?? 0
+  // 受控手动流程标志（仅用户「立即同步」时为 true），用于 IKunCode refresh 这类有副作用端点。
+  // 必须在余额早退分支之前声明，因为 refresh 可能是余额接口失败后的唯一账户来源。
+  const manualCollect = !!(strategy?.manualCollect)
+  // 同一轮采集内 refresh 最多执行一次。余额阶段和 account_snapshot provider
+  // 可能都需要它，但重复 POST 会造成不必要的会话副作用。
+  let refreshAttempted = false
+  let refreshSnapshotRaw: any = null
+  // IKunCode refresh token remains in memory for this collection only.
+  let sessionAccessToken: string | null = null
 
   // 若 strategy 为空或无余额端点，回退旧逻辑（向后兼容）
   let matchedPath: string | null = null
   let dataObj: Record<string, unknown> | null = null
+  // 账户快照可以位于 data.user，不能强行压平成余额端点的顶层字段。
+  let accountSnapshotRaw: any = null
   let authExpired = false
+  const collectRunId = typeof strategy?.collectRunId === 'string' && strategy.collectRunId
+    ? strategy.collectRunId
+    : crypto.randomUUID()
+  const authorityPaths = new Set<string>(['/api/user/self'])
+  for (const endpoint of strategy?.endpoints ?? []) {
+    if (endpoint?.authRole === 'authority' && typeof endpoint.path === 'string') authorityPaths.add(endpoint.path)
+  }
+  const authEvidenceList: AuthEvidence[] = []
+  function noteAuth(
+    state: AuthState,
+    reason: AuthEvidence['reason'],
+    endpointRole: AuthEvidence['endpointRole'],
+    path: string | null,
+    httpStatus: number | null,
+  ) {
+    authEvidenceList.push({
+      state,
+      reason,
+      endpointRole,
+      path,
+      httpStatus,
+      provider: pageAuthContext.provider,
+      contextComplete: pageAuthContext.contextComplete,
+      collectRunId,
+      observedAt: Date.now(),
+    })
+  }
+  function noteAuthFailure(path: string, status: number, json: any, endpointRole: AuthEvidence['endpointRole'] = 'candidate') {
+    const explicitUnauthorized = status === 401 || status === 403 || isExplicitUnauthorized(json)
+    const authority = authorityPaths.has(path)
+    if (authority && explicitUnauthorized) {
+      if (pageAuthContext.contextComplete) {
+        noteAuth('unauthorized', 'ACCOUNT_UNAUTHORIZED', 'account_authority', path, status || null)
+      } else {
+        noteAuth('indeterminate', 'AUTH_CONTEXT_INCOMPLETE', 'account_authority', path, status || null)
+      }
+    } else if (!authority && explicitUnauthorized) {
+      noteAuth('indeterminate', 'CANDIDATE_REJECTED', endpointRole, path, status || null)
+    } else if (authority && status === 0) {
+      noteAuth('indeterminate', 'NETWORK_OR_TIMEOUT', 'account_authority', path, null)
+    }
+  }
+  function noteAccountSuccess(path: string, status: number) {
+    if (authorityPaths.has(path)) {
+      noteAuth('authenticated', 'ACCOUNT_AUTHENTICATED', 'account_authority', path, status)
+    }
+  }
+  function resolveAuthEvidence(): AuthEvidence | null {
+    const ranks: Record<AuthEvidence['reason'], number> = {
+      ACCOUNT_AUTHENTICATED: 400,
+      ACCOUNT_UNAUTHORIZED: 300,
+      AUTH_CONTEXT_INCOMPLETE: 220,
+      NETWORK_OR_TIMEOUT: 210,
+      NON_JSON_RESPONSE: 200,
+      ACCOUNT_CONTRACT_MISMATCH: 190,
+      ENDPOINT_UNAVAILABLE: 180,
+      CANDIDATE_REJECTED: 100,
+    }
+    let best: AuthEvidence | null = null
+    for (const evidence of authEvidenceList) {
+      if (!best || ranks[evidence.reason] > ranks[best.reason] ||
+        (ranks[evidence.reason] === ranks[best.reason] && evidence.observedAt > best.observedAt)) best = evidence
+    }
+    return best
+  }
   // A0：本次采集对余额接口的实测往返耗时（GPT P0-5：非纯延迟、非站点平均响应）
   let apiRoundTripMs: number | null = null
   const needsToken = !!(balanceEp?.needsToken)
@@ -638,14 +1020,17 @@ export async function collectInPage(
       const { status, json, isJson } = await fetchJson(url)
       const dt = performance.now() - t0
       if (status === 401 || status === 403) {
-        authExpired = true
+        noteAuthFailure(balanceEp.path, status, json)
         recordDiag('balance', url, status, '', Math.round(dt), null, '401/403 未授权')
       } else if (status && status < 400 && isJson && json) {
         const data = unwrap(json)
-        if (data && ID_PATHS.some((p) => getPath(data, p) != null)) {
+        const account = extractAccountSnapshot(json)
+        if (data && (ID_PATHS.some((p) => getPath(data, p) != null) || account)) {
           matchedPath = balanceEp.path
           dataObj = data
+          accountSnapshotRaw = account ? json : null
           apiRoundTripMs = Math.round(dt)
+          noteAccountSuccess(balanceEp.path, status)
           recordDiag('balance', url, status, isJson ? 'application/json' : '', Math.round(dt), data, '命中用户信息')
         } else {
           recordDiag('balance', url, status, isJson ? 'application/json' : '', Math.round(dt), data ?? null, '响应缺少用户标识字段')
@@ -666,17 +1051,25 @@ export async function collectInPage(
         const t0 = performance.now()
         const { status, json, isJson } = await fetchJson(url)
         const dt = performance.now() - t0
-        if (status === 401 || status === 403) { authExpired = true; recordDiag('balance', url, status, '', Math.round(dt), null, '401/403 未授权'); continue }
+        if (status === 401 || status === 403) { noteAuthFailure(path, status, json); recordDiag('balance', url, status, '', Math.round(dt), null, '401/403 未授权'); continue }
         if (!status || status >= 400 || !isJson || !json) { recordDiag('balance', url, status || 0, isJson ? 'application/json' : '', Math.round(dt), null, `HTTP ${status ?? '?'} 或非 JSON`); continue }
         const wrapped = isRecord(json) && ('success' in json || 'data' in json)
-        if (wrapped && (json as any).success === false) { authExpired = true; recordDiag('balance', url, status, 'application/json', Math.round(dt), null, 'success:false'); continue }
+        if (wrapped && (json as any).success === false) {
+          // 非认证的 success:false（功能关闭/参数错误/不支持路径）属业务失败，不得判定登录失效（方案 027 §3.2）。
+          if (isExplicitUnauthorized(json)) noteAuthFailure(path, status, json)
+          recordDiag('balance', url, status, 'application/json', Math.round(dt), null, isExplicitUnauthorized(json) ? 'success:false 明确未授权' : 'success:false（业务失败，非认证）')
+          continue
+        }
         const data = unwrap(json)
         if (!data) { recordDiag('balance', url, status, 'application/json', Math.round(dt), null, '无法 unwrap 响应'); continue }
         const hasId = ID_PATHS.some((p) => getPath(data, p) != null)
-        if (!hasId) { recordDiag('balance', url, status, 'application/json', Math.round(dt), data, '缺少用户标识字段'); continue }
+        const account = extractAccountSnapshot(json)
+        if (!hasId && !account) { recordDiag('balance', url, status, 'application/json', Math.round(dt), data, '缺少用户标识字段'); continue }
         matchedPath = path
         dataObj = data
+        accountSnapshotRaw = account ? json : null
         apiRoundTripMs = Math.round(dt)
+        noteAccountSuccess(path, status)
         recordDiag('balance', url, status, 'application/json', Math.round(dt), data, '回退命中')
         break
       } catch (e) {
@@ -686,45 +1079,93 @@ export async function collectInPage(
     }
   }
 
-  if (!dataObj || !matchedPath) {
-    return {
-      ok: false,
-      reason: authExpired ? '登录态失效（接口返回 401 / 未登录）' : '未探测到用户信息接口',
-      authExpired,
-      cookiePresent,
-      cookieNames,
-      localStorageKeys,
-      sessionStorageKeys,
-      balance: null,
-      used: null,
-      totalQuota: null,
-      totalRequests: null,
-      currency: null,
-      todayTokens: null,
-      todayRequests: null,
-      modelUsages: [],
-      path: null,
-      rawKeys: [],
-      cumulativeTokens: null,
-      cumulativeTokensSource: null,
-      apiRoundTripMs: null,
-      avgResponseTimeMs: null,
-      todayCost: null,
-      diags,
-      usageRecords: [],
-      usageRecordsComplete: false,
-      usageRecordsTruncatedReason: null,
+  // IKunCode 只有 POST /api/user/auth/refresh 能返回账户快照时，必须在用户主动同步时受控调用。
+  // 该调用不能放在 dataObj 失败后的 early return 之后，否则永远不会执行。
+  if (!dataObj && manualCollect) {
+    const refreshPath = '/api/user/auth/refresh'
+    refreshAttempted = true
+    const ref = await requestEndpoint({
+      path: refreshPath,
+      method: 'POST',
+      // IKunCode 前端以 undefined body 调用 refresh；空 JSON body 会触发部分部署的参数校验。
+      bodyTemplate: null,
+      sideEffect: 'session_refresh',
+      safeToAutoPoll: false,
+    })
+    if (ref.status >= 200 && ref.status < 400 && ref.isJson && (hasAuthBundle(ref.json) || extractAccountSnapshot(ref.json))) {
+      dataObj = unwrapStats(ref.json) ?? ref.json
+      accountSnapshotRaw = ref.json
+      refreshSnapshotRaw = ref.json
+      matchedPath = refreshPath
+      apiRoundTripMs = ref.elapsedMs
+      recordDiag(
+        'balance',
+        `${origin}${refreshPath}`,
+        ref.status,
+        'application/json',
+        ref.elapsedMs,
+        dataObj,
+        hasAuthBundle(ref.json) ? 'POST refresh 认证 Bundle 成功' : 'POST refresh 命中账户快照',
+      )
+    } else {
+      noteAuthFailure(refreshPath, ref.status, ref.json, 'refresh')
+      recordDiag('balance', `${origin}${refreshPath}`, ref.status || 0, ref.isJson ? 'application/json' : '', ref.elapsedMs, null, 'POST refresh 未取得账户快照')
     }
   }
 
-  let balance = findNumber(dataObj, ['balance', 'remain', 'remaining', 'available'])
-  const used = findNumber(dataObj, USED_PATHS)
-  if (balance == null) {
-    const quota = findNumber(dataObj, ['quota', 'totalQuota', 'total_quota'])
+  const accountSnapshot = accountSnapshotRaw ? extractAccountSnapshot(accountSnapshotRaw) : dataObj ? extractAccountSnapshot(dataObj) : null
+  // DoCode / New API 的 data.user.quota 是“当前可用额度”，而非“总额度”。
+  // 必须在通用余额回退前读取 /api/status 的 quota_per_unit：此前把这一步放在
+  // 可选 provider 阶段，任何用量采集异常都会让旧的 quota - used_quota 结果落库。
+  let billingConfig: { quotaPerUnit: number | null; usdExchangeRate: number | null; customCurrencyExchangeRate: number | null } | null = null
+  let docodeUnitUnavailable = false
+  let isDoCodeOrigin = false
+  try {
+    const hostname = new URL(origin).hostname.toLowerCase()
+    isDoCodeOrigin = hostname === 'docode.cc' || hostname.endsWith('.docode.cc')
+  } catch { /* 无效 origin 仍按通用策略处理 */ }
+  if (accountSnapshot) {
+    const billingUrl = `${origin}/api/status`
+    try {
+      const t0 = performance.now()
+      const { status, json, isJson } = await fetchJson(billingUrl)
+      const elapsedMs = Math.round(performance.now() - t0)
+      const root = isRecord(json) && isRecord((json as any).data) ? (json as any).data : json
+      if (status >= 200 && status < 400 && isJson && isRecord(root)) {
+        const quotaPerUnit = toFiniteNonNegative(getPath(root, 'quota_per_unit'))
+        if (quotaPerUnit != null && quotaPerUnit > 0) {
+          billingConfig = {
+            quotaPerUnit,
+            usdExchangeRate: toFiniteNonNegative(getPath(root, 'usd_exchange_rate')),
+            customCurrencyExchangeRate: toFiniteNonNegative(getPath(root, 'custom_currency_exchange_rate')),
+          }
+          recordDiag('balance', billingUrl, status, 'application/json', elapsedMs, root, '余额单位配置已取得，将按 quota_per_unit 换算')
+        } else {
+          if (isDoCodeOrigin) docodeUnitUnavailable = true
+          recordDiag('balance', billingUrl, status, 'application/json', elapsedMs, root, '余额单位配置缺少有效 quota_per_unit')
+        }
+      } else {
+        if (isDoCodeOrigin) docodeUnitUnavailable = true
+        recordDiag('balance', billingUrl, status || 0, isJson ? 'application/json' : '', elapsedMs, null, '余额单位配置请求失败')
+      }
+    } catch {
+      if (isDoCodeOrigin) docodeUnitUnavailable = true
+      recordDiag('balance', billingUrl, 0, '', 0, null, '余额单位配置网络错误')
+    }
+  }
+
+  // 余额不是整轮采集的前置条件：Hubway 类站点可能没有标准用户接口，
+  // 但统计接口仍可独立返回 today_actual_cost / total_tokens 等权威指标。
+  // 用空对象承接后续解析，最终在所有 provider 请求完成后统一判断是否真的无数据。
+  const balanceData = dataObj ?? {}
+  let balance = findNumber(balanceData, ['balance', 'remain', 'remaining', 'available'])
+  const used = findNumber(balanceData, USED_PATHS)
+  if (balance == null && !(isDoCodeOrigin && accountSnapshot)) {
+    const quota = findNumber(balanceData, ['quota', 'totalQuota', 'total_quota'])
     if (quota != null) balance = quota - (used ?? 0)
   }
   // 累计请求数（ikuncode 等「/api/user/self」明确返回；其余站点可能缺失→null，UI 显「—」）
-  const totalRequests = findNumber(dataObj, [
+  const totalRequests = findNumber(balanceData, [
     'request_count',
     'total_request_count',
     'totalRequestCount',
@@ -734,10 +1175,10 @@ export async function collectInPage(
     'totalRequests',
     'consumed_requests',
   ])
-  const rawKeys = Object.keys(dataObj)
+  const rawKeys = Object.keys(balanceData)
 
   // A0：累计 Token（仅 token 命名字段，绝不取 quota/used_quota 额度，GPT P0-2）
-  const cumulativeTokens = findNumber(dataObj, [
+  const cumulativeTokens = findNumber(balanceData, [
     'total_tokens', 'cumulative_tokens', 'total_token', 'consumed_tokens',
     'all_time_tokens', 'lifetime_tokens', 'totalTokens', 'cumulativeToken',
   ])
@@ -745,42 +1186,11 @@ export async function collectInPage(
 
   // A0：站点自报平均 API 响应（仅权威时间字段；秒级 <1000 视为秒→转 ms，GPT P0-5）
   let avgResponseTimeMs: number | null = null
-  const rawAvg = findNumber(dataObj, [
+  const rawAvg = findNumber(balanceData, [
     'avg_response', 'avg_response_time', 'average_response_time', 'avg_latency',
     'average_latency', 'avgResponseTime', 'avgResponse', 'averageResponse',
   ])
   if (rawAvg != null) avgResponseTimeMs = rawAvg < 1000 ? Math.round(rawAvg * 1000) : Math.round(rawAvg)
-
-  if (balance == null && used == null) {
-    return {
-      ok: false,
-      reason: `响应缺少余额/已用字段（尝试了 ${BALANCE_PATHS.join('/')} 和 ${USED_PATHS.join('/')}）`,
-      authExpired: false,
-      cookiePresent,
-      cookieNames,
-      localStorageKeys,
-      sessionStorageKeys,
-      balance: null,
-      used: null,
-      totalQuota: null,
-      totalRequests: null,
-      currency: null,
-      todayTokens: null,
-      todayRequests: null,
-      modelUsages: [],
-      path: matchedPath,
-      rawKeys,
-      cumulativeTokens: null,
-      cumulativeTokensSource: null,
-      apiRoundTripMs: null,
-      avgResponseTimeMs: null,
-      todayCost: null,
-      diags,
-      usageRecords: [],
-      usageRecordsComplete: false,
-      usageRecordsTruncatedReason: null,
-    }
-  }
 
   const totalQuota = balance != null && used != null ? balance + used : null
 
@@ -796,6 +1206,23 @@ export async function collectInPage(
   let usageCumulativeTokens: number | null = null
   let usageAvgResponseMs: number | null = null
 
+  // ===== 统计接口 + IKunCode provider 采集状态（方案 §7）=====
+  let dsTodayCost: number | null = null
+  let dsCumulativeTokens: number | null = null
+  let dsCumulativeInputTokens: number | null = null
+  let dsCumulativeOutputTokens: number | null = null
+  let dsAvgResponseTimeMs: number | null = null
+  let ikTotalConsumedCost: number | null = null
+  let ikTotalRequests: number | null = null
+  let ruTodayCost: number | null = null
+  let ruTodayTokens: number | null = null
+  let ruTodayRequests: number | null = null
+  let ruRecent24hCost: number | null = null
+  let ruRecent24hTokens: number | null = null
+  let unitAssumed = false
+  let usageStatsSource: 'dashboard_stats' | 'account_snapshot' | 'range_usage' | null = null
+  let todayCostSource: 'dashboard_stats' | 'range_usage' | 'logs' | null = null
+  let usageWindowVal: 'calendar_day' | 'rolling_24h' | 'range' | null = null
   /** 从任意 JSON 对象中尝试提取累计 Token 和平均响应（与余额端点的提取逻辑一致）。 */
   function extractExtraMetrics(data: Record<string, unknown>) {
     if (usageCumulativeTokens == null) {
@@ -828,11 +1255,374 @@ export async function collectInPage(
     return null
   }
 
+  // ===== 统计接口 + IKunCode provider 解析/请求（方案 §4/§5/§7）=====
+  // 全部自包含，不得引用本函数外部符号。
+
+  /** 通用非负有限数字校验（方案 §5.1）：无效（NaN/Infinity/负数/空串/布尔/数组/对象）→ null，0 是合法值。 */
+  function toFiniteNonNegative(v: any): number | null {
+    if (typeof v === 'number') return Number.isFinite(v) && v >= 0 ? v : null
+    if (typeof v === 'string') {
+      const s = v.trim()
+      if (s === '') return null
+      const n = Number(s.replace(/,/g, ''))
+      return Number.isFinite(n) && n >= 0 ? n : null
+    }
+    return null
+  }
+
+  /** 从 localStorage 读取候选 Bearer token（仅本页面内存使用，绝不回传/落库，P0-2）。 */
+  function readLocalToken(): string | null {
+    return pageAuthContext.token
+  }
+
+  /** IKunCode 前端把会话 sid 持久化在 auth.session.sid；只在请求头内存中使用。 */
+  function readAuthSessionSid(): string | null {
+    try {
+      function findSid(value: any, depth = 0): string | null {
+        if (depth > 4 || !isRecord(value)) return null
+        const session = (value as any).session
+        if (isRecord(session) && typeof session.sid === 'string' && session.sid.length > 0) return session.sid
+        for (const key of ['auth', 'state', 'data', 'user', 'store', 'session']) {
+          const nested = findSid((value as any)[key], depth + 1)
+          if (nested) return nested
+        }
+        return null
+      }
+      for (const storage of [localStorage, sessionStorage]) {
+        for (let i = 0; i < storage.length; i++) {
+          const key = storage.key(i) || ''
+          const raw = storage.getItem(key)
+          if (!raw) continue
+          try {
+            const sid = findSid(JSON.parse(raw))
+            if (sid) return sid
+          } catch {
+            /* ignore non-JSON storage values */
+          }
+        }
+      }
+    } catch {
+      /* ignore storage access errors */
+    }
+    return null
+  }
+
+  /** 统一端点请求执行器（方案 §4.5）：支持 GET/POST、query 模板（URL API 写入）、JSON body、Cookie 凭证。 */
+  async function requestEndpoint(ep: any): Promise<{ status: number; json: any; isJson: boolean; elapsedMs: number }> {
+    let url: URL
+    try {
+      url = new URL(origin + ep.path)
+    } catch {
+      return { status: 0, json: null, isJson: false, elapsedMs: 0 }
+    }
+    if (ep.queryTemplate && isRecord(ep.queryTemplate)) {
+      for (const k of Object.keys(ep.queryTemplate as Record<string, unknown>)) {
+        url.searchParams.set(k, String((ep.queryTemplate as any)[k]))
+      }
+    }
+    if (ep.role === 'range_usage') {
+      const now = Date.now()
+      const shanghaiNow = new Date(now + 480 * 60 * 1000)
+      const startMs = Date.UTC(
+        shanghaiNow.getUTCFullYear(),
+        shanghaiNow.getUTCMonth(),
+        shanghaiNow.getUTCDate(),
+      ) - 480 * 60 * 1000
+      url.searchParams.set('start_timestamp', String(Math.floor(startMs / 1000)))
+      url.searchParams.set('end_timestamp', String(Math.floor(now / 1000)))
+      url.searchParams.set('default_time', 'hour')
+    }
+    const method = ep.method === 'POST' ? 'POST' : 'GET'
+    const headers: Record<string, string> = { ...pageAuthContext.headers }
+    const lsToken = readLocalToken()
+    const bearerToken = sessionAccessToken ?? lsToken
+    if (bearerToken) headers['Authorization'] = 'Bearer ' + bearerToken
+    const isSessionRefresh = ep.sideEffect === 'session_refresh' || ep.path === '/api/user/auth/refresh'
+    const sessionSid = isSessionRefresh ? readAuthSessionSid() : null
+    if (sessionSid) headers['X-Auth-Session'] = sessionSid
+    let body: string | undefined
+    if (method === 'POST' && ep.bodyTemplate && isRecord(ep.bodyTemplate)) {
+      try {
+        body = JSON.stringify(ep.bodyTemplate)
+        headers['Content-Type'] = 'application/json'
+      } catch {
+        body = undefined
+      }
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 6000)
+    const t0 = performance.now()
+    try {
+      const fetchOnce = async (requestHeaders: Record<string, string>) => {
+        const res = await fetch(url.toString(), { credentials: 'include', method, headers: requestHeaders, body, signal: controller.signal })
+        const ct = res.headers.get('content-type') || ''
+        const isJson = ct.includes('json')
+        let json: any = null
+        if (isJson) {
+          try {
+            json = JSON.parse(await res.text())
+          } catch {
+            json = null
+          }
+        }
+        return { status: res.status, json, isJson }
+      }
+      // refresh 优先使用当前页面的 HttpOnly Cookie；这是该端点的正常会话来源。
+      // 如果站点版本实际要求 localStorage Bearer，再只补一次 Bearer 请求。
+      const cookieHeaders = { ...headers }
+      delete cookieHeaders.Authorization
+      let result = await fetchOnce(isSessionRefresh ? cookieHeaders : headers)
+      const error = isRecord(result.json) && isRecord(result.json.error) ? result.json.error : null
+      const businessAuthFailure = isRecord(result.json) && (
+        result.json.success === false ||
+        result.json.code === 'AUTH_UNAUTHORIZED' ||
+        result.json.code === 'UNAUTHORIZED' ||
+        error?.code === 'AUTH_UNAUTHORIZED' ||
+        error?.code === 'UNAUTHORIZED'
+      )
+      if ((result.status === 401 || result.status === 403 || businessAuthFailure) &&
+        (bearerToken || isSessionRefresh) && pageAuthContext.provider !== 'new_api_user_object') {
+        result = await fetchOnce(isSessionRefresh ? headers : cookieHeaders)
+      }
+      if (isSessionRefresh && result.status >= 200 && result.status < 400 && result.isJson) {
+        const refreshedToken = extractAuthAccessToken(result.json)
+        if (refreshedToken) sessionAccessToken = refreshedToken
+      }
+      return { ...result, elapsedMs: Math.round(performance.now() - t0) }
+    } catch {
+      return { status: 0, json: null, isJson: false, elapsedMs: Math.round(performance.now() - t0) }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** 解包统计/账户响应（方案 §4.4）：有限深度，不无限递归；success:false 立即拒绝。 */
+  function unwrapStats(raw: any): any {
+    if (!isRecord(raw)) return null
+    const error = isRecord(raw.error) ? raw.error : null
+    if (
+      raw.success === false ||
+      raw.code === 'AUTH_UNAUTHORIZED' ||
+      raw.code === 'UNAUTHORIZED' ||
+      error?.code === 'AUTH_UNAUTHORIZED' ||
+      error?.code === 'UNAUTHORIZED'
+    ) return null
+    let obj: any = raw
+    for (let depth = 0; depth < 5; depth++) {
+      if (!isRecord(obj)) break
+      const nestedError = isRecord(obj.error) ? obj.error : null
+      if (
+        obj.success === false ||
+        obj.code === 'AUTH_UNAUTHORIZED' ||
+        obj.code === 'UNAUTHORIZED' ||
+        nestedError?.code === 'AUTH_UNAUTHORIZED' ||
+        nestedError?.code === 'UNAUTHORIZED'
+      ) return null
+      let advanced = false
+      for (const key of ['data', 'payload', 'response', 'result']) {
+        if (isRecord(obj[key])) {
+          obj = obj[key]
+          advanced = true
+          break
+        }
+      }
+      if (!advanced) break
+    }
+    return obj
+  }
+
+  /** 在有限深度的常见 wrapper 中定位目标对象，兼容 data.data / data.stats 等站点变体。 */
+  function findMetricObject(raw: any, keys: string[], depth = 0): Record<string, unknown> | null {
+    if (depth > 5 || !isRecord(raw)) return null
+    if (keys.some((key) => Object.prototype.hasOwnProperty.call(raw, key))) return raw
+    for (const key of ['data', 'stats', 'summary', 'result', 'usage', 'payload', 'response']) {
+      const nested = (raw as any)[key]
+      const found = findMetricObject(nested, keys, depth + 1)
+      if (found) return found
+    }
+    return null
+  }
+
+  /** 提取 Hubway 统计接口字段（方案 §5.2）：仅精确字段映射，不做额度换算/单位猜测。 */
+  function extractDashboardStats(data: any): {
+    todayCost: number | null
+    cumulativeTokens: number | null
+    cumulativeInputTokens: number | null
+    cumulativeOutputTokens: number | null
+    avgResponseTimeMs: number | null
+  } | null {
+    const metric = findMetricObject(data, [
+      'today_actual_cost',
+      'total_tokens',
+      'total_input_tokens',
+      'total_output_tokens',
+      'average_duration_ms',
+    ])
+    if (!metric) return null
+    const todayCost = toFiniteNonNegative(getPath(metric, 'today_actual_cost'))
+    const cumulativeTokens = toFiniteNonNegative(getPath(metric, 'total_tokens'))
+    const cumulativeInputTokens = toFiniteNonNegative(getPath(metric, 'total_input_tokens'))
+    const cumulativeOutputTokens = toFiniteNonNegative(getPath(metric, 'total_output_tokens'))
+    // average_duration_ms 已声明毫秒语义：直接存原始毫秒，不 /1000、不按大小猜测单位（方案 §1.2.5/§5.2）
+    const avgRaw = toFiniteNonNegative(getPath(metric, 'average_duration_ms'))
+    const avgResponseTimeMs = avgRaw != null ? Math.round(avgRaw) : null
+    if (
+      todayCost == null &&
+      cumulativeTokens == null &&
+      cumulativeInputTokens == null &&
+      cumulativeOutputTokens == null &&
+      avgResponseTimeMs == null
+    ) {
+      return null
+    }
+    return { todayCost, cumulativeTokens, cumulativeInputTokens, cumulativeOutputTokens, avgResponseTimeMs }
+  }
+
+  /** 提取 IKunCode 账户快照 data.user.*（方案 §5.5）：必须用嵌套路径，不依赖顶层模糊搜索。 */
+  function extractAccountSnapshot(data: any): {
+    balanceQuota: number | null
+    consumedQuota: number | null
+    lifetimeRequests: number | null
+  } | null {
+    const root = findMetricObject(data, ['user'])
+    const nestedUser = root && isRecord(root.user) ? root.user : null
+    // DoCode / New API 的当前响应是 { success, data: { id, quota, used_quota, ... } }，
+    // 而不是旧的 { success, data: { user: {...} } }。仅当身份字段与完整账户字段同时存在时接纳直接对象。
+    const direct = unwrapStats(data)
+    const directUser = isRecord(direct) &&
+      ['id', 'user_id', 'username', 'email'].some((key) => direct[key] !== undefined && direct[key] !== null) &&
+      ['quota', 'used_quota', 'request_count'].some((key) => direct[key] !== undefined && direct[key] !== null)
+      ? direct
+      : null
+    const user = nestedUser ?? directUser
+    if (!isRecord(user)) return null
+    const balanceQuota = toFiniteNonNegative(getPath(user, 'quota'))
+    const consumedQuota = toFiniteNonNegative(getPath(user, 'used_quota'))
+    const lifetimeRequests = toFiniteNonNegative(getPath(user, 'request_count'))
+    if (balanceQuota == null && consumedQuota == null && lifetimeRequests == null) return null
+    return { balanceQuota, consumedQuota, lifetimeRequests }
+  }
+
+  /**
+   * IKunCode refresh 返回的是认证 Bundle，不应要求它同时携带额度字段。
+   * 认证成功与账户指标完整是两个独立事实：前者用于判断登录态，后者只用于填充可用指标。
+   */
+  function hasAuthBundle(data: any): boolean {
+    return isRecord(data) && data.success === true && findAuthBundleObject(data) != null
+  }
+
+  /** IKunCode refresh 的真实认证 Bundle；只接受完整结构，避免普通账户 JSON 被当作 Token 来源。 */
+  function findAuthBundleObject(data: any, depth = 0): Record<string, unknown> | null {
+    if (depth > 6 || !isRecord(data) || isBusinessAuthFailure(data)) return null
+    const hasAccessToken = typeof data.access_token === 'string' && data.access_token.trim().length > 8
+    const hasTokenType = typeof data.token_type === 'string' && data.token_type.trim().length > 0
+    const hasAccessExpiry = data.access_expires_at !== undefined && data.access_expires_at !== null
+    const user = isRecord(data.user) ? data.user : null
+    const session = isRecord(data.session) ? data.session : null
+    const hasUserIdentity = !!user &&
+      user.id !== undefined && user.id !== null &&
+      typeof user.username === 'string' && user.username.trim().length > 0 &&
+      typeof user.role === 'string' && user.role.trim().length > 0
+    const hasSessionIdentity = !!session &&
+      typeof session.sid === 'string' && session.sid.trim().length > 0 &&
+      session.current !== undefined && session.current !== null &&
+      typeof session.login_method === 'string' && session.login_method.trim().length > 0 &&
+      typeof session.ip === 'string' && session.ip.trim().length > 0 &&
+      typeof session.user_agent === 'string' && session.user_agent.trim().length > 0 &&
+      session.created_at !== undefined && session.created_at !== null &&
+      session.last_active_at !== undefined && session.last_active_at !== null &&
+      session.expires_at !== undefined && session.expires_at !== null
+    if (hasAccessToken && hasTokenType && hasAccessExpiry && hasUserIdentity && hasSessionIdentity) return data
+    for (const key of ['data', 'payload', 'response', 'result']) {
+      const found = findAuthBundleObject((data as any)[key], depth + 1)
+      if (found) return found
+    }
+    return null
+  }
+
+  function extractAuthAccessToken(data: any): string | null {
+    const bundle = findAuthBundleObject(data)
+    if (!bundle || typeof bundle.access_token !== 'string') return null
+    const token = bundle.access_token.trim()
+    if (token.length <= 8) return null
+    return token.startsWith('Bearer ') ? token.slice(7).trim() : token
+  }
+
+  function parseTimestampMs(v: any): number | null {
+    if (v == null) return null
+    if (typeof v === 'number' && Number.isFinite(v)) return v < 1e12 ? v * 1000 : v
+    const text = String(v).trim()
+    if (!text) return null
+    const numeric = Number(text.replace(/,/g, ''))
+    if (Number.isFinite(numeric)) return numeric < 1e12 ? numeric * 1000 : numeric
+    const parsed = Date.parse(text)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+
+  /** 提取 IKunCode 区间用量（方案 §5.5）：按记录白名单取 quota/token_used/count，分别累加。 */
+  function extractRangeUsage(data: any, fromMs: number, toMs: number): {
+    costSum: number | null
+    tokenSum: number | null
+    requestSum: number | null
+  } | null {
+    const root = unwrapStats(data)
+    if (!root) return null
+    const arr: any[] = findList(root) ?? []
+    if (!Array.isArray(arr) || arr.length === 0) return null
+    let costSum: number | null = null
+    let tokenSum: number | null = null
+    let requestSum: number | null = null
+    for (const item of arr) {
+      if (!isRecord(item)) continue
+      // 服务端部分版本会返回近 24 小时或更宽窗口；created_at 存在时必须
+      // 在客户端再次按 Asia/Shanghai 自然日边界过滤。
+      const createdAt = parseTimestampMs(item.created_at ?? item.timestamp ?? item.time)
+      // 方案 029 §5.3：无时间戳无法证明记录属上海自然日，不得计入「今日」（标记未验证）。
+      if (createdAt == null) continue
+      if (createdAt < fromMs || createdAt > toMs) continue
+      const q = toFiniteNonNegative(getPath(item, 'quota'))
+      const tk = toFiniteNonNegative(getPath(item, 'token_used') ?? getPath(item, 'total_tokens') ?? getPath(item, 'tokens'))
+      const ct = toFiniteNonNegative(getPath(item, 'count'))
+      if (q != null) costSum = (costSum ?? 0) + q
+      if (tk != null) tokenSum = (tokenSum ?? 0) + tk
+      if (ct != null) requestSum = (requestSum ?? 0) + ct
+    }
+    if (costSum == null && tokenSum == null && requestSum == null) return null
+    return { costSum, tokenSum, requestSum }
+  }
+
+  /** quota → 本币金额转换（方案 §5.5/§3.4.3）：仅 unit=quota 时执行；缺失 quotaPerUnit 才用默认 500000 并标记 unitAssumed。 */
+  function quotaToCurrency(
+    quota: number | null,
+    billing: { quotaPerUnit: number | null; usdExchangeRate: number | null; customCurrencyExchangeRate: number | null },
+    targetCurrency: string,
+  ): { value: number | null; unitAssumed: boolean } {
+    if (quota == null) return { value: null, unitAssumed: false }
+    let quotaPerUnit = billing.quotaPerUnit
+    let unitAssumed = false
+    if (quotaPerUnit == null || quotaPerUnit <= 0) {
+      quotaPerUnit = 500000
+      unitAssumed = true
+    }
+    let rate: number | null = null
+    if (targetCurrency === 'USD') rate = 1
+    else if (targetCurrency === 'CNY') rate = billing.usdExchangeRate
+    else if (targetCurrency === 'CUSTOM') rate = billing.customCurrencyExchangeRate
+    if (rate == null || rate < 0) return { value: null, unitAssumed }
+    return { value: (quota / quotaPerUnit) * rate, unitAssumed }
+  }
+
   try {
-    const start = new Date()
-    start.setHours(0, 0, 0, 0)
-    const fromMs = start.getTime()
-    const toMs = Date.now()
+    // IKunCode 的区间接口按 Asia/Shanghai 自然日解释时间戳，不能依赖浏览器本地时区。
+    const nowMs = Date.now()
+    const shanghaiNow = new Date(nowMs + 480 * 60 * 1000)
+    const shanghaiStartMs = Date.UTC(
+      shanghaiNow.getUTCFullYear(),
+      shanghaiNow.getUTCMonth(),
+      shanghaiNow.getUTCDate(),
+    ) - 480 * 60 * 1000
+    const fromMs = shanghaiStartMs
+    const toMs = nowMs
     const fromSec = Math.floor(fromMs / 1000)
     const toSec = Math.floor(toMs / 1000)
 
@@ -851,19 +1641,15 @@ export async function collectInPage(
             // Task #24：从用量端点补充指标
             extractExtraMetrics(udata)
             recordDiag('usage', uUrl, status, isJson ? 'application/json' : '', Math.round(uDt), udata, 'hourly_aggregate 响应')
-            const usage = extractUsage(udata)
-            if (usage && usage.tokens != null) {
-              todayTokens = usage.tokens
-              todayRequests = usage.requests
-              // 今日使用金额：优先顶层货币字段（total_cost/cost/amount…），否则留 null
-              const hc = findNumber(udata, ['total_cost', 'cost', 'total_cost_usd', 'amount', 'spend'])
+            // 方案 029 §5.3：严格区间解析（仅 token_used/count + 上海自然日过滤），不复用宽松 extractUsage
+            const ru = extractRangeUsage(udata, fromMs, toMs)
+            if (ru && ru.tokenSum != null) {
+              todayTokens = ru.tokenSum
+              todayRequests = ru.requestSum
+              // 今日使用金额：仅当响应含明确货币字段时展示，否则留 null（§4.4）
+              const hc = findNumber(udata, ['total_cost', 'cost', 'amount', 'spend'])
               if (hc != null) todayCost = hc
-              modelUsages = [
-                { model: '*', tokens: todayTokens, cost: todayCost ?? 0 },
-                ...(usage.byModel.length
-                  ? usage.byModel.map((m) => ({ model: m.model, tokens: m.tokens, cost: 0 }))
-                  : []),
-              ]
+              modelUsages = [{ model: '*', tokens: todayTokens, cost: todayCost ?? 0 }]
               usageSource = 'hourly_aggregate'
               break
             }
@@ -1490,36 +2276,266 @@ export async function collectInPage(
         usageSource = usageSource ?? 'usage_list'
       }
     }
+
+    // ===== 统计接口 + IKunCode provider 采集（方案 §4/§7）=====
+    // 独立于余额/明细；任一端点失败都不阻断其它，也不覆盖已取得的指标。
+    const statsEps = endpoints.filter((e: any) => {
+      const isSessionRefresh = e.sideEffect === 'session_refresh' || e.path === '/api/user/auth/refresh'
+      const isProvider = e.role === 'usage_stats' || e.role === 'account_snapshot' || e.role === 'range_usage' || e.role === 'billing_config'
+      // 余额主链路已读取到单位时，不重复请求 /api/status；这也避免后置 provider 覆盖已验证结果。
+      if (e.role === 'billing_config' && billingConfig?.quotaPerUnit != null) return false
+      // refresh 会轮换会话并可能改变服务端状态，只能由用户主动同步触发。
+      return isProvider && (manualCollect || !isSessionRefresh)
+    })
+    // billing 配置必须先于账户/区间 provider，确保 quota 使用站点实际单位和汇率转换。
+    const orderedStatsEps = [...statsEps].sort((a: any, b: any) => {
+      const rank = (role: string) => role === 'billing_config' ? 0 : role === 'account_snapshot' ? 1 : role === 'range_usage' ? 2 : 3
+      return rank(a.role) - rank(b.role)
+    })
+    for (const ep of orderedStatsEps) {
+      try {
+        const { status, json, isJson, elapsedMs } = await requestEndpoint(ep)
+        if (ep.role === 'usage_stats') {
+          if (status >= 200 && status < 400 && isJson && json) {
+            const data = unwrapStats(json)
+            if (data) {
+              recordDiag('usage', `${origin}${ep.path}`, status, 'application/json', elapsedMs, data, 'usage_stats 响应')
+              const r = extractDashboardStats(data)
+              if (r) {
+                dsTodayCost = r.todayCost
+                dsCumulativeTokens = r.cumulativeTokens
+                dsCumulativeInputTokens = r.cumulativeInputTokens
+                dsCumulativeOutputTokens = r.cumulativeOutputTokens
+                dsAvgResponseTimeMs = r.avgResponseTimeMs
+                usageStatsSource = 'dashboard_stats'
+                if (r.todayCost != null) usageWindowVal = 'calendar_day'
+              } else {
+                isPartial = true
+              }
+            } else {
+              recordDiag('usage', `${origin}${ep.path}`, status, 'application/json', elapsedMs, null, 'usage_stats 无法 unwrap')
+              isPartial = true
+            }
+          } else {
+            recordDiag('usage', `${origin}${ep.path}`, status || 0, isJson ? 'application/json' : '', elapsedMs, null, `usage_stats HTTP ${status ?? '?'} 或非 JSON`)
+            isPartial = true
+          }
+        } else if (ep.role === 'account_snapshot') {
+          let parsed: any = null
+          if (status >= 200 && status < 400 && isJson && json) {
+            parsed = json
+          }
+          if ((!parsed || !extractAccountSnapshot(parsed)) && refreshSnapshotRaw) parsed = refreshSnapshotRaw
+          // 账户快照优先用 GET 用户接口；缺失必要字段且为受控手动流程时，再尝试 POST refresh（有副作用，方案 §4.6）
+          if ((!parsed || !extractAccountSnapshot(parsed)) && manualCollect && !refreshAttempted) {
+            refreshAttempted = true
+            try {
+              const ref = await requestEndpoint({ ...ep, path: '/api/user/auth/refresh', method: 'POST', bodyTemplate: null })
+              if (ref.status >= 200 && ref.status < 400 && ref.isJson && (hasAuthBundle(ref.json) || extractAccountSnapshot(ref.json))) {
+                parsed = ref.json
+                refreshSnapshotRaw = ref.json
+              }
+            } catch { /* refresh 失败不阻断 */ }
+          }
+          if (parsed) {
+            const snap = extractAccountSnapshot(parsed)
+            if (snap) {
+              if (snap.consumedQuota != null) {
+                const conv = quotaToCurrency(snap.consumedQuota, billingConfig ?? { quotaPerUnit: null, usdExchangeRate: null, customCurrencyExchangeRate: null }, stratCurrency)
+                ikTotalConsumedCost = conv.value
+                if (conv.unitAssumed) unitAssumed = true
+              }
+              ikTotalRequests = snap.lifetimeRequests
+              noteAccountSuccess(ep.path, status)
+              usageStatsSource = usageStatsSource ?? 'account_snapshot'
+            }
+          }
+        } else if (ep.role === 'range_usage') {
+          if (status >= 200 && status < 400 && isJson && json) {
+            const ru = extractRangeUsage(json, fromMs, toMs)
+            if (ru) {
+              ruTodayCost = ru.costSum
+              ruTodayTokens = ru.tokenSum
+              ruTodayRequests = ru.requestSum
+              // 自然日口径：页面已按 Asia/Shanghai 自然日过滤；rolling 24h 由同一接口另一窗口产生，此处不覆盖
+              usageWindowVal = usageWindowVal ?? 'calendar_day'
+            }
+          }
+        } else if (ep.role === 'billing_config') {
+          if (status >= 200 && status < 400 && isJson && json) {
+            const root = isRecord(json) && isRecord((json as any).data) ? (json as any).data : json
+            if (isRecord(root)) {
+              billingConfig = {
+                quotaPerUnit: toFiniteNonNegative(getPath(root, 'quota_per_unit')),
+                usdExchangeRate: toFiniteNonNegative(getPath(root, 'usd_exchange_rate')),
+                customCurrencyExchangeRate: toFiniteNonNegative(getPath(root, 'custom_currency_exchange_rate')),
+              }
+            }
+          }
+        }
+      } catch {
+        isPartial = true
+      }
+    }
   } catch {
     // 用量接口可选，不影响余额采集；但须标记采集失败，避免把「空结果」误当「成功空日」覆盖历史批次（GPT P0-I2）
     usageFailed = true
   }
 
-  // Task #24：若余额端点未拿到累计Token/平均响应，但用量端点拿到了 → 回填（来源标注为 dashboard，因为来自站点权威接口）
-  const finalCumulativeTokens = cumulativeTokens ?? usageCumulativeTokens
-  const finalCumulativeTokensSource = cumulativeTokens != null ? cumulativeTokensSource
-    : usageCumulativeTokens != null ? 'dashboard' as const : null
-  const finalAvgResponseMs = avgResponseTimeMs ?? usageAvgResponseMs
+  // 所有独立 provider 都完成后再判定整轮失败。
+  // 余额接口未命中不应吞掉 Hubway 统计接口已取得的指标。
+  const resolvedAuthEvidence = resolveAuthEvidence()
+  const resolvedAuthState: AuthState = resolvedAuthEvidence?.state ?? 'indeterminate'
+  authExpired = resolvedAuthState === 'unauthorized'
+  const hasAnyMetric =
+    balance != null ||
+    used != null ||
+    totalRequests != null ||
+    accountSnapshot != null ||
+    todayTokens != null ||
+    todayRequests != null ||
+    todayCost != null ||
+    usageCumulativeTokens != null ||
+    dsTodayCost != null ||
+    dsCumulativeTokens != null ||
+    dsCumulativeInputTokens != null ||
+    dsCumulativeOutputTokens != null ||
+    dsAvgResponseTimeMs != null ||
+    ikTotalConsumedCost != null ||
+    ikTotalRequests != null ||
+    ruTodayCost != null ||
+    ruTodayTokens != null ||
+    ruTodayRequests != null ||
+    usageRecords.length > 0
+  if (!hasAnyMetric) {
+    return {
+      ok: false,
+      reason: authExpired
+        ? '登录态失效（权威账户端点明确未授权）'
+        : resolvedAuthEvidence?.reason === 'AUTH_CONTEXT_INCOMPLETE'
+          ? '未取得 DoCode 请求上下文，请保持控制台登录后重新检测'
+          : '未取得任何可用站点指标',
+      authExpired,
+      authState: resolvedAuthState,
+      authEvidence: resolvedAuthEvidence,
+      authContext: pageAuthContext.authContext,
+      cookiePresent,
+      cookieNames,
+      localStorageKeys,
+      sessionStorageKeys,
+      balance: null,
+      used: null,
+      totalQuota: null,
+      totalRequests: null,
+      currency: null,
+      todayTokens: null,
+      todayRequests: null,
+      modelUsages: [],
+      path: matchedPath,
+      rawKeys,
+      cumulativeTokens: null,
+      cumulativeTokensSource: null,
+      apiRoundTripMs,
+      avgResponseTimeMs,
+      todayCost: null,
+      diags,
+      usageRecords,
+      usageRecordsComplete,
+      usageRecordsTruncatedReason,
+      usageCollected,
+      usageFailed,
+      cumulativeInputTokens: null,
+      cumulativeOutputTokens: null,
+      totalConsumedCost: null,
+      recent24hCost: null,
+      recent24hTokens: null,
+      usageWindow: null,
+      todayCostSource: null,
+      usageStatsSource: null,
+    }
+  }
+
+  // Task #24：若余额端点未拿到累计Token/平均响应，但用量端点拿到了 → 回填
+  // 统计接口（dashboard_stats）优先：其 total_tokens 是权威累计值，不得被输入+输出相加或今日 Token 覆盖。
+  const finalCumulativeTokens = dsCumulativeTokens ?? cumulativeTokens ?? usageCumulativeTokens
+  const finalCumulativeTokensSource = dsCumulativeTokens != null ? ('dashboard' as const)
+    : cumulativeTokens != null ? cumulativeTokensSource
+    : usageCumulativeTokens != null ? ('dashboard' as const) : null
+  const finalAvgResponseMs = dsAvgResponseTimeMs ?? avgResponseTimeMs ?? usageAvgResponseMs
+
+  // 今日金额：统计接口 today_actual_cost 优先（dashboard_stats 权威），否则沿用日志口径（方案 §7.3）
+  const rangeTodayCost = ruTodayCost != null
+    ? quotaToCurrency(
+        ruTodayCost,
+        billingConfig ?? { quotaPerUnit: null, usdExchangeRate: null, customCurrencyExchangeRate: null },
+        stratCurrency,
+      ).value
+    : null
+  const finalTodayCost = dsTodayCost ?? rangeTodayCost ?? todayCost
+  const finalTodayCostSource: 'dashboard_stats' | 'range_usage' | 'logs' | null = dsTodayCost != null
+    ? 'dashboard_stats'
+    : rangeTodayCost != null
+      ? 'range_usage'
+      : todayCost != null
+        ? 'logs'
+        : null
+  // 区间用量（IKunCode 自然日）作为今日兜底；累计请求数取账户快照 lifetime
+  const finalTodayTokens = todayTokens ?? ruTodayTokens
+  const finalTodayRequests = todayRequests ?? ruTodayRequests
+  const finalTotalRequests = ikTotalRequests ?? totalRequests
+  // DoCode 等站点的 data.user.quota 与 used_quota 是整数额度，不是美元金额。
+  // 当同轮同时取得嵌套账户快照与 /api/status.quota_per_unit 时，结构化证据已足够，
+  // 不再依赖 family（旧发现结果可能把 DoCode 标成 one-api-compatible 或 unknown）。
+  const inferredAccountSemantics: AccountSemantics | null =
+    accountSnapshot?.balanceQuota != null &&
+    billingConfig?.quotaPerUnit != null &&
+    billingConfig.quotaPerUnit > 0
+      ? 'current_balance_and_historical_consumed'
+      : null
+  // 本轮取得的 quota_per_unit 是比历史发现标签更强的新证据；优先使用它以修正旧版本持久化的分类。
+  const resolvedAccountSemantics = inferredAccountSemantics ?? strategyAccountSemantics
+  const applyContract =
+    resolvedAccountSemantics === 'current_balance_and_historical_consumed' &&
+    accountSnapshot != null &&
+    billingConfig != null
+  const accountBalance = applyContract
+    ? quotaToCurrency(accountSnapshot.balanceQuota, billingConfig!, stratCurrency).value
+    : null
+  const accountConsumed = applyContract
+    ? quotaToCurrency(accountSnapshot.consumedQuota, billingConfig!, stratCurrency).value
+    : null
+  const accountTotalQuota = applyContract && accountSnapshot.balanceQuota != null && accountSnapshot.consumedQuota != null
+    ? quotaToCurrency(accountSnapshot.balanceQuota + accountSnapshot.consumedQuota, billingConfig!, stratCurrency).value
+    : null
+  const accountRequests = applyContract ? accountSnapshot.lifetimeRequests : null
 
   return {
     ok: true,
     reason: '',
     authExpired: false,
+    authState: resolvedAuthState,
+    authEvidence: resolvedAuthEvidence,
+    authContext: pageAuthContext.authContext,
     cookiePresent,
     cookieNames,
     localStorageKeys,
     sessionStorageKeys,
-    balance: balance ?? 0,
-    used: used ?? 0,
-    totalQuota,
-    totalRequests,
+    // 只有已验证的账户语义契约才允许把 quota 按货币单位换算；其余站点仍走原有余额字段，
+    // 防止某个同名 quota 字段在缺少 quota_per_unit 时被猜测性换算。
+    // 对 DoCode，若同轮没取得 quota_per_unit，宁可留空也绝不回退为 quota - used_quota。
+    balance: docodeUnitUnavailable ? null : accountBalance ?? balance,
+    used: docodeUnitUnavailable ? null : accountConsumed ?? used,
+    totalQuota: accountTotalQuota != null
+      ? accountTotalQuota
+      : totalQuota,
+    totalRequests: accountRequests != null ? accountRequests : finalTotalRequests,
     currency: stratCurrency,
-    todayTokens,
-    todayRequests,
+    todayTokens: finalTodayTokens,
+    todayRequests: finalTodayRequests,
     modelUsages,
     path: matchedPath,
     rawKeys,
-    usageSource: usageSource ?? (todayTokens == null ? 'unavailable' : undefined),
+    usageSource: usageSource ?? (finalTodayTokens == null ? 'unavailable' : undefined),
     usageCollected,
     usageFailed,
     usageListDay: targetDay,
@@ -1527,12 +2543,22 @@ export async function collectInPage(
     usageListKind: selectedUsageListKind,
     isPartial: isPartial || undefined,
     collectorVersion: collectorVersion || undefined,
+    accountSemantics: resolvedAccountSemantics,
     cumulativeTokens: finalCumulativeTokens,
     cumulativeTokensSource: finalCumulativeTokensSource,
     apiRoundTripMs,
     avgResponseTimeMs: finalAvgResponseMs,
-    todayCost: todayCost ?? null,
+    todayCost: finalTodayCost ?? null,
     metricsPartial: isPartial || undefined,
+    // 统计接口 + IKunCode provider 字段（方案 §7）
+    cumulativeInputTokens: dsCumulativeInputTokens,
+    cumulativeOutputTokens: dsCumulativeOutputTokens,
+    totalConsumedCost: accountConsumed != null ? accountConsumed : ikTotalConsumedCost,
+    recent24hCost: ruRecent24hCost,
+    recent24hTokens: ruRecent24hTokens,
+    usageWindow: usageWindowVal,
+    todayCostSource: finalTodayCostSource,
+    usageStatsSource,
     diags,
     usageRecords,
     usageRecordsComplete,
@@ -1549,6 +2575,8 @@ export interface SessionProbeResult {
   ok: boolean
   reason: string
   authExpired: boolean
+  authState: AuthState
+  authEvidence: AuthEvidence | null
   cookiePresent: boolean
   cookieNames: string[]
   localStorageKeys: string[]
@@ -1560,6 +2588,7 @@ export interface SessionProbeResult {
 export async function probeSessionInPage(
   origin: string,
   discoveredPath: string | null,
+  allowRefresh = false,
 ): Promise<SessionProbeResult> {
   // —— 以下全部自包含 ——
   const ID_PATHS = ['id', 'user_id', 'userId', 'username', 'email']
@@ -1595,10 +2624,174 @@ export async function probeSessionInPage(
   function isRecord(v: unknown): v is Record<string, unknown> {
     return v != null && typeof v === 'object' && !Array.isArray(v)
   }
+  function isBusinessAuthFailure(raw: unknown): boolean {
+    if (!isRecord(raw)) return false
+    const error = isRecord(raw.error) ? raw.error : null
+    return (
+      raw.success === false ||
+      raw.code === 'AUTH_UNAUTHORIZED' ||
+      raw.code === 'UNAUTHORIZED' ||
+      error?.code === 'AUTH_UNAUTHORIZED' ||
+      error?.code === 'UNAUTHORIZED'
+    )
+  }
+  /**
+   * 明确未授权（方案 027 §3.2）：仅识别显式未授权业务码。
+   * 普通 success:false（功能关闭 / 参数错误 / 不支持的路径）属业务失败，不得据此判定登录失效。
+   * HTTP 401/403 由调用处按状态码单独判定。
+   */
+  function isExplicitUnauthorized(raw: unknown): boolean {
+    if (!isRecord(raw)) return false
+    const error = isRecord(raw.error) ? raw.error : null
+    return (
+      raw.code === 'AUTH_UNAUTHORIZED' ||
+      raw.code === 'UNAUTHORIZED' ||
+      error?.code === 'AUTH_UNAUTHORIZED' ||
+      error?.code === 'UNAUTHORIZED'
+    )
+  }
   function unwrap(raw: unknown): Record<string, unknown> | null {
-    if (!isRecord(raw)) return null
-    if ('data' in raw && isRecord((raw as any).data)) return (raw as any).data as Record<string, unknown>
-    return raw as Record<string, unknown>
+    if (!isRecord(raw) || isBusinessAuthFailure(raw)) return null
+    let value: any = raw
+    for (let depth = 0; depth < 5; depth++) {
+      if (!isRecord(value) || isBusinessAuthFailure(value)) return null
+      let advanced = false
+      for (const key of ['data', 'payload', 'response', 'result']) {
+        if (isRecord((value as any)[key])) {
+          value = (value as any)[key]
+          advanced = true
+          break
+        }
+      }
+      if (!advanced) break
+    }
+    return isRecord(value) ? value : null
+  }
+  function hasAccountSnapshot(raw: unknown): boolean {
+    const root = unwrap(raw)
+    if (!root) return false
+    function findUser(value: any, depth = 0): Record<string, unknown> | null {
+      if (depth > 5 || !isRecord(value)) return null
+      if (isRecord((value as any).user)) return (value as any).user
+      for (const key of ['data', 'payload', 'response', 'result', 'stats', 'summary']) {
+        const found = findUser((value as any)[key], depth + 1)
+        if (found) return found
+      }
+      return null
+    }
+    const nestedUser = findUser(root)
+    const user = nestedUser ?? root
+    const hasIdentity = ['id', 'user_id', 'username', 'email'].some((key) => user[key] !== undefined && user[key] !== null)
+    return hasIdentity && ['quota', 'used_quota', 'request_count'].some((key) => user[key] !== undefined && user[key] !== null)
+  }
+
+  /** IKunCode refresh 的认证成功条件，与账户额度字段解析解耦。 */
+  function hasAuthBundle(raw: unknown): boolean {
+    if (!isRecord(raw) || raw.success !== true || isBusinessAuthFailure(raw)) return false
+    function findBundle(value: any, depth = 0): boolean {
+      if (depth > 6 || !isRecord(value) || isBusinessAuthFailure(value)) return false
+      const tokenOk = typeof value.access_token === 'string' && value.access_token.trim().length > 8
+      const tokenTypeOk = typeof value.token_type === 'string' && value.token_type.trim().length > 0
+      const expiryOk = value.access_expires_at !== undefined && value.access_expires_at !== null
+      const user = isRecord(value.user) ? value.user : null
+      const session = isRecord(value.session) ? value.session : null
+      const userOk = !!user &&
+        user.id !== undefined && user.id !== null &&
+        typeof user.username === 'string' && user.username.trim().length > 0 &&
+        typeof user.role === 'string' && user.role.trim().length > 0
+      const sessionOk = !!session &&
+        typeof session.sid === 'string' && session.sid.trim().length > 0 &&
+        session.current !== undefined && session.current !== null &&
+        typeof session.login_method === 'string' && session.login_method.trim().length > 0 &&
+        typeof session.ip === 'string' && session.ip.trim().length > 0 &&
+        typeof session.user_agent === 'string' && session.user_agent.trim().length > 0 &&
+        session.created_at !== undefined && session.created_at !== null &&
+        session.last_active_at !== undefined && session.last_active_at !== null &&
+        session.expires_at !== undefined && session.expires_at !== null
+      if (tokenOk && tokenTypeOk && expiryOk && userOk && sessionOk) return true
+      for (const nestedKey of ['data', 'payload', 'response', 'result']) {
+        if (findBundle((value as any)[nestedKey], depth + 1)) return true
+      }
+      return false
+    }
+    return findBundle(raw)
+  }
+
+  function buildPageAuthContext() {
+    const headers: Record<string, string> = { Accept: 'application/json', 'Cache-Control': 'no-store' }
+    let user: Record<string, unknown> | null = null
+    try {
+      const raw = localStorage.getItem('user')
+      const parsed = raw ? JSON.parse(raw) : null
+      if (isRecord(parsed)) user = parsed
+    } catch {}
+    const idRaw = user?.id
+    const userId = (typeof idRaw === 'number' && Number.isFinite(idRaw)) ||
+      (typeof idRaw === 'string' && idRaw.trim().length > 0) ? String(idRaw) : null
+    const nestedToken = user?.token
+    let token: string | null = typeof nestedToken === 'string' && nestedToken.trim().length > 8 ? nestedToken.trim() : null
+    if (!token) {
+      try {
+        for (const key of ['token', 'access_token', 'auth_token', 'userToken', 'Authorization', 'auth', 'accessToken', 'id_token']) {
+          const value = localStorage.getItem(key)
+          if (value && value.length > 8) { token = value.trim(); break }
+        }
+      } catch {}
+    }
+    if (token?.startsWith('Bearer ')) token = token.slice(7).trim()
+    let browserId: string | null = null
+    try {
+      const value = localStorage.getItem('docode_browser_id')
+      if (value && value.length >= 16 && value.length <= 128) browserId = value
+      if (!browserId) {
+        const generated = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+        localStorage.setItem('docode_browser_id', generated)
+        browserId = generated
+      }
+    } catch {}
+    if (userId) headers['New-API-User'] = userId
+    if (token) headers.Authorization = 'Bearer ' + token
+    if (browserId) headers['X-Docode-Browser-Id'] = browserId
+    return {
+      headers,
+      token,
+      provider: userId ? ('new_api_user_object' as const) : ('generic_cookie_or_token' as const),
+      contextComplete: !!userId && !!browserId,
+    }
+  }
+
+  /** IKunCode 前端把会话 sid 持久化在 auth.session.sid；只在请求头内存中使用。 */
+  function readAuthSessionSid(): string | null {
+    try {
+      function findSid(value: any, depth = 0): string | null {
+        if (depth > 4 || !isRecord(value)) return null
+        const session = (value as any).session
+        if (isRecord(session) && typeof session.sid === 'string' && session.sid.length > 0) return session.sid
+        for (const key of ['auth', 'state', 'data', 'user', 'store', 'session']) {
+          const nested = findSid((value as any)[key], depth + 1)
+          if (nested) return nested
+        }
+        return null
+      }
+      for (const storage of [localStorage, sessionStorage]) {
+        for (let i = 0; i < storage.length; i++) {
+          const key = storage.key(i) || ''
+          const raw = storage.getItem(key)
+          if (!raw) continue
+          try {
+            const sid = findSid(JSON.parse(raw))
+            if (sid) return sid
+          } catch {
+            /* ignore non-JSON storage values */
+          }
+        }
+      }
+    } catch {
+      /* ignore storage access errors */
+    }
+    return null
   }
 
   const cookiePresent = document.cookie.length > 0
@@ -1609,7 +2802,30 @@ export async function probeSessionInPage(
   const localStorageKeys = Object.keys(localStorage)
   const sessionStorageKeys = Object.keys(sessionStorage)
 
-  let authExpired = false
+  const pageAuthContext = buildPageAuthContext()
+  const authorityPath = discoveredPath || '/api/user/self'
+  let authEvidence: AuthEvidence | null = null
+  const recordAuth = (
+    state: AuthState,
+    reason: AuthEvidence['reason'],
+    endpointRole: AuthEvidence['endpointRole'],
+    path: string | null,
+    status: number | null,
+  ) => {
+    const next: AuthEvidence = {
+      state,
+      reason,
+      endpointRole,
+      path,
+      httpStatus: status,
+      provider: pageAuthContext.provider,
+      contextComplete: pageAuthContext.contextComplete,
+      observedAt: Date.now(),
+    }
+    // 成功的权威账户证据不允许被后续候选失败覆盖。
+    if (authEvidence?.reason === 'ACCOUNT_AUTHENTICATED' && authEvidence.endpointRole === 'account_authority') return
+    authEvidence = next
+  }
   let matchedPath: string | null = null
   let lastStatus: number | null = null
 
@@ -1618,43 +2834,45 @@ export async function probeSessionInPage(
     try {
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), 6000)
-      // 携带 localStorage 中的 token 作为 Bearer 头（不读取/回传 token 值，红线 P0-2）
-      const headers: Record<string, string> = { Accept: 'application/json' }
-      try {
-        const lsToken = (function () {
+      const headers: Record<string, string> = { ...pageAuthContext.headers }
+      const fetchOnce = async (requestHeaders: Record<string, string>) => {
+        const res = await fetch(url, { credentials: 'include', headers: requestHeaders, signal: controller.signal })
+        const ct = res.headers.get('content-type') || ''
+        let json: any = null
+        if (ct.includes('json')) {
           try {
-            const ks = ['token', 'access_token', 'auth_token', 'userToken', 'Authorization', 'auth', 'accessToken', 'id_token']
-            for (const k of ks) {
-              const v = localStorage.getItem(k)
-              if (v && v.length > 8) return v.startsWith('Bearer ') ? v.slice(7) : v
-            }
-            for (let i = 0; i < localStorage.length; i++) {
-              const k = localStorage.key(i)
-              const v = k ? localStorage.getItem(k) : null
-              if (v && v.startsWith('eyJ')) return v
-            }
-          } catch {}
-          return null
-        })()
-        if (lsToken) headers['Authorization'] = 'Bearer ' + lsToken
-      } catch {}
-      const res = await fetch(url, {
-        credentials: 'include',
-        headers,
-        signal: controller.signal,
-      })
+            json = JSON.parse(await res.text())
+          } catch {
+            json = null
+          }
+        }
+        return { res, ct, json }
+      }
+      let { res, ct, json } = await fetchOnce(headers)
+      if (pageAuthContext.token && pageAuthContext.provider !== 'new_api_user_object' &&
+        (res.status === 401 || res.status === 403 || isBusinessAuthFailure(json))) {
+        ;({ res, ct, json } = await fetchOnce({ Accept: 'application/json' }))
+      }
       clearTimeout(timer)
       lastStatus = res.status
-      if (res.status === 401 || res.status === 403) {
-        authExpired = true
+      if (res.status === 401 || res.status === 403 || isExplicitUnauthorized(json)) {
+        if (path === authorityPath || path === '/api/user/self') {
+          if (pageAuthContext.contextComplete) recordAuth('unauthorized', 'ACCOUNT_UNAUTHORIZED', 'account_authority', path, res.status)
+          else recordAuth('indeterminate', 'AUTH_CONTEXT_INCOMPLETE', 'account_authority', path, res.status)
+        } else {
+          recordAuth('indeterminate', 'CANDIDATE_REJECTED', 'candidate', path, res.status)
+        }
         continue
       }
-      const ct = res.headers.get('content-type') || ''
-      if (!res.ok || !ct.includes('json')) continue
-      const json = JSON.parse(await res.text())
+      if (!res.ok || !ct.includes('json') || !json) continue
       const data = unwrap(json)
-      if (data && ID_PATHS.some((p) => getPath(data, p) != null)) {
+      if (data && (ID_PATHS.some((p) => getPath(data, p) != null) || hasAccountSnapshot(json) || hasAuthBundle(json))) {
         matchedPath = path
+        if (path === authorityPath || path === '/api/user/self') {
+          recordAuth('authenticated', 'ACCOUNT_AUTHENTICATED', 'account_authority', path, res.status)
+        } else {
+          recordAuth('authenticated', 'ACCOUNT_AUTHENTICATED', 'candidate', path, res.status)
+        }
         break
       }
     } catch {
@@ -1662,9 +2880,76 @@ export async function probeSessionInPage(
     }
   }
 
-  if (matchedPath) {
-    return { ok: true, reason: 'ok', authExpired: false, cookiePresent, cookieNames, localStorageKeys, sessionStorageKeys, status: lastStatus, path: matchedPath }
+  // IKunCode 的 refresh 是唯一稳定返回 data.user 账户快照的接口；只在
+  // 用户显式点击测试/授权时调用，不能纳入普通定时采集。
+  if (!matchedPath && allowRefresh) {
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 6000)
+      // 与 IKunCode 前端一致：refresh 是无 body 的 POST，不发送 JSON Content-Type。
+      const headers: Record<string, string> = { ...pageAuthContext.headers }
+      const sessionSid = readAuthSessionSid()
+      if (sessionSid) headers['X-Auth-Session'] = sessionSid
+      const tokenHeaders = { ...headers }
+      const fetchRefresh = async (requestHeaders: Record<string, string>) => {
+        const response = await fetch(origin + '/api/user/auth/refresh', {
+          credentials: 'include',
+          method: 'POST',
+          headers: requestHeaders,
+          signal: controller.signal,
+        })
+        const contentType = response.headers.get('content-type') || ''
+        let json: any = null
+        if (contentType.includes('json')) {
+          try {
+            json = JSON.parse(await response.text())
+          } catch {
+            json = null
+          }
+        }
+        return { response, contentType, json }
+      }
+      let refreshed = await fetchRefresh(headers)
+      if (
+        (refreshed.response.status === 401 || refreshed.response.status === 403 || isBusinessAuthFailure(refreshed.json)) &&
+        tokenHeaders.Authorization && pageAuthContext.provider !== 'new_api_user_object'
+      ) {
+        refreshed = await fetchRefresh(tokenHeaders)
+      }
+      clearTimeout(timer)
+      lastStatus = refreshed.response.status
+      if (refreshed.response.status >= 200 && refreshed.response.status < 400 && refreshed.contentType.includes('json')) {
+        if (hasAuthBundle(refreshed.json) || hasAccountSnapshot(refreshed.json)) {
+          matchedPath = '/api/user/auth/refresh'
+          recordAuth('authenticated', 'ACCOUNT_AUTHENTICATED', 'refresh', '/api/user/auth/refresh', refreshed.response.status)
+        }
+      } else if (refreshed.response.status === 401 || refreshed.response.status === 403) {
+        recordAuth('indeterminate', 'CANDIDATE_REJECTED', 'refresh', '/api/user/auth/refresh', refreshed.response.status)
+      }
+    } catch {
+      // 保持原始探测结果，网络失败不是明确的授权失败。
+    }
   }
+
+  if (matchedPath) {
+    const stableAuthEvidence = authEvidence as AuthEvidence | null
+    return {
+      ok: true,
+      reason: 'ok',
+      authExpired: false,
+      authState: stableAuthEvidence?.state ?? 'authenticated',
+      authEvidence: stableAuthEvidence,
+      cookiePresent,
+      cookieNames,
+      localStorageKeys,
+      sessionStorageKeys,
+      status: lastStatus,
+      path: matchedPath,
+    }
+  }
+  const stableAuthEvidence = authEvidence as AuthEvidence | null
+  const finalAuthState: AuthState = stableAuthEvidence?.state ?? 'indeterminate'
+  const authExpired = finalAuthState === 'unauthorized'
   return {
     ok: false,
     reason: authExpired
@@ -1673,6 +2958,8 @@ export async function probeSessionInPage(
         ? '未找到用户信息接口（标准路径均 404，可能部署了自定义 API 前缀，请用「网络发现」）'
         : '页面无 Cookie，请确认已在浏览器中登录该站点',
     authExpired,
+    authState: finalAuthState,
+    authEvidence: stableAuthEvidence,
     cookiePresent,
     cookieNames,
     localStorageKeys,

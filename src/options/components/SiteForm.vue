@@ -28,6 +28,11 @@ const form = ref({ name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', curren
 const formError = ref('')
 const submitting = ref(false)
 
+// 方案 029 §6：编辑态站点若曾因「面板域与已登录控制台域不一致」失败，给出明确诊断（不依赖原始错误文案）。
+const showPanelMismatch = computed(
+  () => isEdit.value && props.site?.lastFailureReason === 'PANEL_ORIGIN_SESSION_MISMATCH',
+)
+
 watch(
   () => props.visible,
   (v) => {
@@ -138,6 +143,11 @@ function handleSubmit() {
       <div class="f">
         <label>面板地址</label>
         <input v-model="form.baseUrl" placeholder="https://example.com" @keyup.enter="handleSubmit" />
+        <div class="f-hint">请填写你实际登录的控制台地址（如 https://docode.cc/console），不要填单独的 API Base URL（如 https://api.docode.cc）。两者域名不同会导致找不到已登录会话，并触发「面板域与控制台不一致」诊断。</div>
+      </div>
+
+      <div v-if="showPanelMismatch" class="form-err">
+        ⚠️ 该站点上次采集因「面板地址与已登录控制台域不一致」失败：请核对面板地址是否为你实际登录的控制台（含正确子域，如 <b>/console</b>），而非 API Base URL。修改后保存即可清除该诊断。
       </div>
       <div class="f">
         <label>适配器类型</label>
@@ -220,6 +230,12 @@ function handleSubmit() {
 .f select:focus {
   outline: none;
   border-color: var(--brand);
+}
+.f-hint {
+  margin-top: 5px;
+  font-size: 10px;
+  color: var(--sub);
+  line-height: 1.6;
 }
 .steps {
   background: var(--panel-soft);

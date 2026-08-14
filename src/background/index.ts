@@ -3,7 +3,7 @@
 // 确保采集 alarm、注册消息路由。无长驻状态（MV3）。
 import { ensureSchedulers, setupScheduler } from './scheduler'
 import { registerMessageRouter } from './router'
-import { getLabCorsUnblock, db } from '../storage'
+import { getLabCorsUnblock, db, runAuthStateMigration } from '../storage'
 import { applyCorsRules } from './corsRules'
 import { applyIconBehavior } from './popupBehavior'
 
@@ -11,7 +11,9 @@ console.log('[AI Relay] Service Worker started')
 
 // 预打开 IndexedDB（含一次性迁移）：避免在首条消息的异步 handler 内才懒打开，
 // 降低 MV3 SW 在「打开+迁移」期间被休眠、导致 handler 挂死/客户端超时的概率。
-void db.open().catch((e) => console.warn('[AI Relay] DB 预打开失败', e))
+void db.open()
+  .then(() => runAuthStateMigration())
+  .catch((e) => console.warn('[AI Relay] DB 预打开/授权状态迁移失败', e))
 
 chrome.runtime.onInstalled.addListener(() => {
   // 确保采集 + 清理 alarm 存在且周期与设置一致

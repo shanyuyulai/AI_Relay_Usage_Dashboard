@@ -10,6 +10,7 @@ export const credentialRepo = {
       siteId,
       method: 'cookie',
       authorized,
+      authState: authorized ? 'authenticated' : 'unknown',
       updatedAt: Date.now(),
     }
     await db.credentials.put(row)

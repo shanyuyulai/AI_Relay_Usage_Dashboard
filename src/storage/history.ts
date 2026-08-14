@@ -34,6 +34,29 @@ export const snapshotRepo = {
     const rows = await db.snapshots.orderBy('takenAt').toArray()
     return rows.reverse()
   },
+
+  /** 按自增主键删除一条快照；返回实际删除条数。 */
+  async deleteById(id: number): Promise<number> {
+    const row = await db.snapshots.get(id)
+    if (!row) return 0
+    await db.snapshots.delete(id)
+    return 1
+  },
+
+  /** 按用户明确选择的自增主键批量删除快照；不触碰其他业务表。 */
+  async deleteByIds(ids: number[]): Promise<number> {
+    const uniqueIds = [...new Set(ids.filter((id) => Number.isSafeInteger(id) && id > 0))]
+    if (uniqueIds.length === 0) return 0
+
+    return db.transaction('rw', db.snapshots, async () => {
+      const rows = await db.snapshots.bulkGet(uniqueIds)
+      const existingIds = rows
+        .filter((row): row is Snapshot & { id: number } => typeof row?.id === 'number')
+        .map((row) => row.id)
+      if (existingIds.length > 0) await db.snapshots.bulkDelete(existingIds)
+      return existingIds.length
+    })
+  },
 }
 
 // 按日聚合仓储：仅来自精确 usage 日志（P0-3，禁余额差分）；保留策略见 retention.purgeOlderThan

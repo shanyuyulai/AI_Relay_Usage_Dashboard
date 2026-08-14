@@ -28,6 +28,18 @@ export function fmtTokens(val: number | null): string {
   return (val / 1_000_000).toFixed(2) + 'M'
 }
 
+/**
+ * 紧凑 Token 格式化（统计接口口径，方案 §9.3）：1 位小数 K/M。
+ * 40456074 -> 40.5M；5756413 -> 5.8M；263181 -> 263.2K；0..999 -> 原整数。
+ * null -> 「—」。
+ */
+export function fmtCompactTokens(val: number | null): string {
+  if (val == null) return '—'
+  if (val < 1000) return String(val)
+  if (val < 1_000_000) return (val / 1000).toFixed(1) + 'K'
+  return (val / 1_000_000).toFixed(1) + 'M'
+}
+
 /** 整数千分位格式化：null → 「—」。 */
 export function fmtNum(val: number | null): string {
   if (val == null) return '—'

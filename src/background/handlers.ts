@@ -21,6 +21,7 @@ import {
   setClickBehavior,
   usageRecordsRepo,
   usageCache,
+  authStateRepo,
   exportAll,
   importAll,
 } from '../storage'
@@ -43,6 +44,8 @@ import type {
   DeleteSitePayload,
   SiteIdPayload,
   CollectNowPayload,
+  ReorderSitesPayload,
+  ReorderSitesResponse,
   CaptureCustomPayload,
   GetCapturesPayload,
   ClearCapturesPayload,
@@ -74,12 +77,19 @@ import type {
   GetUsageFilterOptionsResponse,
   GetSiteDataPayload,
   GetSiteDataResponse,
+  DeleteSnapshotPayload,
+  DeleteSnapshotsPayload,
+  DeleteSnapshotsResponse,
   ResetSiteDataPayload,
   ResetAllDataPayload,
   ResetDataResponse,
+  GetSiteCollectionProfilesPayload,
+  GetSiteCollectionProfilesResponse,
 } from '../core/messaging/protocol'
 import type { Req } from '../core/messaging/protocol'
-import type { SiteConfig } from '../shared/types'
+import type { SiteConfig, SiteCollectionProfile, AccountSemantics } from '../shared/types'
+import { buildSiteCollectionProfile } from '../core/collectionProfile'
+import { authReasonToFailure } from '../core/authState'
 import { probeSiteEndpoints, type ProbeResult } from '../content/probe'
 import { classifySite, type SiteFingerprint, type EndpointSignal } from '../core/classifySite'
 import { discoverNetworkRequests, type NetDiscoveryRequest } from './netDiscovery'
@@ -113,17 +123,39 @@ function waitForTabLoad(tabId: number): Promise<void> {
  * 用「页面主世界会话探测」确认登录态并持久化授权标记（M1 仅 Cookie 会话，不存任何私密）。
  * 必须在已登录的站点标签页中执行——SW 读不到 Cookie，detectSession 在 SW 里必失败（带空 Cookie）。
  */
-async function authorizeCookie(siteId: string): Promise<'ok' | 'expired'> {
+async function authorizeCookie(siteId: string): Promise<'ok' | 'expired' | 'indeterminate'> {
   const site = await siteRepo.get(siteId)
-  if (!site) return 'expired'
+  if (!site) return 'indeterminate'
   try {
     const r = await probeSessionInTab(site)
-    const ok = r.ok
-    await credentialRepo.setAuthorized(siteId, ok)
-    return ok ? 'ok' : 'expired'
-  } catch {
-    await credentialRepo.setAuthorized(siteId, false)
-    return 'expired'
+    const evidence = r.authEvidence ?? undefined
+    if (r.authState === 'authenticated') {
+      await authStateRepo.apply(siteId, { state: 'authenticated', evidence })
+      return 'ok'
+    }
+    if (r.authState === 'unauthorized') {
+      await authStateRepo.apply(siteId, {
+        state: 'unauthorized',
+        evidence,
+        failureReason: evidence ? authReasonToFailure(evidence.reason) : 'ACCOUNT_UNAUTHORIZED',
+        error: r.reason,
+      })
+      return 'expired'
+    }
+    await authStateRepo.apply(siteId, {
+      state: 'indeterminate',
+      evidence,
+      failureReason: evidence ? authReasonToFailure(evidence.reason) : 'ENDPOINT_UNAVAILABLE',
+      error: r.reason,
+    })
+    return 'indeterminate'
+  } catch (e) {
+    await authStateRepo.apply(siteId, {
+      state: 'indeterminate',
+      failureReason: 'SCRIPT_INJECTION_FAILED',
+      error: e instanceof Error ? e.message : String(e),
+    })
+    return 'indeterminate'
   }
 }
 
@@ -206,8 +238,8 @@ export const handlers: Record<string, Handler> = {
   async COLLECT_NOW(payload: CollectNowPayload) {
     const results: CollectResultMsg[] = (
       payload?.siteIds?.length
-        ? await collectSpecificInTabs(payload.siteIds, true, false)
-        : await collectAllInTabs(true, false)
+        ? await collectSpecificInTabs(payload.siteIds, true, false, true)
+        : await collectAllInTabs(true, false, true)
     ).map((r) => ({
       siteId: r.siteId,
       ok: r.ok,
@@ -264,6 +296,28 @@ export const handlers: Record<string, Handler> = {
   // 站点列表（Options）
   async GET_SITES() {
     return siteRepo.list()
+  },
+
+  /**
+   * 站点类型与采集方案可视化（方案 028）：返回所有站点的只读展示模型。
+   * 不持久化第二份策略；数据量与站点数线性相关，仅读取每站最近一条脱敏诊断。
+   * 单独失败时不影响 GET_SITES，调用方降级显示「方案暂不可用」。
+   */
+  async GET_SITE_COLLECTION_PROFILES(): Promise<GetSiteCollectionProfilesResponse> {
+    const labEnabled = await getLabZeroTab()
+    const engine: 'page_main_world' | 'sw_lab' = labEnabled ? 'sw_lab' : 'page_main_world'
+    const sites = await siteRepo.list()
+    const profiles: Record<string, SiteCollectionProfile> = {}
+    for (const site of sites) {
+      let latestDiag: any = null
+      try {
+        latestDiag = (await diagnosticsRepo.listBySite(site.id, 1))[0] ?? null
+      } catch {
+        latestDiag = null
+      }
+      profiles[site.id] = buildSiteCollectionProfile(site, engine, latestDiag)
+    }
+    return { profiles }
   },
 
   // 新增站点：权限由 UI 侧（用户手势）申请，SW 仅校验是否已授予（P0-5 逐站授权）
@@ -338,6 +392,30 @@ export const handlers: Record<string, Handler> = {
     return { permissionsRevoked: !stillUsed }
   },
 
+  // 手动排序（设置页拖拽手柄 / ▲▼ 按钮）。完整集合重排 + 运行时校验（GPT P0-1/P0-2 修正）。
+  async REORDER_SITES(payload: ReorderSitesPayload): Promise<ReorderSitesResponse> {
+    // 载荷形态校验（MV3 编译后无 TS 类型，必须运行时校验）
+    const input = Array.isArray(payload?.orderedIds) ? payload.orderedIds : null
+    if (!input) return { ok: false, code: 'INVALID_SITE_ORDER' }
+    for (const id of input) {
+      if (typeof id !== 'string' || id.length === 0) return { ok: false, code: 'INVALID_SITE_ORDER' }
+    }
+    if (new Set(input).size !== input.length) return { ok: false, code: 'INVALID_SITE_ORDER' }
+    // 与 DB 现有集合一致性校验（禁止部分重排）
+    const all = await siteRepo.list()
+    const dbIds = new Set(all.map((s) => s.id))
+    if (dbIds.size !== input.length) return { ok: false, code: 'INVALID_SITE_ORDER' }
+    for (const id of input) {
+      if (!dbIds.has(id)) return { ok: false, code: 'INVALID_SITE_ORDER' }
+    }
+    // 事务写入（事务内还会再校验一次，确保并发安全）；仅更新 order，不动其他字段
+    const res = await siteRepo.reorder(input)
+    if (!res.ok) return res
+    // 事务提交后再广播（P1-5：侧边栏/弹窗监听 SITES_CHANGED 并重取）；广播失败不误判 DB 写入
+    broadcastSitesChanged()
+    return { ok: true }
+  },
+
   // 连通性自检 / 授权（M1 仅 Cookie 会话）
   async TEST_SITE(payload: SiteIdPayload) {
     const status = await authorizeCookie(payload.id)
@@ -380,8 +458,9 @@ export const handlers: Record<string, Handler> = {
     const result = (frameResult?.result as ProbeResult | undefined) ?? null
     if (!result) throw new Error('探测脚本未返回结果')
 
-    // 若命中真实接口，持久化到站点配置供后续采集使用。
-    if (result.match) {
+    // 有余额命中时保存完整分类；即使余额命中条件不完整，也保存已探测到的 provider 路径。
+    // 这样后续采集不会因为一次发现漏掉标准统计接口。
+    if (result.match || result.attempts.length > 0) {
       // 从探测尝试中构建脱敏指纹（P0-4：仅类型/结构��息，不含 JSON 原文）
       const signals: EndpointSignal[] = result.attempts.map((a) => {
         const hasDataArray = a.hasDataArray ?? false
@@ -394,6 +473,8 @@ export const handlers: Record<string, Handler> = {
         else if (a.url.includes('/api/user/dashboard')) pathKey = 'dashboard'
         else if (a.url.includes('/api/log/self')) pathKey = 'logSelf'
         else if (a.url.includes('/api/data/self')) pathKey = 'dataSelf'
+        // 统计接口（Hubway 类 usage/dashboard/stats）：必须排在 /api/v1/usage 之前，否则会被误判为 usageV1 列表端点（方案 §3.1）
+        else if (a.url.includes('/usage/dashboard/stats')) pathKey = 'usageDashboardStats'
         else if (a.url.includes('/api/v1/usage')) pathKey = 'usageV1'
         else if (a.url.includes('/api/usage')) pathKey = 'usageList'
         else pathKey = new URL(a.url).pathname.replace(/\//g, '_').replace(/^_/, '')
@@ -405,11 +486,12 @@ export const handlers: Record<string, Handler> = {
           hasDataArray,
           hasHourlyStructure,
           hasSuccessWrapper: a.hasWrapper,
-          successValue: null,
-           hasDataObject: a.hasDataArray || a.topKeys.includes('data') || a.topKeys.some((k) => a.dataFieldTypes?.[k] === 'object'),
+          successValue: a.successValue ?? null,
+          hasDataObject: a.hasDataArray || a.topKeys.includes('data') || a.topKeys.some((k) => a.dataFieldTypes?.[k] === 'object'),
           dataFieldTypes: a.dataFieldTypes ?? {},
           dataFieldNames: a.dataFieldNames ?? [],
           hasUserId: a.hasUserId ?? false,
+          hasAccountSnapshot: a.hasAccountSnapshot ?? false,
         }
       })
 
@@ -420,9 +502,9 @@ export const handlers: Record<string, Handler> = {
 
       const fp: SiteFingerprint = {
         signals,
-        bestPathKey: result.match.path === '/api/user/self' ? 'userSelf'
-          : result.match.path === '/api/v1/auth/me' ? 'authMe'
-          : result.match.path.startsWith('/api/v1') ? 'userSelfV1'
+        bestPathKey: result.match?.path === '/api/user/self' ? 'userSelf'
+          : result.match?.path === '/api/v1/auth/me' ? 'authMe'
+          : result.match?.path?.startsWith('/api/v1') ? 'userSelfV1'
           : 'unknown',
         hasLocalStorageToken: hasToken,
       }
@@ -434,17 +516,85 @@ export const handlers: Record<string, Handler> = {
       })
       const usageListPath = usageListAttempt ? new URL(usageListAttempt.url).pathname : null
 
+      // 统计接口（Hubway 类 usage/dashboard/stats）实际 pathname（去 query）：命中才持久化（方案 §3.1/§6）
+      const statsFields = new Set([
+        'today_actual_cost',
+        'total_tokens',
+        'total_input_tokens',
+        'total_output_tokens',
+        'average_duration_ms',
+      ])
+      const statsAttempt = result.attempts.find((a) => {
+        try {
+          return new URL(a.url).pathname.includes('/usage/dashboard/stats') &&
+            a.status >= 200 &&
+            a.status < 300 &&
+            a.contentType.includes('json') &&
+            a.successValue !== false &&
+            (a.dataFieldNames ?? []).some((name) => statsFields.has(name))
+        } catch {
+          return false
+        }
+      })
+      // IKunCode 类区间用量端点（/api/data/self）实际 pathname
+      const dataSelfAttempt = result.attempts.find((a) => {
+        try {
+          const p = new URL(a.url).pathname
+          return (p === '/api/data/self' || p === '/api/v1/data/self') &&
+            a.status >= 200 &&
+            a.status < 300 &&
+            a.contentType.includes('json') &&
+            a.successValue !== false
+        } catch {
+          return false
+        }
+      })
+      // IKunCode 类计价配置端点（/api/status 或 /api/billing/config）实际 pathname
+      const billingAttempt = result.attempts.find((a) => {
+        try {
+          const p = new URL(a.url).pathname
+          return (p === '/api/status' || p === '/api/billing/config' || p === '/api/v1/billing/config') &&
+            a.status >= 200 &&
+            a.status < 300 &&
+            a.contentType.includes('json') &&
+            a.successValue !== false
+        } catch {
+          return false
+        }
+      })
+
+      const discoveredUserPath = result.match?.path ?? site.discovered?.userSelfPath ?? '/api/user/self'
+
+      // 账户快照语义契约：data.user.{quota,used_quota,request_count} 是明确的嵌套账户结构。
+      // 该结构优先于 family 标签；DoCode 会因页面版本差异被分类为 one-api-compatible，
+      // 但 quota 仍是当前余额，不能继续走“总额度 - 已用额度”的通用公式。
+      const detectedSemantics: AccountSemantics | null = signals.some(
+        (s) => s.hasAccountSnapshot && s.successValue === true,
+      )
+        ? 'current_balance_and_historical_consumed'
+        : (site.discovered?.accountSemantics ?? null)
+
       await siteRepo.update(site.id, {
         discovered: {
-          userSelfPath: result.match.path,
-          userSelfUrl: result.match.url,
+          ...(site.discovered ?? {}),
+          userSelfPath: discoveredUserPath,
+          userSelfUrl: result.match?.url ?? site.discovered?.userSelfUrl,
           probedAt: Date.now(),
           family: classification.family,
           routeProfile: classification.routeProfile,
           capabilities: classification.capabilities,
           confidence: classification.confidence,
-          usageListKind: classification.usageListKind ?? null,
-          usageListPath,
+          // 探测不一定覆盖用量列表；失败时保留上一次已经验证的路径/类型。
+          usageListKind: classification.usageListKind ?? site.discovered?.usageListKind ?? null,
+          usageListPath: usageListPath ?? site.discovered?.usageListPath ?? null,
+          // 统计接口：仅命中才写入；账户快照复用 userSelfPath（buildStrategy 兜底），此处留 null
+          usageStatsPath: statsAttempt ? new URL(statsAttempt.url).pathname : (site.discovered?.usageStatsPath ?? null),
+          usageStatsKind: statsAttempt ? 'hubway_dashboard_stats' : (site.discovered?.usageStatsKind ?? null),
+          accountSnapshotPath: site.discovered?.accountSnapshotPath ?? null,
+          rangeUsagePath: dataSelfAttempt ? new URL(dataSelfAttempt.url).pathname : (site.discovered?.rangeUsagePath ?? null),
+          billingConfigPath: billingAttempt ? new URL(billingAttempt.url).pathname : (site.discovered?.billingConfigPath ?? null),
+          accountSemantics: detectedSemantics ?? undefined,
+          accountContractVersion: detectedSemantics ? 5 : site.discovered?.accountContractVersion,
         },
       })
     }
@@ -761,6 +911,21 @@ export const handlers: Record<string, Handler> = {
       },
     }
     return data
+  },
+
+  /** 删除单条余额历史快照；不影响站点、凭证、用量或诊断记录。 */
+  async DELETE_SNAPSHOT(payload: DeleteSnapshotPayload): Promise<DeleteSnapshotsResponse> {
+    const id = payload?.id
+    if (!Number.isSafeInteger(id) || id <= 0) throw new Error('快照标识无效')
+    return { deleted: await snapshotRepo.deleteById(id) }
+  },
+
+  /** 删除用户明确选中的余额历史快照；仅按快照 ID 删除。 */
+  async DELETE_SNAPSHOTS(payload: DeleteSnapshotsPayload): Promise<DeleteSnapshotsResponse> {
+    const ids = Array.isArray(payload?.ids) ? payload.ids : []
+    if (ids.length === 0) return { deleted: 0 }
+    if (ids.some((id) => !Number.isSafeInteger(id) || id <= 0)) throw new Error('包含无效的快照标识')
+    return { deleted: await snapshotRepo.deleteByIds(ids) }
   },
 
   /**

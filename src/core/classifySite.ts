@@ -9,13 +9,30 @@
 
 // ---- 类型定义 ----
 
+import type { AccountSemantics, SiteConfig } from '../shared/types'
+
 export type Family = 'one-api-compatible' | 'new-api-capable' | 'independent' | 'unknown'
 export type RouteProfile = 'standard' | 'fork-path' | 'discovered'
-export type Capability = 'balance' | 'usageLogs' | 'hourlyUsage' | 'requestCount' | 'tokenSource' | 'usageList'
+export type Capability =
+  | 'balance'
+  | 'usageLogs'
+  | 'hourlyUsage'
+  | 'requestCount'
+  | 'tokenSource'
+  | 'usageList'
+  | 'usageDashboardStats'
 export type Confidence = 'high' | 'medium' | 'low'
 export type UsageSource = 'hourly_aggregate' | 'raw_logs' | 'unavailable'
+/** 统计接口适配器种类（Hubway 类 /api/v1/usage/dashboard/stats）。 */
+export type UsageStatsKind = 'hubway_dashboard_stats'
 /** 当日用量明细列表适配器种类（P0：适配器隔离，禁把 hubway 约定泛化到所有站点） */
 export type UsageListKind = 'hubway_v1' | 'generic'
+/** 指标 Provider 标识（按响应结构指纹/路径绑定，而非按域名绑定）。 */
+export type ProviderId =
+  | 'hubway_dashboard_stats'
+  | 'ikuncode_account_snapshot'
+  | 'ikuncode_range_usage'
+  | 'ikuncode_billing_config'
 
 export interface SiteClassification {
   family: Family
@@ -26,11 +43,18 @@ export interface SiteClassification {
   /** 当日用量明细适配器种类；仅当 capabilities 含 'usageList' 时非 null */
   usageListKind?: UsageListKind | null
   usageListPath?: string | null
+  /** 统计接口（usage/dashboard/stats）已发现 pathname（不含 query）。 */
+  usageStatsPath?: string | null
+  usageStatsKind?: UsageStatsKind | null
+  /** IKunCode 类组合 provider 已发现 pathname（不含 query）。 */
+  accountSnapshotPath?: string | null
+  rangeUsagePath?: string | null
+  billingConfigPath?: string | null
 }
 
 export interface EndpointActivation {
-  role: 'balance' | 'usage' | 'usage_list'
-  /** 可选端点 ID（如 'userSelf'、'logSelf'、'dataSelf'、'usageV1'） */
+  role: 'balance' | 'usage' | 'usage_list' | 'usage_stats' | 'account_snapshot' | 'range_usage' | 'billing_config'
+  /** 可选端点 ID（如 'userSelf'、'logSelf'、'dataSelf'、'usageV1'、'usageDashboardStats'） */
   endpointId: string
   /** 实际请求路径（相对于 origin） */
   path: string
@@ -40,6 +64,26 @@ export interface EndpointActivation {
   needsToken?: boolean
   /** 仅 usage_list 角色：适配器种类，决定请求参数构造方式 */
   usageListKind?: UsageListKind
+  /** 请求方法（默认 GET）。POST 用于有副作用的会话刷新（如 IKunCode refresh）。 */
+  method?: 'GET' | 'POST'
+  /** 查询参数模板（通过 URL API 写入，不拼接未编码字符串） */
+  queryTemplate?: Record<string, string | number>
+  /** JSON 请求体模板（仅 POST 等允许 body 的方法） */
+  bodyTemplate?: Record<string, unknown> | null
+  /** 指标时间窗口：point/calendar_day/rolling_24h/range/lifetime */
+  usageWindow?: 'point' | 'calendar_day' | 'rolling_24h' | 'range' | 'lifetime'
+  /** 是否会改变会话状态：session_refresh 不能作为普通自动轮询端点 */
+  sideEffect?: 'none' | 'session_refresh'
+  /** 是否允许定时采集（false=不能进入普通定时任务，仅受控手动流程触发） */
+  safeToAutoPoll?: boolean
+  /** 同源端点调用冷却（ms），用于有副作用/高成本端点 */
+  cooldownMs?: number
+  /** 统计接口适配器种类 */
+  usageStatsKind?: UsageStatsKind
+  /** 关联 Provider 标识 */
+  providerId?: ProviderId
+  /** 只有权威账户端点可裁决登录失效；普通候选/用量接口没有该权限。 */
+  authRole?: 'authority' | 'candidate' | 'none'
 }
 
 export interface CollectStrategy {
@@ -48,6 +92,8 @@ export interface CollectStrategy {
   confidence: Confidence
   currency?: string
   collectorVersion: number
+  /** 账户快照语义契约（方案 027 §3.1）；由 discovered 透传，驱动 collectInPage 的字段口径。 */
+  accountSemantics?: AccountSemantics
 }
 
 /**
@@ -76,6 +122,8 @@ export interface EndpointSignal {
   dataFieldNames: string[]
   /** 是否有用户标识字段（id/user_id/username/email 任一） */
   hasUserId: boolean
+  /** 是否命中 data.user.{quota,used_quota,request_count} 账户结构 */
+  hasAccountSnapshot?: boolean
 }
 
 export interface SiteFingerprint {
@@ -89,7 +137,7 @@ export interface SiteFingerprint {
 
 // ---- 分类逻辑 ----
 
-const COLLECTOR_VERSION = 1
+const COLLECTOR_VERSION = 6
 
 /**
  * 从脱敏指纹判定站点分类。
@@ -118,7 +166,7 @@ export function classifySite(fp: SiteFingerprint): SiteClassification {
     if (types['quota'] === 'number') {
       // One-API 家族：有 {success,data} + quota 为数值
       family = types['request_count'] === 'number' ? 'new-api-capable' : 'one-api-compatible'
-    } else if (types['balance'] !== undefined && best.hasUserId) {
+    } else if ((types['balance'] !== undefined && best.hasUserId) || best.hasAccountSnapshot) {
       // 可能是独立站点（有 wrapper 但无 quota，有 balance）
       family = 'independent'
     }
@@ -169,9 +217,27 @@ export function classifySite(fp: SiteFingerprint): SiteClassification {
     capabilities.push('tokenSource')
   }
 
+  // 统计接口（Hubway 类 usage/dashboard/stats）识别：路径别名 + 结构指纹（方案 §3.1/§6.4）
+  // 仅靠 pathname + 字段结构识别，不按域名硬编码。
+  const statsSignal = fp.signals.find((s) => s.pathKey === 'usageDashboardStats')
+  let usageStatsPath: string | null = null
+  let usageStatsKind: UsageStatsKind | null = null
+  if (statsSignal) {
+    const names = statsSignal.dataFieldNames || []
+    const hitStatsField = ['today_actual_cost', 'total_tokens', 'total_input_tokens', 'total_output_tokens', 'average_duration_ms'].some(
+      (n) => names.includes(n),
+    )
+    if (hitStatsField) {
+      if (!capabilities.includes('usageDashboardStats')) capabilities.push('usageDashboardStats')
+      // 标准候选路径（探针使用的即该规范路径）；真实 fork 变体的 pathname 由 DISCOVER_ENDPOINTS 从 attempt 实际 URL 持久化
+      usageStatsPath = '/api/v1/usage/dashboard/stats'
+      usageStatsKind = 'hubway_dashboard_stats'
+    }
+  }
+
   // Step 4: 置信度
   let confidence: Confidence = 'low'
-  const validWithUser = valid.filter((s) => s.hasUserId && s.hasDataObject)
+  const validWithUser = valid.filter((s) => (s.hasUserId || s.hasAccountSnapshot) && s.hasDataObject)
   if (validWithUser.length >= 2 && family !== 'unknown') {
     confidence = 'high'
   } else if (validWithUser.length >= 1 && family !== 'unknown') {
@@ -189,7 +255,20 @@ export function classifySite(fp: SiteFingerprint): SiteClassification {
             : null) // 非标准路径由 discovered.userSelfPath 单独记录
     : null
 
-  return { family, routeProfile, capabilities, confidence, userSelfPath, usageListKind }
+  return {
+    family,
+    routeProfile,
+    capabilities,
+    confidence,
+    userSelfPath,
+    usageListKind,
+    usageStatsPath,
+    usageStatsKind,
+    // IKunCode 类组合 provider 的 pathname 依赖 userSelfPath / /api/data/self 等，由 DISCOVER_ENDPOINTS 从 attempt 实际 URL 持久化，此处不臆测
+    accountSnapshotPath: null,
+    rangeUsagePath: null,
+    billingConfigPath: null,
+  }
 }
 
 /**
@@ -202,6 +281,13 @@ export function buildStrategy(
   classification: SiteClassification,
   userSelfPath: string,
   currency?: string,
+  discoveredPaths?: {
+    usageStatsPath?: string | null
+    usageStatsKind?: UsageStatsKind | null
+    accountSnapshotPath?: string | null
+    rangeUsagePath?: string | null
+    billingConfigPath?: string | null
+  },
 ): CollectStrategy {
   const endpoints: EndpointActivation[] = []
 
@@ -211,6 +297,7 @@ export function buildStrategy(
     endpointId: 'userSelf',
     path: userSelfPath,
     needsToken: classification.capabilities.includes('tokenSource'),
+    authRole: 'authority',
   })
 
   // 用量端点：按 capabilities 优先级降级；同能力给出「标准 + fork 变体」候选，
@@ -254,11 +341,124 @@ export function buildStrategy(
     })
   }
 
+  // 统计接口（Hubway 类 usage/dashboard/stats）：权威累计 Token / 今日使用金额 / 平均响应。
+  // 独立角色，不阻塞余额/明细采集；明细接口失败也不覆盖统计指标。
+  if (discoveredPaths?.usageStatsPath || classification.capabilities.includes('usageDashboardStats')) {
+    endpoints.push({
+      role: 'usage_stats',
+      endpointId: 'usageDashboardStats',
+      path: discoveredPaths?.usageStatsPath ?? '/api/v1/usage/dashboard/stats',
+      method: 'GET',
+      queryTemplate: { timezone: 'Asia/Shanghai' },
+      usageStatsKind: discoveredPaths?.usageStatsKind ?? 'hubway_dashboard_stats',
+      providerId: 'hubway_dashboard_stats',
+      sideEffect: 'none',
+      safeToAutoPoll: true,
+    })
+  }
+
+  // IKunCode 类组合 provider（方案 §3.4）：账户快照 / 区间用量 / 计价配置，按职责独立激活。
+  // 账户快照与余额同源（/api/user/self 的 data.user.*），但明确声明新角色以区分口径。
+  if (userSelfPath && (discoveredPaths?.accountSnapshotPath || classification.family === 'independent' || classification.capabilities.includes('hourlyUsage'))) {
+    const accountPath = discoveredPaths?.accountSnapshotPath ?? userSelfPath
+    const accountIsRefresh = accountPath === '/api/user/auth/refresh'
+    endpoints.push({
+      role: 'account_snapshot',
+      endpointId: 'accountSnapshot',
+      path: accountPath,
+      method: accountIsRefresh ? 'POST' : 'GET',
+      usageWindow: 'point',
+      sideEffect: accountIsRefresh ? 'session_refresh' : 'none',
+      safeToAutoPoll: !accountIsRefresh,
+      providerId: 'ikuncode_account_snapshot',
+      authRole: accountIsRefresh ? 'candidate' : 'authority',
+    })
+  }
+  if (discoveredPaths?.rangeUsagePath || classification.capabilities.includes('hourlyUsage')) {
+    endpoints.push({
+      role: 'range_usage',
+      endpointId: 'rangeUsage',
+      path: discoveredPaths?.rangeUsagePath ?? '/api/data/self',
+      method: 'GET',
+      usageWindow: 'calendar_day',
+      sideEffect: 'none',
+      safeToAutoPoll: true,
+      providerId: 'ikuncode_range_usage',
+    })
+  }
+  if (discoveredPaths?.billingConfigPath || classification.family === 'independent' || classification.capabilities.includes('hourlyUsage')) {
+    endpoints.push({
+      role: 'billing_config',
+      endpointId: 'billingConfig',
+      path: discoveredPaths?.billingConfigPath ?? '/api/status',
+      method: 'GET',
+      usageWindow: 'point',
+      sideEffect: 'none',
+      safeToAutoPoll: true,
+      providerId: 'ikuncode_billing_config',
+    })
+  }
+
   return {
     endpoints,
     family: classification.family,
     confidence: classification.confidence,
     currency,
     collectorVersion: COLLECTOR_VERSION,
+    accountSemantics: undefined,
   }
+}
+
+/**
+ * 从 SiteConfig 派生「实际生效策略」（方案 028 §5.2）。
+ * pageCollect（采集）与 collectionProfile（展示）共用同一函数，避免策略默认值两处漂移。
+ * 旧 discovered 缺字段时给出保守默认，确保首采也能尝试统计/账户 provider。
+ */
+export function buildEffectiveStrategy(site: SiteConfig, _manualCollect: boolean): CollectStrategy {
+  const discovered = site.discovered
+  const userSelfPath = discovered?.userSelfPath ?? '/api/user/self'
+  const capabilities: Capability[] = [...((discovered?.capabilities as Capability[] | undefined) ?? [])]
+  if (!capabilities.includes('usageDashboardStats')) capabilities.push('usageDashboardStats')
+  // IKunCode 类（独立家族 / hourlyUsage 能力 / 未分类）默认启用账户快照/区间用量/计价配置候选。
+  const ikuncodeLike =
+    !discovered ||
+    discovered.family === 'independent' ||
+    discovered.family === 'unknown' ||
+    capabilities.includes('hourlyUsage')
+  // One API / New API 兼容站点都可能通过 /api/status 公开 quota_per_unit。
+  // 不能只依赖 new-api-capable：DoCode 的脱敏指纹在部分版本会被归为 one-api-compatible，
+  // 但 data.user.quota 仍是需要按 quota_per_unit 换算的账户余额。
+  const quotaUnitAccountLike =
+    discovered?.family === 'one-api-compatible' ||
+    discovered?.family === 'new-api-capable' ||
+    discovered?.accountSemantics === 'current_balance_and_historical_consumed'
+  const classification: SiteClassification = {
+    family: (discovered?.family as Family) || 'unknown',
+    routeProfile: (discovered?.routeProfile as RouteProfile) || 'standard',
+    capabilities,
+    confidence: (discovered?.confidence as Confidence) || 'low',
+    userSelfPath,
+    usageListKind: discovered?.usageListKind ?? null,
+    usageListPath: discovered?.usageListPath ?? null,
+    usageStatsPath: discovered?.usageStatsPath ?? null,
+    usageStatsKind: discovered?.usageStatsKind ?? null,
+    accountSnapshotPath: discovered?.accountSnapshotPath ?? null,
+    rangeUsagePath: discovered?.rangeUsagePath ?? null,
+    billingConfigPath: discovered?.billingConfigPath ?? null,
+  }
+  const strategy = buildStrategy(
+    classification,
+    userSelfPath,
+    site.currency ?? undefined,
+    {
+      usageStatsPath: discovered?.usageStatsPath ?? '/api/v1/usage/dashboard/stats',
+      usageStatsKind: discovered?.usageStatsKind ?? 'hubway_dashboard_stats',
+      accountSnapshotPath: discovered?.accountSnapshotPath ?? (ikuncodeLike ? userSelfPath : null),
+      rangeUsagePath: discovered?.rangeUsagePath ?? (ikuncodeLike ? '/api/data/self' : null),
+      billingConfigPath: discovered?.billingConfigPath ?? (ikuncodeLike || quotaUnitAccountLike ? '/api/status' : null),
+    },
+  )
+  // 账户快照语义契约透传：驱动 collectInPage 在 DoCode 等契约下的字段口径（027 §3.3）。
+  strategy.accountSemantics = (discovered?.accountSemantics as AccountSemantics | undefined) ?? undefined
+  return strategy
 }

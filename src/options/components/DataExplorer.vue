@@ -10,6 +10,7 @@ import type {
   LabShowDashboardResponse,
   ClickBehaviorResponse,
   ResetDataResponse,
+  DeleteSnapshotsResponse,
 } from '../../core/messaging/protocol'
 import type { SiteConfig, Snapshot, DailyStat, CustomCaptureRecord } from '../../shared/types'
 import { fmtBalance, fmtTokens, fmtNum, fmtDateTime } from '../../shared/format'
@@ -79,6 +80,10 @@ const pageSnapshots = ref(1)
 const pageDaily = ref(1)
 const pageCaptures = ref(1)
 const expanded = ref<Set<string>>(new Set())
+// 余额历史的批量选择按需展开，避免默认展示一整列复选框干扰表格阅读。
+const snapshotSelectionOpen = ref(false)
+const selectedSnapshotIds = ref<Set<number>>(new Set())
+const deletingSnapshots = ref(false)
 
 const ALL_SITES_ID = '__all__'
 
@@ -123,6 +128,15 @@ const capturesTotalPages = computed(() => Math.max(1, Math.ceil(capturesTotal.va
 const snapshotsView = computed(() => paginate(data.value?.snapshots ?? [], pageSnapshots.value))
 const dailyView = computed(() => paginate(data.value?.dailyStats ?? [], pageDaily.value))
 const capturesView = computed(() => paginate(data.value?.captures ?? [], pageCaptures.value))
+const snapshotIdsOnPage = computed(() =>
+  snapshotsView.value
+    .map((snapshot) => snapshotId(snapshot))
+    .filter((id): id is number => id != null),
+)
+const selectedSnapshotCount = computed(() => selectedSnapshotIds.value.size)
+const allSnapshotsOnPageSelected = computed(() =>
+  snapshotIdsOnPage.value.length > 0 && snapshotIdsOnPage.value.every((id) => selectedSnapshotIds.value.has(id)),
+)
 
 // 每页大小变化：所有表回到第 1 页
 function onPageSizeChange() {
@@ -160,6 +174,85 @@ function toggleExpand(key: string) {
   const next = new Set(expanded.value)
   next.has(key) ? next.delete(key) : next.add(key)
   expanded.value = next
+}
+
+function snapshotKey(snapshot: Snapshot): string {
+  return typeof snapshot.id === 'number'
+    ? `snapshot:${snapshot.id}`
+    : `snapshot:${snapshot.siteId}:${snapshot.takenAt}:${snapshot.recordId ?? ''}`
+}
+
+function snapshotId(snapshot: Snapshot): number | null {
+  return typeof snapshot.id === 'number' && Number.isSafeInteger(snapshot.id) && snapshot.id > 0
+    ? snapshot.id
+    : null
+}
+
+function isSnapshotSelected(snapshot: Snapshot): boolean {
+  const id = snapshotId(snapshot)
+  return id != null && selectedSnapshotIds.value.has(id)
+}
+
+function onSnapshotSelectionChange(snapshot: Snapshot, event: Event) {
+  const id = snapshotId(snapshot)
+  if (id == null) return
+  const checked = (event.target as HTMLInputElement).checked
+  const next = new Set(selectedSnapshotIds.value)
+  checked ? next.add(id) : next.delete(id)
+  selectedSnapshotIds.value = next
+}
+
+function toggleSnapshotsOnPage() {
+  const ids = snapshotIdsOnPage.value
+  const shouldSelect = !allSnapshotsOnPageSelected.value
+  const next = new Set(selectedSnapshotIds.value)
+  for (const id of ids) shouldSelect ? next.add(id) : next.delete(id)
+  selectedSnapshotIds.value = next
+}
+
+function toggleSnapshotSelection() {
+  const nextOpen = !snapshotSelectionOpen.value
+  snapshotSelectionOpen.value = nextOpen
+  // 收起多选时清空选择，避免不可见的选择仍让批量删除按钮可用。
+  if (!nextOpen) selectedSnapshotIds.value = new Set()
+}
+
+async function deleteSnapshots(ids: number[]) {
+  const uniqueIds = [...new Set(ids.filter((id) => Number.isSafeInteger(id) && id > 0))]
+  if (uniqueIds.length === 0) {
+    showMsg('未找到可删除的余额历史记录')
+    return
+  }
+  const description = uniqueIds.length === 1
+    ? '确定删除这条余额历史记录吗？此操作不可恢复。'
+    : `确定删除已选的 ${uniqueIds.length} 条余额历史记录吗？此操作不可恢复。`
+  if (!confirm(description)) return
+
+  deletingSnapshots.value = true
+  try {
+    const type = uniqueIds.length === 1 ? 'DELETE_SNAPSHOT' : 'DELETE_SNAPSHOTS'
+    const payload = uniqueIds.length === 1 ? { id: uniqueIds[0] } : { ids: uniqueIds }
+    const res = await send<DeleteSnapshotsResponse>(type, payload)
+    showMsg(res.deleted > 0 ? `已删除 ${res.deleted} 条余额历史记录` : '所选余额历史记录已不存在')
+    await refresh()
+  } catch (e) {
+    showMsg(e instanceof MessagingError ? e.message : String(e))
+  } finally {
+    deletingSnapshots.value = false
+  }
+}
+
+async function deleteSnapshot(snapshot: Snapshot) {
+  const id = snapshotId(snapshot)
+  if (id == null) {
+    showMsg('该余额历史记录缺少可删除标识')
+    return
+  }
+  await deleteSnapshots([id])
+}
+
+async function deleteSelectedSnapshots() {
+  await deleteSnapshots([...selectedSnapshotIds.value])
 }
 
 async function loadRetention() {
@@ -292,6 +385,7 @@ async function refresh() {
     pageDaily.value = 1
     pageCaptures.value = 1
     expanded.value = new Set()
+    selectedSnapshotIds.value = new Set()
   } catch (e) {
     showMsg(e instanceof MessagingError ? e.message : String(e))
   } finally {
@@ -632,10 +726,40 @@ onMounted(() => {
 
       <!-- 余额历史 -->
       <div class="dex-block">
-        <div class="dex-title">余额历史（{{ data.snapshots.length }}）</div>
+        <div class="dex-title-row">
+          <div class="dex-title">余额历史（{{ data.snapshots.length }}）</div>
+          <div class="dex-actions">
+            <button
+              type="button"
+              class="btn dex-selection-toggle"
+              :aria-expanded="snapshotSelectionOpen"
+              @click="toggleSnapshotSelection"
+            >
+              {{ snapshotSelectionOpen ? '收起多选' : '多选' }}
+            </button>
+            <button
+              type="button"
+              class="btn danger dex-delete-selected"
+              :disabled="selectedSnapshotCount === 0 || deletingSnapshots"
+              @click="deleteSelectedSnapshots"
+            >
+              删除已选（{{ selectedSnapshotCount }}）
+            </button>
+          </div>
+        </div>
         <table v-if="data.snapshots.length" class="dex-table">
           <thead>
             <tr>
+              <th v-if="snapshotSelectionOpen" class="dex-check">
+                <input
+                  type="checkbox"
+                  :checked="allSnapshotsOnPageSelected"
+                  :disabled="snapshotIdsOnPage.length === 0 || deletingSnapshots"
+                  aria-label="全选当前页余额历史"
+                  @click.stop
+                  @change="toggleSnapshotsOnPage"
+                />
+              </th>
               <th>时间</th>
               <th>站点</th>
               <th>余额</th>
@@ -650,8 +774,18 @@ onMounted(() => {
             </tr>
           </thead>
           <tbody>
-            <template v-for="s in snapshotsView" :key="'s' + s.siteId + ':' + s.takenAt">
-              <tr @click="toggleExpand('s' + s.siteId + ':' + s.takenAt)">
+            <template v-for="s in snapshotsView" :key="snapshotKey(s)">
+              <tr @click="toggleExpand(snapshotKey(s))">
+                <td v-if="snapshotSelectionOpen" class="dex-check">
+                  <input
+                    type="checkbox"
+                    :checked="isSnapshotSelected(s)"
+                    :disabled="snapshotId(s) == null || deletingSnapshots"
+                    aria-label="选择余额历史记录"
+                    @click.stop
+                    @change="onSnapshotSelectionChange(s, $event)"
+                  />
+                </td>
                 <td>{{ fmtDateTime(s.takenAt) }}</td>
                 <td :title="s.siteId">{{ siteNameOf(s.siteId) }}</td>
                 <td>{{ fmtBalance(s.balance, s.currency) }}</td>
@@ -661,11 +795,21 @@ onMounted(() => {
                 <td>{{ s.currency ?? '—' }}</td>
                 <td>{{ s.channel }}</td>
                 <td>{{ s.quality }}</td>
-                <td>{{ s.status }}</td>
+                <td class="snapshot-status">
+                  <span>{{ s.status }}</span>
+                  <button
+                    type="button"
+                    class="snapshot-delete"
+                    :disabled="snapshotId(s) == null || deletingSnapshots"
+                    @click.stop="deleteSnapshot(s)"
+                  >
+                    删除
+                  </button>
+                </td>
                 <td class="exp">{{ expanded.has('s' + s.siteId + ':' + s.takenAt) ? '▾' : '▸' }}</td>
               </tr>
-              <tr v-if="expanded.has('s' + s.takenAt)">
-                <td colspan="11" class="json-cell">
+              <tr v-if="expanded.has(snapshotKey(s))">
+                <td :colspan="snapshotSelectionOpen ? 12 : 11" class="json-cell">
                   <pre>{{ JSON.stringify(s, null, 2) }}</pre>
                 </td>
               </tr>
@@ -955,8 +1099,24 @@ onMounted(() => {
 .dex-title {
   font-size: 13px;
   font-weight: 700;
-  margin-bottom: 8px;
   color: var(--text);
+}
+.dex-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.dex-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dex-selection-toggle,
+.dex-delete-selected {
+  padding: 5px 9px;
+  font-size: 12px;
 }
 .dex-table {
   width: 100%;
@@ -990,6 +1150,40 @@ onMounted(() => {
 .dex-table .exp {
   text-align: right;
   color: var(--sub);
+}
+.dex-table .dex-check {
+  width: 32px;
+  padding-right: 4px;
+  text-align: center;
+}
+.dex-check input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--brand);
+  cursor: pointer;
+}
+.dex-check input:disabled {
+  cursor: not-allowed;
+}
+.snapshot-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.snapshot-delete {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--err);
+  font-size: 12px;
+  cursor: pointer;
+}
+.snapshot-delete:hover:not(:disabled) {
+  text-decoration: underline;
+}
+.snapshot-delete:disabled {
+  color: var(--sub);
+  cursor: not-allowed;
 }
 .dex-table .url {
   max-width: 320px;

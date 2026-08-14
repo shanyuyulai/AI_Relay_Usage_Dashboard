@@ -4,10 +4,11 @@ import { send, MessagingError } from '../core/messaging/client'
 import type { DashboardData, CollectResultMsg, CurrencyTotal } from '../core/messaging/protocol'
 import type { SiteConfig } from '../shared/types'
 import { getThemeMode, setThemeMode, type ThemeMode } from '../shared/theme'
-import { fmtBalance, fmtTokens, fmtNum, fmtTime, fmtMs, fmtMsClass, statusBadge } from '../shared/format'
+import { fmtBalance, fmtTokens, fmtCompactTokens, fmtNum, fmtTime, fmtMs, fmtMsClass, statusBadge } from '../shared/format'
 import { registry } from '../adapters'
 import { ensureOriginPermission, ensureOriginPermissions } from '../shared/permissions'
 import { isValidSiteUrl } from '../shared/util'
+import { shouldShowReauthorize } from '../core/authState'
 import { getLabShowDashboard, LAB_SHOWDASHBOARD_CHANGED } from '../storage/labConfig'
 import SiteDetail from './components/SiteDetail.vue'
 
@@ -18,6 +19,23 @@ const lastRefreshed = ref('')
 const dashboard = ref<DashboardData | null>(null)
 const view = ref<'dashboard' | 'detail'>('dashboard')
 const detailSiteId = ref('')
+
+function displayStatus(site: SiteConfig) {
+  return site.lastStatus === 'auth_expired' && !shouldShowReauthorize(site) ? 'error' : site.lastStatus
+}
+
+function balanceClass(balance: number | null | undefined): string {
+  if (balance == null) return 'is-null'
+  if (balance <= 1) return 'bal-critical'
+  return balance >= 5 ? 'bal-high' : 'bal-low'
+}
+
+function collectionErrorHint(site: SiteConfig): string {
+  if (site.lastFailureReason === 'AUTH_CONTEXT_INCOMPLETE') return '未取得站点请求上下文，请保持控制台登录后重新检测'
+  if (site.lastFailureReason === 'NETWORK_OR_TIMEOUT') return '站点请求超时，请稍后重试'
+  if (site.lastFailureReason === 'CANDIDATE_REJECTED') return '未找到可用账户接口，请重新探测'
+  return '采集异常，请检查站点状态后重试'
+}
 
 const adapterMap = computed<Record<string, string>>(() => {
   const m: Record<string, string> = {}
@@ -155,6 +173,27 @@ function cumSrcLabel(src: string | null | undefined): string {
 function cumSrcTitle(src: string | null | undefined): string {
   if (src === 'dashboard') return '来源：站点仪表盘权威接口返回的累计 Token'
   if (src === 'local_history') return '来源：本插件按日用量历史累加（非站点官方值）'
+  return ''
+}
+
+// 今日使用金额来源标注（方案 §7.3）：dashboard_stats(统计接口权威) / logs(用量日志降级)
+function todayCostSrcLabel(src: string | null | undefined): string {
+  if (src === 'dashboard_stats') return '站'
+  if (src === 'range_usage') return '区间'
+  if (src === 'logs') return '日'
+  return ''
+}
+function todayCostSrcTitle(src: string | null | undefined): string {
+  if (src === 'dashboard_stats') return '今日使用金额来源：站点统计接口（权威）'
+  if (src === 'range_usage') return '今日使用金额来源：站点自然日区间用量接口'
+  if (src === 'logs') return '今日使用金额来源：当日用量明细日志（降级）'
+  return ''
+}
+// 指标时间窗口标注（方案 §1.2）：calendar_day=自然日 / rolling_24h=近24h
+function usageWindowLabel(w: string | null | undefined): string {
+  if (w === 'calendar_day') return '日'
+  if (w === 'rolling_24h') return '24h'
+  if (w === 'range') return '区间'
   return ''
 }
 
@@ -324,38 +363,29 @@ onUnmounted(() => {
                   {{ s.site.origin.replace('https://', '') }} · {{ adapterMap[s.site.adapter] || s.site.adapter }}
                 </div>
               </div>
-              <span class="badge" :class="statusBadge(s.lastStatus).cls">
-                {{ statusBadge(s.lastStatus).text }}
+              <span class="badge" :class="statusBadge(displayStatus(s.site)).cls">
+                {{ statusBadge(displayStatus(s.site)).text }}
               </span>
             </div>
 
             <div class="sc-metrics" :class="{ dimmed: !s.latest }">
               <div class="m">
                 <div class="k">余额</div>
-                <div class="v">{{ fmtBalance(s.latest?.balance ?? null, s.latest?.currency ?? null) }}</div>
+                <div class="v" :class="balanceClass(s.latest?.balance)">{{ fmtBalance(s.latest?.balance ?? null, s.latest?.currency ?? null) }}</div>
               </div>
               <div class="m">
-                <div class="k" title="今日使用金额（来自用量日志的消耗字段；站点未返回则显 —）">今日使用</div>
+                <div class="k" title="今日使用金额（来自用量日志的消耗字段；站点未返回则显 —）">
+                  今日使用
+                  <span v-if="s.latest?.todayCostSource" class="src" :title="todayCostSrcTitle(s.latest.todayCostSource)">{{ todayCostSrcLabel(s.latest.todayCostSource) }}</span>
+                </div>
                 <div class="v">{{ fmtBalance(s.latest?.todayCost ?? null, s.latest?.currency ?? null) }}</div>
-              </div>
-              <div class="m">
-                <div class="k">今日 Token</div>
-                <div class="v">{{ fmtTokens(s.latest?.todayTokens ?? null) }}</div>
-              </div>
-              <div class="m">
-                <div class="k">今日请求</div>
-                <div class="v">{{ fmtNum(s.latest?.todayRequests ?? null) }}</div>
               </div>
               <div class="m">
                 <div class="k">
                   累计 Token
                   <span v-if="s.latest?.cumulativeTokensSource" class="src" :title="cumSrcTitle(s.latest.cumulativeTokensSource)">{{ cumSrcLabel(s.latest.cumulativeTokensSource) }}</span>
                 </div>
-                <div class="v">{{ fmtTokens(s.latest?.cumulativeTokens ?? null) }}</div>
-              </div>
-              <div class="m">
-                <div class="k" title="本次采集对余额接口实测往返耗时（非纯网络延迟）">API 往返</div>
-                <div class="v" :class="fmtMsClass(s.latest?.apiRoundTripMs ?? null)">{{ fmtMs(s.latest?.apiRoundTripMs ?? null) }}</div>
+                <div class="v">{{ fmtCompactTokens(s.latest?.cumulativeTokens ?? null) }}</div>
               </div>
             </div>
 
@@ -365,14 +395,14 @@ onUnmounted(() => {
               <span class="re" @click="syncSite(s.site.id, $event)">刷新 ⟳</span>
             </div>
 
-            <div v-if="s.lastStatus === 'auth_expired'" class="authbar">
+            <div v-if="shouldShowReauthorize(s.site)" class="authbar">
               登录态已过期，请前往原站重新登录后点击「刷新」
             </div>
             <div v-if="s.lastStatus === 'no_source'" class="authbar info">
               该站点无精确用量接口，今日用量不展示（禁止模拟数据）
             </div>
-            <div v-if="s.lastStatus === 'error'" class="authbar err">
-              采集异常，请检查站点状态后重试
+            <div v-if="displayStatus(s.site) === 'error'" class="authbar err">
+              {{ collectionErrorHint(s.site) }}
             </div>
           </div>
         </template>
@@ -685,19 +715,19 @@ body {
   color: var(--sub);
 }
 .sc-metrics {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   margin-top: 11px;
   border-top: 1px dashed var(--line);
   padding-top: 10px;
-  gap: 8px 0;
+  gap: 10px 0;
 }
 .sc-metrics.dimmed {
   opacity: 0.5;
 }
 .m {
-  flex: 0 0 33.333%;
   box-sizing: border-box;
+  min-width: 0;
 }
 .m .k {
   font-size: 10px;
@@ -727,6 +757,19 @@ body {
   font-size: 14px;
   font-weight: 700;
   margin-top: 2px;
+}
+.m .v.bal-high {
+  color: var(--ok);
+}
+.m .v.bal-low {
+  color: var(--warn);
+}
+.m .v.bal-critical {
+  color: var(--err);
+}
+.m .v.is-null {
+  color: var(--sub);
+  font-weight: 400;
 }
 .sc-foot {
   display: flex;

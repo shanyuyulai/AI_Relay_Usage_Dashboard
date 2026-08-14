@@ -11,6 +11,7 @@ const error = ref('')
 
 function balClass(it: DashboardSummaryItem): string {
   if (it.balance == null) return 'is-null'
+  if (it.balance <= 1) return 'bal-critical'
   return it.balance >= 5 ? 'bal-high' : 'bal-low'
 }
 
@@ -191,6 +192,9 @@ onMounted(() => {
 }
 .pop-bal.bal-low {
   color: var(--warn);
+}
+.pop-bal.bal-critical {
+  color: var(--err);
 }
 .pop-bal.is-null {
   color: var(--sub);

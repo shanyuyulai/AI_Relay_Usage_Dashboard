@@ -3,10 +3,12 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import Chart from 'chart.js/auto'
 import { send, MessagingError } from '../../core/messaging/client'
 import type { SiteDetailData, GetUsageDetailsResponse } from '../../core/messaging/protocol'
-import type { UsageRecord, SiteConfig, Snapshot, DailyStat, ModelUsage } from '../../shared/types'
-import { fmtBalance, fmtTokens, fmtNum, fmtTime, fmtMs, fmtMsClass, statusBadge } from '../../shared/format'
+import type { UsageRecord, SiteConfig, Snapshot, DailyStat, ModelUsage, SiteCollectionProfile } from '../../shared/types'
+import { fmtBalance, fmtTokens, fmtCompactTokens, fmtNum, fmtTime, fmtMs, fmtMsClass, statusBadge } from '../../shared/format'
 import { ensureOriginPermission } from '../../shared/permissions'
 import { isValidSiteUrl } from '../../shared/util'
+import { shouldShowReauthorize } from '../../core/authState'
+import CollectionProfileCard from '../../options/components/CollectionProfileCard.vue'
 
 const props = defineProps<{ siteId: string }>()
 const emit = defineEmits<{ back: [] }>()
@@ -29,6 +31,16 @@ const snapshots = computed<Snapshot[]>(() => data.value?.snapshots ?? [])
 const daily = computed<DailyStat[]>(() => (data.value?.dailyStats ?? []) as DailyStat[])
 const latest = computed<Snapshot | null>(() => snapshots.value[0] ?? null)
 
+function displayStatus(config: SiteConfig): SiteConfig['lastStatus'] {
+  return config.lastStatus === 'auth_expired' && !shouldShowReauthorize(config) ? 'error' : config.lastStatus
+}
+
+function balanceClass(balance: number | null | undefined): string {
+  if (balance == null) return 'is-null'
+  if (balance <= 1) return 'bal-critical'
+  return balance >= 5 ? 'bal-high' : 'bal-low'
+}
+
 // 累计 Token 来源标注（GPT P0-2：绝不冒充；local_history 为插件历史累加）
 function cumSrcLabel(src: string | null | undefined): string {
   if (src === 'dashboard') return '站'
@@ -39,6 +51,76 @@ function cumSrcTitle(src: string | null | undefined): string {
   if (src === 'dashboard') return '来源：站点仪表盘权威接口返回的累计 Token'
   if (src === 'local_history') return '来源：本插件按日用量历史累加（非站点官方值）'
   return ''
+}
+
+// 今日使用金额来源标注（方案 §7.3）：dashboard_stats(统计接口权威) / logs(用量日志降级)
+function todayCostSrcLabel(src: string | null | undefined): string {
+  if (src === 'dashboard_stats') return '站'
+  if (src === 'range_usage') return '区间'
+  if (src === 'logs') return '日'
+  return ''
+}
+function todayCostSrcTitle(src: string | null | undefined): string {
+  if (src === 'dashboard_stats') return '今日使用金额来源：站点统计接口（权威）'
+  if (src === 'range_usage') return '今日使用金额来源：站点自然日区间用量接口'
+  if (src === 'logs') return '今日使用金额来源：当日用量明细日志（降级）'
+  return ''
+}
+
+// —— 数据来源（站点类型与采集方案，方案 028 侧边栏复用）：只读展示模型，不持久化 ——
+const profile = ref<SiteCollectionProfile | null>(null)
+const profileOpen = ref(false)
+async function loadProfile(seq: number) {
+  try {
+    const res = await send<{ profiles: Record<string, SiteCollectionProfile> }>('GET_SITE_COLLECTION_PROFILES', {})
+    if (seq !== reqSeq.value || dead) return
+    profile.value = res.profiles?.[props.siteId] ?? null
+  } catch {
+    if (seq !== reqSeq.value || dead) return
+    profile.value = null
+  }
+}
+function dsFamily(p: SiteCollectionProfile): string {
+  switch (p.classification.family) {
+    case 'independent': return '独立接口'
+    case 'new-api-capable': return 'New API 兼容'
+    case 'one-api-compatible': return 'One API 兼容'
+    default: return '待识别'
+  }
+}
+function dsRoute(p: SiteCollectionProfile): string {
+  switch (p.classification.routeProfile) {
+    case 'standard': return '标准路径'
+    case 'fork-path': return '变体路径'
+    case 'discovered': return '网络发现'
+    default: return ''
+  }
+}
+function dsSemantics(p: SiteCollectionProfile): string {
+  switch (p.classification.accountSemantics) {
+    case 'current_balance_and_historical_consumed': return '当前余额/历史消耗'
+    case 'quota_limit_and_used': return '总额度/已用'
+    case 'direct_balance': return '直接余额'
+    default: return '账户语义待定'
+  }
+}
+function dsEngine(p: SiteCollectionProfile): string {
+  return p.execution.engine === 'sw_lab' ? '零标签实验室' : '页面会话'
+}
+function dsSummary(p: SiteCollectionProfile): string {
+  const verified = p.steps.filter((s) => s.state === 'verified').length
+  if (!p.classification.probedAt) return '待探测'
+  if (p.health.latestFailure?.reason === 'ACCOUNT_UNAUTHORIZED') return `${dsEngine(p)} · 需登录`
+  if (p.health.lastStatus === 'error') return `${dsEngine(p)} · 采集异常`
+  return `${dsEngine(p)} · 已验证 ${verified} 项`
+}
+// 管理类动作（重新探测/诊断/编辑/授权）在设置页完成，侧边栏仅做内联「立即同步」+ 跳转设置。
+function openOptionsForManage() {
+  try {
+    chrome.runtime.openOptionsPage()
+  } catch {
+    /* 选项页不可用时静默忽略 */
+  }
 }
 
 const chartLabels = computed(() => dailyTail.value.map((d) => d.date.slice(5)))
@@ -425,6 +507,8 @@ async function loadDetail(force: boolean) {
     if (seq !== reqSeq.value || sid !== props.siteId || dead) return
     data.value = detail
     usagePartial.value = false
+    // 并行加载数据来源（站点类型与采集方案，方案 028）
+    void loadProfile(seq)
     const usage = await fetchAllUsage(sid, force ? 'force' : 'cache-only', seq)
     if (seq !== reqSeq.value || sid !== props.siteId || dead) return
     usageRows.value = usage.rows
@@ -512,14 +596,32 @@ function openOrigin(url: string) {
             </div>
             <div class="sc-url">{{ site.origin.replace('https://', '') }}</div>
           </div>
-          <span class="badge" :class="statusBadge(site.lastStatus).cls">
-            {{ statusBadge(site.lastStatus).text }}
+            <span class="badge" :class="statusBadge(displayStatus(site)).cls">
+            {{ statusBadge(displayStatus(site)).text }}
           </span>
+          </div>
+        <!-- 数据来源：站点类型与采集方案常驻摘要（方案 028，侧边栏复用） -->
+        <div class="ds-row" v-if="profile">
+          <span class="chip chip-type" :title="'自动识别的站点类型（与配置适配器区分）'">{{ dsFamily(profile) }}</span>
+          <span class="chip" v-if="dsRoute(profile)">{{ dsRoute(profile) }}</span>
+          <span class="chip" :title="'账户字段语义契约（027 §3.1）'">{{ dsSemantics(profile) }}</span>
+          <span class="chip chip-engine" :title="'采集引擎与运行态'">{{ dsSummary(profile) }}</span>
+          <button class="mini link" :class="profileOpen ? 'accent' : ''" @click="profileOpen = !profileOpen">
+            {{ profileOpen ? '收起方案' : '查看方案' }}
+          </button>
         </div>
+        <div class="ds-row muted" v-else>数据来源：待探测</div>
         <div class="sc-metrics">
           <div class="m">
             <div class="k">余额</div>
-            <div class="v">{{ fmtBalance(latest?.balance ?? null, latest?.currency ?? null) }}</div>
+            <div class="v" :class="balanceClass(latest?.balance)">{{ fmtBalance(latest?.balance ?? null, latest?.currency ?? null) }}</div>
+          </div>
+          <div class="m">
+            <div class="k">
+              今日使用
+              <span v-if="latest?.todayCostSource" class="src" :title="todayCostSrcTitle(latest.todayCostSource)">{{ todayCostSrcLabel(latest.todayCostSource) }}</span>
+            </div>
+            <div class="v">{{ fmtBalance(latest?.todayCost ?? null, latest?.currency ?? null) }}</div>
           </div>
           <div class="m">
             <div class="k">今日 Token</div>
@@ -534,7 +636,15 @@ function openOrigin(url: string) {
               累计 Token
               <span v-if="latest?.cumulativeTokensSource" class="src" :title="cumSrcTitle(latest.cumulativeTokensSource)">{{ cumSrcLabel(latest.cumulativeTokensSource) }}</span>
             </div>
-            <div class="v">{{ fmtTokens(latest?.cumulativeTokens ?? null) }}</div>
+                <div class="v">{{ fmtCompactTokens(latest?.cumulativeTokens ?? null) }}</div>
+          </div>
+          <div class="m">
+            <div class="k" title="账户累计输入 Token（仅权威接口 total_input_tokens；否则 —）">累计输入</div>
+            <div class="v">{{ fmtCompactTokens(latest?.cumulativeInputTokens ?? null) }}</div>
+          </div>
+          <div class="m">
+            <div class="k" title="账户累计输出 Token（仅权威接口 total_output_tokens；否则 —）">累计输出</div>
+            <div class="v">{{ fmtCompactTokens(latest?.cumulativeOutputTokens ?? null) }}</div>
           </div>
           <div class="m">
             <div class="k" title="本次采集对余额接口实测往返耗时">API 往返</div>
@@ -544,6 +654,17 @@ function openOrigin(url: string) {
             <div class="k" title="站点自报平均 API 响应（仅权威接口返回时展示）">平均响应</div>
             <div class="v">{{ fmtMs(latest?.avgResponseTimeMs ?? null) }}</div>
           </div>
+        </div>
+        <!-- 展开采集方案卡（方案 028，侧边栏复用 CollectionProfileCard） -->
+        <div v-if="profileOpen && profile" class="ds-card">
+          <CollectionProfileCard
+            :profile="profile"
+            @reprobe="openOptionsForManage"
+            @diagnose="openOptionsForManage"
+            @edit="openOptionsForManage"
+            @reauth="openOptionsForManage"
+            @sync="refresh"
+          />
         </div>
       </div>
 
@@ -694,6 +815,50 @@ function openOrigin(url: string) {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* 数据来源常驻摘要（方案 028，侧边栏复用） */
+.ds-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+.ds-row.muted {
+  color: var(--sub);
+  font-size: 11px;
+}
+.ds-row .chip {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--chip-bg);
+  color: var(--chip-text);
+  font-weight: 600;
+}
+.ds-row .chip-type {
+  border-color: var(--brand);
+  color: var(--brand-text);
+}
+.ds-row .chip-engine {
+  background: var(--panel-soft);
+}
+.ds-row .mini.link {
+  border: none;
+  background: transparent;
+  color: var(--brand-text);
+  padding: 2px 4px;
+  font-weight: 600;
+  font-size: 11px;
+  cursor: pointer;
+}
+.ds-row .mini.link:hover {
+  text-decoration: underline;
+}
+.ds-card {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
 .badge {
   font-size: 10px;
   font-weight: 700;
@@ -723,16 +888,15 @@ function openOrigin(url: string) {
   color: var(--sub);
 }
 .sc-metrics {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 0;
   margin-top: 11px;
   border-top: 1px dashed var(--line);
   padding-top: 10px;
 }
 .m {
-  flex: 0 0 33.333%;
-  margin-bottom: 10px;
+  min-width: 0;
 }
 .m .k {
   font-size: 10px;
@@ -742,6 +906,19 @@ function openOrigin(url: string) {
   font-size: 14px;
   font-weight: 700;
   margin-top: 2px;
+}
+.m .v.bal-high {
+  color: var(--ok);
+}
+.m .v.bal-low {
+  color: var(--warn);
+}
+.m .v.bal-critical {
+  color: var(--err);
+}
+.m .v.is-null {
+  color: var(--sub);
+  font-weight: 400;
 }
 .m .v.sm {
   font-size: 13px;

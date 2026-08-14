@@ -9,6 +9,85 @@ export type SiteStatus =
   | 'error' // 采集异常
   | 'no_source' // 站点无精确用量接口，今日用量不可得（P0-3）
 
+/** 页面采集得到的授权结论。indeterminate 表示证据不足，不代表用户已退出。 */
+export type AuthState = 'authenticated' | 'unauthorized' | 'indeterminate'
+
+/** 授权证据的固定原因枚举；不得承载 Token、Cookie 或响应正文。 */
+export type AuthEvidenceReason =
+  | 'ACCOUNT_AUTHENTICATED'
+  | 'ACCOUNT_UNAUTHORIZED'
+  | 'AUTH_CONTEXT_INCOMPLETE'
+  | 'CANDIDATE_REJECTED'
+  | 'NETWORK_OR_TIMEOUT'
+  | 'NON_JSON_RESPONSE'
+  | 'ACCOUNT_CONTRACT_MISMATCH'
+  | 'ENDPOINT_UNAVAILABLE'
+
+export type AuthEndpointRole = 'account_authority' | 'candidate' | 'usage' | 'refresh'
+
+/** 最近一次授权结论的脱敏证据。仅保存状态、角色、pathname、状态码和时间。 */
+export interface AuthEvidence {
+  state: AuthState
+  reason: AuthEvidenceReason
+  endpointRole: AuthEndpointRole
+  path: string | null
+  httpStatus: number | null
+  provider: 'new_api_user_object' | 'generic_cookie_or_token' | 'unknown'
+  contextComplete: boolean
+  collectRunId?: string
+  observedAt: number
+}
+
+/**
+ * 账户快照语义（方案 027 §3.1）：以「响应结构契约」识别，绝不按域名硬编码。
+ * - current_balance_and_historical_consumed：data.user.quota=当前余额、used_quota=历史累计消耗、request_count=累计请求（如 DoCode）。
+ * - quota_limit_and_used：quota=总额度、used_quota=已用额度（通用额度站）。
+ * - direct_balance：仅直接余额字段。
+ * - unknown：结构不足以判定。
+ */
+export type AccountSemantics =
+  | 'current_balance_and_historical_consumed'
+  | 'quota_limit_and_used'
+  | 'direct_balance'
+  | 'unknown'
+
+/**
+ * 脱敏账户指标候选（方案 029 §5.5）：页面主世界只回传经过数值校验的原值，
+ * 绝不携带 Cookie / Token / 响应原文。后台经 normalizeAccount() 归一化后再落库。
+ */
+export interface AccountMetricCandidate {
+  /** data.user.quota 等：当前可用余额（DoCode 语义下即当前余额）。 */
+  quota: number | null
+  /** data.user.used_quota 等：历史累计消耗。 */
+  usedQuota: number | null
+  /** data.user.request_count 等：累计请求数。 */
+  requestCount: number | null
+  /** 直接余额字段（如 balance/remain）。 */
+  directBalance: number | null
+  /** 站点明确给出的总额度（充值/赠送可破坏 quota+used 假设，无则 null）。 */
+  explicitTotalQuota: number | null
+  /** 币种（来自响应或站点配置兜底）。 */
+  currency: string | null
+}
+
+/**
+ * 采集失败原因（方案 027 §3.2）：脱敏、枚举化的固定分类。
+ * 仅记录枚举错误码、HTTP 状态、pathname 与建议动作；绝不写入 Cookie/Token/响应正文。
+ */
+export type CollectFailureReason =
+  | 'HOST_PERMISSION_MISSING'
+  | 'NO_MATCHING_OPEN_TAB'
+  | 'PANEL_ORIGIN_SESSION_MISMATCH'
+  | 'ACCOUNT_UNAUTHORIZED'
+  | 'AUTH_CONTEXT_INCOMPLETE'
+  | 'CANDIDATE_REJECTED'
+  | 'NETWORK_OR_TIMEOUT'
+  | 'NON_JSON_RESPONSE'
+  | 'ACCOUNT_CONTRACT_MISMATCH'
+  | 'ENDPOINT_UNAVAILABLE'
+  | 'SCRIPT_INJECTION_FAILED'
+  | 'SW_SESSION_UNAVAILABLE'
+
 export interface SiteConfig {
   id: string
   name: string
@@ -22,6 +101,12 @@ export interface SiteConfig {
   lastCollectAt: number | null
   lastStatus: SiteStatus
   lastError?: string // 最近一次采集失败的错误描述
+  /** 结构化失败原因枚举（方案 029 §6）：优先于 status 推导，便于精确呈现（如实验室无会话 vs 接口不可用）。绝不承载私密值。 */
+  lastFailureReason?: CollectFailureReason
+  /** 最近一次授权结论；无证据的历史 auth_expired 不得直接驱动 UI。 */
+  lastAuthEvidence?: AuthEvidence
+  /** 最近一次采集轮次，用于阻止旧轮次覆盖新状态。 */
+  lastCollectRunId?: string
   /** 计价货币（默认 USD；ikuncode 等以 ¥/CNY 计价的站点显式设置为 CNY）。仅影响展示符号，不参与跨币种相加（P1-3）。 */
   currency?: string
   /**
@@ -43,6 +128,17 @@ export interface SiteConfig {
     /** 当日用量明细列表适配器种类（P0：适配器隔离，禁把 hubway 约定泛化）：hubway_v1 | generic | null */
     usageListKind?: 'hubway_v1' | 'generic' | null
     usageListPath?: string | null
+    /** 统计接口（usage/dashboard/stats）已发现 pathname（不含 query）。 */
+    usageStatsPath?: string | null
+    usageStatsKind?: 'hubway_dashboard_stats' | null
+    /** IKunCode 类组合 provider 的已发现 pathname（不含 query）。 */
+    accountSnapshotPath?: string | null
+    rangeUsagePath?: string | null
+    billingConfigPath?: string | null
+    /** 账户快照语义契约（方案 027 §3.1）：由脱敏指纹识别，用于区分 quota=余额 还是 quota=总额度。 */
+    accountSemantics?: AccountSemantics
+    /** 账户契约识别规则版本；便于今后调整识别规则时区分历史发现结果。 */
+    accountContractVersion?: number
   }
   /**
    * 用户自定义的采集请求（原样保存，不改写）。
@@ -114,10 +210,27 @@ export interface Snapshot {
   cumulativeTokensSource?: 'dashboard' | 'logs' | 'local_history' | null
   /** 本次采集对余额接口实测往返耗时（ms）。非纯网络延迟、非站点平均响应（GPT P0-5）。 */
   apiRoundTripMs?: number | null
-  /** 站点自报平均 API 响应时间（ms）。仅当权威接口明确返回时填入，否则 null（不得伪造）。 */
+    /** 站点自报平均 API 响应时间（ms）。仅当权威接口明确返回时填入，否则 null（不得伪造）。 */
   avgResponseTimeMs?: number | null
   /** 指标是否不完整（如部分字段缺失/分页超限） */
   metricsPartial?: boolean
+  // ===== 统计接口（Hubway 类 usage/dashboard/stats 等）采集字段 =====
+  /** 账户累计输入 Token（仅权威字段 total_input_tokens；否则 null）。 */
+  cumulativeInputTokens?: number | null
+  /** 账户累计输出 Token（仅权威字段 total_output_tokens；否则 null）。 */
+  cumulativeOutputTokens?: number | null
+  /** 账户累计消费额度/费用（如 IKunCode used_quota 经 quotaToCurrency 转换；否则 null）。 */
+  totalConsumedCost?: number | null
+  /** 滚动 24 小时使用金额（range_usage rolling_24h 口径；否则 null）。 */
+  recent24hCost?: number | null
+  /** 滚动 24 小时 Token（range_usage rolling_24h 口径；否则 null）。 */
+  recent24hTokens?: number | null
+  /** 当前指标的时间窗口口径：calendar_day=自然日 / rolling_24h=近24h / range=自定义。用于 UI 标签区分。 */
+  usageWindow?: 'calendar_day' | 'rolling_24h' | 'range' | null
+  /** 今日使用金额来源：dashboard_stats(仪表盘统计接口)=权威 / logs(用量日志)=降级。 */
+  todayCostSource?: 'dashboard_stats' | 'range_usage' | 'logs' | null
+  /** 统计/账户指标来源：dashboard_stats / account_snapshot / range_usage / null。 */
+  usageStatsSource?: 'dashboard_stats' | 'account_snapshot' | 'range_usage' | null
 }
 
 /**
@@ -144,12 +257,15 @@ export interface DailyStat {
 /**
  * 凭证：MVP 仅 Cookie 会话（P0-2）。
  * 不存储 Token、不存储 Cookie 原文——Cookie 在采集时由 chrome.cookies 实时读取。
- * authorized 仅作 UI 态标记：采集成功置 true、AUTH_EXPIRED 置 false。
+ * authorized 为兼容字段；授权判定应优先读取 authState。
  */
 export interface CredentialRow {
   siteId: string // pk
   method: 'cookie'
   authorized: boolean
+  /** 三态授权结论；unknown 表示本轮无法确认，不应覆盖最近明确结论。 */
+  authState?: 'authenticated' | 'unauthorized' | 'unknown'
+  lastEvidenceAt?: number
   updatedAt: number
 }
 
@@ -207,6 +323,8 @@ export interface DiagnosticEntry {
     todayTokens: boolean
     todayRequests: boolean
     cumulativeTokens: boolean
+    cumulativeInputTokens: boolean
+    cumulativeOutputTokens: boolean
     totalRequests: boolean
     avgResponseTimeMs: boolean
     todayCost: boolean
@@ -395,4 +513,72 @@ export interface UsageDataMeta {
   isStale: boolean
   /** 陈旧分钟数（isStale=true 时有效；新鲜为 0） */
   staleAgeMinutes: number
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 站点类型与采集方案可视化（方案 028）：只读展示 DTO，绝不持久化第二份策略副本。
+// 真实策略的唯一来源是 buildEffectiveStrategy()；本模型仅由其生成并下发展示。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 脱敏失败摘要（复用诊断的脱敏原则：仅枚举错误码/HTTP 状态/pathname/时间/建议动作）。 */
+export interface SafeFailureSummary {
+  /** 枚举失败原因；null 表示无失败。 */
+  reason: CollectFailureReason | null
+  /** HTTP 状态码；0=网络错误/超时。 */
+  httpStatus: number | null
+  /** 仅 pathname（不含 query 值与 host），如 /api/user/self。 */
+  pathname: string | null
+  at: number | null
+  /** 面向用户的建议动作（固定中文文案）。 */
+  suggestedAction: string | null
+}
+
+/** 采集方案中的单个指标步骤（方案 028 §5.1）。 */
+export interface CollectionPlanStep {
+  id: string
+  role: 'balance' | 'usage' | 'usage_list' | 'usage_stats' | 'account_snapshot' | 'range_usage' | 'billing_config'
+  label: string
+  method: 'GET' | 'POST'
+  /** 仅 pathname，禁止 query 值。 */
+  path: string
+  /** 是否允许定时自动采集。 */
+  automatic: boolean
+  /** 是否会改变会话状态（如 IKunCode refresh）→ 标记「仅手动」。 */
+  sideEffect: 'none' | 'session_refresh'
+  /** 该步骤预期产出的指标中文标签。 */
+  expectedMetrics: string[]
+  /** 运行态：已验证/计划尝试/部分可用/不支持/需登录/异常。 */
+  state: 'verified' | 'planned' | 'partial' | 'unsupported' | 'unauthorized' | 'failed'
+}
+
+/** 单站「类型与采集方案」展示模型（方案 028 §5.1）。 */
+export interface SiteCollectionProfile {
+  siteId: string
+  /** 用户设定的适配器（配置适配器，可编辑）。 */
+  configuredAdapter: { id: string; label: string }
+  /** 自动识别的站点分类。 */
+  classification: {
+    family: 'one-api-compatible' | 'new-api-capable' | 'independent' | 'unknown'
+    routeProfile: 'standard' | 'fork-path' | 'discovered' | null
+    confidence: 'high' | 'medium' | 'low' | null
+    probedAt: number | null
+    /** 账户快照语义契约（027 §3.1）。 */
+    accountSemantics: AccountSemantics | null
+    capabilities: string[]
+  }
+  execution: {
+    /** 采集引擎：页面主世界同源会话 / SW 零标签实验室。 */
+    engine: 'page_main_world' | 'sw_lab'
+    collectorVersion: number
+    /** 是否需要同源已登录会话。 */
+    requiresSameOriginSession: boolean
+    /** 自动采集：enabled=允许 / manual_only=仅手动 / unavailable=不支持。 */
+    automaticCollection: 'enabled' | 'manual_only' | 'unavailable'
+  }
+  steps: CollectionPlanStep[]
+  health: {
+    lastStatus: SiteStatus
+    lastCollectAt: number | null
+    latestFailure: SafeFailureSummary | null
+  }
 }

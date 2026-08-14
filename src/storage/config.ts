@@ -45,6 +45,35 @@ export const siteRepo = {
     const all = await db.sites.toArray()
     return all.reduce((m, s) => Math.max(m, s.order), -1) + 1
   },
+
+  /**
+   * 手动排序：把整列站点按给定 id 顺序归一化为 order=0..n-1。
+   * GPT P0-1 修正：必须传入**当前全部站点的完整排列**，仅做 `update(id,{order})`，
+   * 绝不整体 `put`（避免覆盖 discovered/lastStatus/凭证等内部字段）。
+   * 事务内做最后一道防御校验：大小一致 / 无重复 / 无未知 id；不通过则整体回滚并返回错误码。
+   * 与 ADD_SITE.nextOrder 收进同一 Dexie 事务边界，避免并发产生重复 order（GPT P1-2）。
+   */
+  async reorder(orderedIds: string[]): Promise<{ ok: boolean; code?: string }> {
+    return db.transaction('rw', db.sites, async () => {
+      const all = await db.sites.toArray()
+      const dbIds = new Set(all.map((s) => s.id))
+      const input = Array.isArray(orderedIds) ? orderedIds : []
+      const seen = new Set<string>()
+      for (const id of input) {
+        if (typeof id !== 'string' || id.length === 0) return { ok: false, code: 'INVALID_SITE_ORDER' }
+        if (seen.has(id)) return { ok: false, code: 'INVALID_SITE_ORDER' }
+        seen.add(id)
+        if (!dbIds.has(id)) return { ok: false, code: 'INVALID_SITE_ORDER' }
+      }
+      if (dbIds.size !== input.length) return { ok: false, code: 'INVALID_SITE_ORDER' }
+      let i = 0
+      for (const id of input) {
+        await db.sites.update(id, { order: i })
+        i++
+      }
+      return { ok: true }
+    })
+  },
 }
 
 // 设置仓储（轻量 kv）

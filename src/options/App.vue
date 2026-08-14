@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
-import type { ExportConfig, ImportResult } from '../core/messaging/protocol'
-import type { SiteConfig, SiteStatus, CustomCaptureRecord, DiagnosticEntry } from '../shared/types'
+import type { ExportConfig, ImportResult, ReorderSitesResponse } from '../core/messaging/protocol'
+import type { SiteConfig, SiteStatus, CustomCaptureRecord, DiagnosticEntry, SiteCollectionProfile } from '../shared/types'
 import type { ProbeResult } from '../content/probe'
 import type { NetDiscoveryRequest } from '../background/netDiscovery'
 import { normalizeOrigin, isValidSiteUrl } from '../shared/util'
@@ -11,9 +11,11 @@ import { getThemeMode, setThemeMode, type ThemeMode } from '../shared/theme'
 import { getLabShowDashboard, LAB_SHOWDASHBOARD_CHANGED } from '../storage'
 import { registry } from '../adapters'
 import { statusBadge } from '../shared/format'
+import { shouldShowReauthorize } from '../core/authState'
 import SiteForm from './components/SiteForm.vue'
 import DataExplorer from './components/DataExplorer.vue'
 import UsageDashboard from './components/UsageDashboard.vue'
+import CollectionProfileCard from './components/CollectionProfileCard.vue'
 
 // GPT P0：跨层错误白名单——绝不透传任何 Error.message 原文
 // 异常消息可能包含 URL/响应片段/认证细节/内部实现，统一映射为固定中文文案。
@@ -67,11 +69,55 @@ watch(labShowDashboard, (on) => {
   if (!on && activeTab.value === 'dashboard') activeTab.value = 'settings'
 })
 
+// 顶部 Tab 仅在有「用量看板」时才存在：单一切换按钮（站点设置/用量看板互切）。
+// 去掉常驻且永远高亮的「⚙ 站点设置」按钮（默认即设置页，点击无副作用）。
+function toggleDashboardTab() {
+  activeTab.value = activeTab.value === 'settings' ? 'dashboard' : 'settings'
+}
+const dashboardTabLabel = computed(() =>
+  activeTab.value === 'settings' ? '📊 用量看板' : '⚙ 站点设置',
+)
+
 // 弹窗状态
 const formVisible = ref(false)
 const editingSite = ref<SiteConfig | null>(null)
 const helpVisible = ref(false)
 const helpUrl = chrome.runtime.getURL('README.html')
+const groupQrVisible = ref(false)
+const groupQrUrl = chrome.runtime.getURL('qrcode_1102575547.png')
+
+// 排序开关：临时编辑态，默认关闭、不持久化（GPT R1：排序结果已落库，无需持久化开关）
+const sortMode = ref(false)
+// 二级菜单唯一真值（hover/点击/键盘 都只走它；GPT P0-1）
+const moreOpen = ref<string | null>(null)
+function toggleMore(id: string) {
+  moreOpen.value = moreOpen.value === id ? null : id
+}
+function onMoreItem(_site: SiteConfig, fn: () => void) {
+  fn()
+  moreOpen.value = null // 点完收起（含展开面板项，GPT R3/P1-4）
+}
+function closeMore() {
+  moreOpen.value = null
+}
+// 首/末行边界：上移/下移按钮原生 disabled（GPT P1-2）
+function canMoveUp(site: SiteConfig): boolean {
+  return !reorderInFlight.value && sites.value.findIndex((s) => s.id === site.id) > 0
+}
+function canMoveDown(site: SiteConfig): boolean {
+  const i = sites.value.findIndex((s) => s.id === site.id)
+  return !reorderInFlight.value && i >= 0 && i < sites.value.length - 1
+}
+// 关闭排序开关时清理拖拽临时态（GPT P1-1）
+watch(sortMode, (on) => {
+  if (!on) resetDrag()
+})
+// 文档级外部点击收起菜单：单一监听，按 .more-wrap 判定（GPT P2-3）
+function onDocClick(e: MouseEvent) {
+  if (moreOpen.value && !(e.target as HTMLElement)?.closest?.('.more-wrap')) {
+    moreOpen.value = null
+  }
+}
 
 // 文件导入
 const fileInput = ref<HTMLInputElement | null>(null)
@@ -92,10 +138,80 @@ async function loadSites() {
   loading.value = true
   try {
     sites.value = await send<SiteConfig[]>('GET_SITES')
+    moreOpen.value = null // 刷新后旧 id 可能不存在，防悬空（GPT P2-2）
   } catch (e) {
     showToast(safeUiError(e))
   } finally {
     loading.value = false
+  }
+  // 并行加载采集方案模型（方案 028）；失败不阻断站点管理，降级显示「方案暂不可用」。
+  void loadProfiles()
+}
+
+// ── 站点类型与采集方案可视化（方案 028）──
+const profiles = ref<Record<string, SiteCollectionProfile>>({})
+const profilesAvailable = ref(true) // profile 接口失败时降级
+async function loadProfiles() {
+  try {
+    const res = await send<{ profiles: Record<string, SiteCollectionProfile> }>('GET_SITE_COLLECTION_PROFILES', {})
+    profiles.value = res.profiles ?? {}
+    profilesAvailable.value = true
+  } catch {
+    profilesAvailable.value = false
+  }
+}
+function profileFor(site: SiteConfig): SiteCollectionProfile | null {
+  return profiles.value[site.id] ?? null
+}
+// 独立于「自定义采集面板」的展开态，避免互相干扰（方案 028 §6 B5）。
+const profileSiteId = ref<string | null>(null)
+function toggleProfile(site: SiteConfig) {
+  profileSiteId.value = profileSiteId.value === site.id ? null : site.id
+}
+
+// ── 采集方案展示用标签/摘要（方案 028 §3/§7）──
+function typeLabel(p: SiteCollectionProfile): string {
+  switch (p.classification.family) {
+    case 'independent': return '独立接口'
+    case 'new-api-capable': return 'New API 兼容'
+    case 'one-api-compatible': return 'One API 兼容'
+    default: return '待识别'
+  }
+}
+function routeLabel(p: SiteCollectionProfile): string {
+  switch (p.classification.routeProfile) {
+    case 'standard': return '标准路径'
+    case 'fork-path': return '变体路径'
+    case 'discovered': return '网络发现'
+    default: return ''
+  }
+}
+function confLabel(p: SiteCollectionProfile): string {
+  switch (p.classification.confidence) {
+    case 'high': return '置信度：高'
+    case 'medium': return '置信度：中'
+    case 'low': return '置信度：低'
+    default: return ''
+  }
+}
+function engineLabel(p: SiteCollectionProfile): string {
+  return p.execution.engine === 'sw_lab' ? '零标签实验室' : '页面会话'
+}
+function collectionSummaryText(p: SiteCollectionProfile): string {
+  const verified = p.steps.filter((s) => s.state === 'verified').length
+  if (!p.classification.probedAt) return '待探测'
+  if (p.health.latestFailure?.reason === 'ACCOUNT_UNAUTHORIZED') return `${engineLabel(p)} · 需登录`
+  if (p.health.lastStatus === 'error') return `${engineLabel(p)} · 采集异常`
+  return `${engineLabel(p)} · 已验证 ${verified} 项`
+}
+function stepStateLabel(s: SiteCollectionProfile['steps'][number]['state']): string {
+  switch (s) {
+    case 'verified': return '已验证'
+    case 'planned': return '计划尝试'
+    case 'partial': return '部分可用'
+    case 'unsupported': return '不支持'
+    case 'unauthorized': return '需要登录'
+    case 'failed': return '异常'
   }
 }
 
@@ -143,15 +259,141 @@ async function authorizeSite(site: SiteConfig) {
     showToast('未获得该站点权限，请在 Chrome 权限弹窗中允许访问')
     return
   }
+
+  // 「去授权 / 重新授权」始终先打开原站，方便用户直接查看或恢复登录态。
+  if (isValidSiteUrl(site.baseUrl)) {
+    try {
+      await chrome.tabs.create({ url: site.baseUrl, active: true })
+    } catch {
+      // 打开失败不阻断后续授权检查，也不向 UI 暴露浏览器原始错误。
+    }
+  }
+
   try {
-    const res = await send<{ status: 'ok' | 'expired' }>('AUTHORIZE_SITE', { id: site.id })
+    const res = await send<{ status: 'ok' | 'expired' | 'indeterminate' }>('AUTHORIZE_SITE', { id: site.id })
     if (res.status === 'expired') {
       showToast('登录态已过期，正在打开原站，请登录后回到插件重新授权')
-      if (isValidSiteUrl(site.baseUrl)) chrome.tabs.create({ url: site.baseUrl })
+    } else if (res.status === 'indeterminate') {
+      showToast('暂时无法确认授权状态，请保持控制台已登录后重新检测')
+      await loadSites()
     } else {
       showToast('授权成功，登录态有效')
       await loadSites()
     }
+  } catch (e) {
+    showToast(safeUiError(e))
+  }
+}
+
+// ── 手动排序（拖拽手柄 / ▲▼ 按钮；完整集合重排，GPT P0-1 修正）──
+const dragId = ref<string | null>(null) // 当前被拖拽的站点 id
+const dragOverId = ref<string | null>(null) // 当前悬停的站点 id（用于插入指示线）
+const dragOverPos = ref<'before' | 'after'>('before') // 插入到目标之前还是之后
+const reorderInFlight = ref(false) // 是否有保存请求在途
+const reorderDirty = ref(false) // 在途期间顺序又变了 → 落库后再提交一次
+
+/** 把本地 sites 的当前顺序提交到后台（完整集合）。连续拖拽时串行化，保证最终序落库。 */
+async function commitOrder() {
+  if (reorderInFlight.value) {
+    reorderDirty.value = true
+    return
+  }
+  reorderInFlight.value = true
+  try {
+    while (true) {
+      reorderDirty.value = false
+      const orderedIds = sites.value.map((s) => s.id)
+      const res = await send<ReorderSitesResponse>('REORDER_SITES', { orderedIds })
+      if (!res.ok) {
+        showToast('排序保存失败，已恢复为服务器顺序')
+        await loadSites() // 以服务端为准，不在本地回滚旧数组（GPT P1-4）
+        break
+      }
+      if (!reorderDirty.value) break // 期间未再变化 → 结束
+    }
+  } catch (e) {
+    showToast(safeUiError(e))
+    await loadSites() // 异常同样以服务端为准
+  } finally {
+    reorderInFlight.value = false
+  }
+}
+
+/** ▲ 上移 */
+function moveUp(site: SiteConfig) {
+  const idx = sites.value.findIndex((s) => s.id === site.id)
+  if (idx <= 0) return
+  swapOrder(idx, idx - 1)
+}
+/** ▼ 下移 */
+function moveDown(site: SiteConfig) {
+  const idx = sites.value.findIndex((s) => s.id === site.id)
+  if (idx < 0 || idx >= sites.value.length - 1) return
+  swapOrder(idx, idx + 1)
+}
+function swapOrder(a: number, b: number) {
+  if (a < 0 || b < 0 || a >= sites.value.length || b >= sites.value.length) return
+  const arr = sites.value.slice()
+  const t = arr[a]
+  arr[a] = arr[b]
+  arr[b] = t
+  sites.value = arr
+  void commitOrder()
+}
+
+// ── 原生 HTML5 拖放（仅拖拽手柄可拖，整行不拖，避免干扰文本选择与按钮点击：GPT P1-3）──
+function onDragStart(e: DragEvent, site: SiteConfig) {
+  dragId.value = site.id
+  if (e.dataTransfer) {
+    e.dataTransfer.setData('text/plain', site.id)
+    e.dataTransfer.effectAllowed = 'move'
+  }
+}
+function onDragOver(e: DragEvent, site: SiteConfig) {
+  if (!dragId.value || dragId.value === site.id) return
+  e.preventDefault() // 允许作为放置目标
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  dragOverId.value = site.id
+  dragOverPos.value = e.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
+}
+function onDrop(e: DragEvent, site: SiteConfig) {
+  e.preventDefault()
+  const fromId = dragId.value
+  if (!fromId || fromId === site.id) return
+  const from = sites.value.findIndex((s) => s.id === fromId)
+  const to = sites.value.findIndex((s) => s.id === site.id)
+  if (from < 0 || to < 0) return
+  const arr = sites.value.slice()
+  const [moved] = arr.splice(from, 1)
+  const to2 = to > from ? to - 1 : to // 移除后目标在压缩数组中的新下标
+  const insertAt = dragOverPos.value === 'after' ? to2 + 1 : to2
+  arr.splice(insertAt, 0, moved)
+  sites.value = arr
+  resetDrag()
+  void commitOrder()
+}
+function onDragEnd() {
+  resetDrag()
+}
+function resetDrag() {
+  dragId.value = null
+  dragOverId.value = null
+  dragOverPos.value = 'before'
+}
+
+// 采集方案卡「立即同步」：单站触发一次采集（方案 028 §6 B5，与侧边栏刷新同源）。
+async function collectNow(site: SiteConfig) {
+  const granted = await ensureOriginPermission(site.origin)
+  if (!granted) {
+    showToast('未获得该站点权限，请在 Chrome 权限弹窗中允许访问')
+    return
+  }
+  showToast('正在采集该站点…')
+  try {
+    await send('COLLECT_NOW', { siteIds: [site.id] }, 60_000)
+    showToast('采集完成，已刷新方案状态')
+    await loadSites()
+    void loadProfiles()
   } catch (e) {
     showToast(safeUiError(e))
   }
@@ -323,7 +565,8 @@ function cancelImport() {
   pendingImport.value = null
 }
 
-function statusText(status: SiteStatus): string {
+function statusText(site: SiteConfig): string {
+  const status = site.lastStatus === 'auth_expired' && !shouldShowReauthorize(site) ? 'error' : site.lastStatus
   const info = statusBadge(status)
   return info.text
 }
@@ -481,9 +724,12 @@ async function clearCaptures(site: SiteConfig) {
 }
 
 const theme = ref<ThemeMode>('light')
-async function setTheme(mode: ThemeMode) {
-  theme.value = mode
-  await setThemeMode(mode)
+// 主题切换与侧边栏一致：点击循环 light → dark → auto → light
+const themeIcon = computed(() => (theme.value === 'dark' ? '🌙' : theme.value === 'auto' ? '🔄' : '☀️'))
+function cycleTheme() {
+  const next: ThemeMode = theme.value === 'light' ? 'dark' : theme.value === 'dark' ? 'auto' : 'light'
+  theme.value = next
+  setThemeMode(next)
 }
 
 onMounted(async () => {
@@ -491,6 +737,7 @@ onMounted(async () => {
   theme.value = await getThemeMode()
   labShowDashboard.value = await getLabShowDashboard()
   chrome.runtime.onMessage.addListener(onOptionsNotify)
+  document.addEventListener('click', onDocClick)
   // Phase C：尊重 sidebar「📊 用量看板」按钮写入的 session storage 提示
   try {
     const sess = await chrome.storage.session?.get?.('aihub.optsTab')
@@ -507,6 +754,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   chrome.runtime.onMessage.removeListener(onOptionsNotify)
+  document.removeEventListener('click', onDocClick)
 })
 </script>
 
@@ -515,11 +763,30 @@ onUnmounted(() => {
     <header class="topbar">
       <div class="logo">AI</div>
       <span class="title">AI 中转站用量看板 · 设置</span>
-      <nav class="tabs">
-        <button :class="{ on: activeTab === 'settings' }" @click="activeTab = 'settings'">⚙ 站点设置</button>
-        <button v-if="labShowDashboard" :class="{ on: activeTab === 'dashboard' }" @click="activeTab = 'dashboard'">📊 用量看板</button>
+      <nav class="tabs" v-if="labShowDashboard">
+        <button
+          class="tab-toggle"
+          :class="{ on: activeTab === 'dashboard' }"
+          :title="activeTab === 'settings' ? '打开用量看板' : '返回站点设置'"
+          @click="toggleDashboardTab"
+        >{{ dashboardTabLabel }}</button>
       </nav>
-      <button class="btn help-btn" title="查看使用说明" @click="openHelp">❔ 使用说明</button>
+      <div class="topbar-actions">
+        <a
+          class="btn feedback-btn"
+          href="https://docs.qq.com/sheet/DZG1GaENEc2pFYVJy?tab=BB08J2"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="打开问题反馈表"
+        >📝 问题反馈</a>
+        <div class="group-wrap" @mouseenter="groupQrVisible = true" @mouseleave="groupQrVisible = false">
+          <button class="btn group-btn" title="加入 QQ 交流群（鼠标悬停显示二维码）">👥 交流群：1102575547</button>
+          <div v-if="groupQrVisible" class="group-pop" @mouseenter="groupQrVisible = true" @mouseleave="groupQrVisible = false">
+            <img :src="groupQrUrl" alt="AI Hub 插件交流群二维码" class="group-qr-img" />
+          </div>
+        </div>
+        <button class="btn help-btn" title="查看使用说明" @click="openHelp">❔ 使用说明</button>
+      </div>
     </header>
 
     <main class="opt-main">
@@ -533,11 +800,23 @@ onUnmounted(() => {
         <button class="btn primary" @click="openAdd">＋ 添加站点</button>
         <button class="btn" @click="exportConfig">⇪ 全量备份</button>
         <button class="btn" @click="triggerImport">⇩ 导入备份</button>
-        <div class="theme-switch">
-          <button :class="{ on: theme === 'light' }" title="白天" @click="setTheme('light')">☀️</button>
-          <button :class="{ on: theme === 'dark' }" title="黑夜" @click="setTheme('dark')">🌙</button>
-          <button :class="{ on: theme === 'auto' }" title="跟随系统" @click="setTheme('auto')">🔄</button>
-        </div>
+        <!-- 排序开关：开启后才显示拖拽手柄与 ▲▼（GPT R1：不持久化） -->
+        <label class="sort-switch" :class="{ on: sortMode }">
+          <span class="sort-switch-label">手动排序</span>
+          <button
+            type="button"
+            class="switch"
+            role="switch"
+            :aria-checked="sortMode"
+            aria-label="启用手动排序（开启后可拖拽或上下移动站点顺序）"
+            @click="sortMode = !sortMode"
+          ><span class="knob"></span></button>
+        </label>
+        <button
+          class="cycle-theme"
+          :title="themeIcon + ' 主题（点击切换）'"
+          @click="cycleTheme"
+        >{{ themeIcon }}</button>
         <input
           ref="fileInput"
           type="file"
@@ -546,6 +825,7 @@ onUnmounted(() => {
           @change="handleFile"
         />
       </div>
+      <div v-if="sortMode" class="sort-hint">🔃 排序模式已开启：拖动 ⠿ 或点 ▲▼ 调整顺序，保存自动生效。</div>
 
       <div v-if="loading" class="state-msg">加载中…</div>
 
@@ -556,7 +836,31 @@ onUnmounted(() => {
       </div>
 
       <template v-else>
-        <div v-for="site in sites" :key="site.id" class="site-row" :class="{ 'site-disabled': !site.enabled }">
+        <div
+          v-for="(site, idx) in sites"
+          :key="site.id"
+          class="site-row"
+          :class="{
+            'site-disabled': !site.enabled,
+            dragging: dragId === site.id,
+            'drop-before': dragOverId === site.id && dragOverPos === 'before',
+            'drop-after': dragOverId === site.id && dragOverPos === 'after',
+            'last-rows': idx >= sites.length - 2,
+          }"
+          @dragover="sortMode && onDragOver($event, site)"
+          @drop="sortMode && onDrop($event, site)"
+        >
+          <!-- 拖拽手柄（仅排序模式显示；仅此元素可拖，整行不拖以免干扰文本选择与按钮点击：GPT P1-3） -->
+          <div
+            v-if="sortMode"
+            class="drag-handle"
+            draggable="true"
+            role="button"
+            :aria-label="'拖拽排序 ' + site.name"
+            title="拖拽排序"
+            @dragstart="onDragStart($event, site)"
+            @dragend="onDragEnd"
+          >⠿</div>
           <div class="avatar" :style="{ background: site.color }">
             {{ site.name.charAt(0).toUpperCase() }}
           </div>
@@ -569,46 +873,110 @@ onUnmounted(() => {
             <div class="meta">
               {{ site.origin.replace('https://', '') }} · 凭证：Cookie 会话 ·
               <span :class="site.lastStatus === 'ok' ? 'perm' : 'perm no'">
-                {{ statusText(site.lastStatus) }}
+                {{ statusText(site) }}
               </span>
             </div>
+            <!-- 站点类型与采集方案常驻摘要（方案 028）：始终可见，不放进更多菜单 -->
+            <div class="collect-summary" v-if="profileFor(site)">
+              <span class="chip chip-type" title="自动识别的站点类型（与配置适配器区分）">{{ typeLabel(profileFor(site)!) }}</span>
+              <span class="chip" v-if="routeLabel(profileFor(site)!)">{{ routeLabel(profileFor(site)!) }}</span>
+              <span class="chip" v-if="confLabel(profileFor(site)!)" :title="'探测置信度'">{{ confLabel(profileFor(site)!) }}</span>
+              <span class="chip chip-engine" :title="'采集引擎与运行态'">{{ collectionSummaryText(profileFor(site)!) }}</span>
+              <button
+                class="mini link"
+                :class="profileSiteId === site.id ? 'accent' : ''"
+                :aria-expanded="profileSiteId === site.id"
+                :aria-controls="`profile-panel-${site.id}`"
+                @click="toggleProfile(site)"
+              >查看方案</button>
+            </div>
+            <div class="collect-summary muted" v-else-if="!profilesAvailable">采集方案暂不可用</div>
+            <div class="collect-summary muted" v-else>待探测</div>
           </div>
           <div class="ops">
-            <!-- 启用/禁用开关 -->
+            <!-- 手动排序：▲▼ 键盘可操作入口（仅排序模式显示；首/末行原生 disabled，GPT P1-2） -->
+            <template v-if="sortMode">
+              <button
+                class="mini move-btn"
+                :title="'上移 ' + site.name"
+                aria-label="上移"
+                @click="moveUp(site)"
+                :disabled="!canMoveUp(site)"
+              >▲</button>
+              <button
+                class="mini move-btn"
+                :title="'下移 ' + site.name"
+                aria-label="下移"
+                @click="moveDown(site)"
+                :disabled="!canMoveDown(site)"
+              >▼</button>
+            </template>
+            <!-- 启用/禁用：动作动词文案，明确可点击（GPT 需求③） -->
             <button
               class="mini"
               :class="site.enabled ? '' : 'accent'"
-              :title="site.enabled ? '点击禁用（不采集、不在侧边栏展示）' : '点击启用'"
+              :title="site.enabled ? '点击禁用该站点（不采集、不在侧边栏展示）' : '点击启用该站点'"
               @click="toggleEnabled(site)"
             >
-              {{ site.enabled ? '● 运行中' : '○ 已停用' }}
+              {{ site.enabled ? '禁用' : '启用' }}
             </button>
-            <button
-              v-if="site.lastStatus !== 'ok'"
-              class="mini accent"
-              @click="authorizeSite(site)"
-            >
-              去授权
-            </button>
-            <button v-else class="mini" @click="authorizeSite(site)">重新授权</button>
-            <button class="mini" @click="discoverEndpoints(site)">探测接口</button>
-            <button class="mini" @click="discoverViaNetwork(site)">网络发现</button>
             <button class="mini" @click="openEdit(site)">编辑</button>
-            <button class="mini danger" @click="deleteSite(site)">删除</button>
             <button
               class="mini"
-              :class="expandedSiteId === site.id ? 'accent' : ''"
-              @click="toggleCustom(site)"
+              :class="site.lastStatus !== 'ok' ? 'accent' : ''"
+              @click="authorizeSite(site)"
+            >{{ site.lastStatus !== 'ok' ? '去授权' : '重新授权' }}</button>
+            <!-- 二级菜单：高级操作 hover/点击 展开（moreOpen 唯一真值，GPT P0-1） -->
+            <div
+              class="more-wrap"
+              :class="{ open: moreOpen === site.id }"
+              @mouseenter="moreOpen = site.id"
+              @mouseleave="moreOpen = null"
+              @keydown.esc="moreOpen = null"
             >
-              自定义采集
-            </button>
-            <button
-              class="mini"
-              :class="diagSiteId === site.id ? 'accent' : ''"
-              @click="toggleDiag(site)"
-            >
-              诊断日志
-            </button>
+              <button
+                class="mini more-trigger"
+                :aria-label="'更多操作 ' + site.name"
+                :aria-expanded="moreOpen === site.id"
+                :aria-controls="`site-more-menu-${site.id}`"
+                @click="toggleMore(site.id)"
+              >⋯ 更多</button>
+              <div
+                class="submenu"
+                :id="`site-more-menu-${site.id}`"
+                v-show="moreOpen === site.id"
+              >
+                <button class="mini" @click="onMoreItem(site, () => discoverEndpoints(site))">探测接口</button>
+                <button class="mini" @click="onMoreItem(site, () => discoverViaNetwork(site))">网络发现</button>
+                <div class="submenu-sep"></div>
+                <button
+                  class="mini"
+                  :class="expandedSiteId === site.id ? 'accent' : ''"
+                  :aria-expanded="expandedSiteId === site.id"
+                  @click="onMoreItem(site, () => toggleCustom(site))"
+                >自定义采集</button>
+                <button
+                  class="mini"
+                  :class="diagSiteId === site.id ? 'accent' : ''"
+                  :aria-expanded="diagSiteId === site.id"
+                  @click="onMoreItem(site, () => toggleDiag(site))"
+                >诊断日志</button>
+                <div class="submenu-sep"></div>
+                <button class="mini danger" @click="onMoreItem(site, () => deleteSite(site))">删除</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 采集方案卡（方案 028）：独立于自定义采集面板展开 -->
+          <div v-if="profileSiteId === site.id && profileFor(site)" :id="`profile-panel-${site.id}`" class="profile-panel">
+            <CollectionProfileCard
+              :profile="profileFor(site)!"
+              @reprobe="discoverEndpoints(site)"
+              @diagnose="toggleDiag(site)"
+              @edit="openEdit(site)"
+              @reauth="authorizeSite(site)"
+              @sync="collectNow(site)"
+            />
           </div>
 
           <!-- 自定义采集面板 -->
@@ -749,6 +1117,8 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <!-- 交流群二维码弹窗已改为按钮 hover 弹层（见 topbar-actions 内 group-wrap） -->
+
     <Transition name="toast">
       <div v-if="toast" class="toast">{{ toast }}</div>
     </Transition>
@@ -879,28 +1249,88 @@ body {
   gap: 10px;
   margin-bottom: 20px;
 }
-.theme-switch {
+/* 排序开关（GPT R1：临时编辑态，不持久化） */
+.sort-switch {
   display: inline-flex;
-  margin-left: auto;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  overflow: hidden;
-}
-.theme-switch button {
-  border: none;
-  background: var(--panel);
-  padding: 8px 12px;
-  font-size: 13px;
-  line-height: 1;
+  align-items: center;
+  gap: 8px;
+  margin-left: 4px;
   cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.sort-switch-label {
+  font-size: 12px;
   color: var(--sub);
 }
-.theme-switch button.on {
-  background: var(--brand);
-  color: #fff;
+.sort-switch.on .sort-switch-label {
+  color: var(--brand-text);
+  font-weight: 600;
 }
-.theme-switch button + button {
-  border-left: 1px solid var(--line);
+.switch {
+  position: relative;
+  width: 38px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel-soft);
+  padding: 0;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  flex-shrink: 0;
+}
+.sort-switch.on .switch {
+  background: var(--brand);
+  border-color: var(--brand);
+}
+.knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 0.15s;
+}
+.sort-switch.on .knob {
+  transform: translateX(18px);
+}
+.switch:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+.sort-hint {
+  font-size: 12px;
+  color: var(--brand-text);
+  background: var(--brand-soft);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 14px;
+  line-height: 1.6;
+}
+/* 主题切换：单按钮点击循环（与侧边栏一致） */
+.cycle-theme {
+  margin-left: auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--sub);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+.cycle-theme:hover {
+  background: var(--panel-soft);
+  color: var(--text);
+  border-color: var(--line);
 }
 .btn {
   padding: 8px 16px;
@@ -972,6 +1402,85 @@ body {
 }
 .site-row.site-disabled:hover {
   opacity: 0.75;
+}
+/* 拖拽排序视觉 */
+.drag-handle {
+  cursor: grab;
+  color: var(--sub);
+  font-size: 16px;
+  line-height: 1;
+  padding: 4px 6px;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  flex-shrink: 0;
+  border-radius: 6px;
+  transition: background 0.12s, color 0.12s;
+}
+.drag-handle:hover {
+  background: var(--panel-soft);
+  color: var(--text);
+}
+.drag-handle:active {
+  cursor: grabbing;
+}
+.site-row.dragging {
+  opacity: 0.4;
+}
+/* 插入指示线：拖到目标上半部=上方插入，下半部=下方插入（box-shadow 内描边，避免布局抖动） */
+.site-row.drop-before {
+  box-shadow: inset 0 2px 0 0 var(--brand);
+}
+.site-row.drop-after {
+  box-shadow: inset 0 -2px 0 0 var(--brand);
+}
+.move-btn {
+  font-weight: 700;
+}
+/* 二级菜单（moreOpen 唯一真值，v-show 控制；GPT P0-1） */
+.more-wrap {
+  position: relative;
+}
+.more-trigger {
+  white-space: nowrap;
+}
+.submenu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: absolute;
+  right: 0;
+  /* 消除触发按钮与菜单之间的空隙，hover 可连续进入菜单。 */
+  top: calc(100% - 1px);
+  z-index: 30;
+  min-width: 128px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  box-shadow: 0 8px 24px var(--shadow-lg);
+  padding: 4px;
+}
+/* 末两行向上展开，避免视口底部溢出（GPT P2-4） */
+.last-rows .submenu {
+  top: auto;
+  bottom: calc(100% - 1px);
+}
+.submenu .mini {
+  width: 100%;
+  text-align: left;
+  justify-content: flex-start;
+  margin: 0;
+}
+.submenu-sep {
+  height: 1px;
+  background: var(--line);
+  margin: 3px 2px;
+}
+/* 焦点可见轮廓（GPT P2-5） */
+.more-trigger:focus-visible,
+.submenu .mini:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
 }
 .avatar {
   width: 36px;
@@ -1057,6 +1566,42 @@ body {
 .mini:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+/* 采集方案常驻摘要（方案 028） */
+.mini.link {
+  border: none;
+  background: transparent;
+  color: var(--brand-text);
+  padding: 2px 4px;
+  font-weight: 600;
+}
+.mini.link:hover {
+  text-decoration: underline;
+}
+.collect-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+}
+.collect-summary.muted {
+  color: var(--sub);
+  font-size: 11px;
+}
+.chip-type {
+  border-color: var(--brand);
+  color: var(--brand-text);
+}
+.chip-engine {
+  background: var(--panel-soft);
+}
+/* 采集方案展开卡（方案 028） */
+.profile-panel {
+  flex-basis: 100%;
+  border-top: 1px dashed var(--line);
+  padding-top: 12px;
+  margin-top: 2px;
 }
 
 /* 自定义采集面板 */
@@ -1241,8 +1786,18 @@ body {
 }
 
 /* 使用说明入口与弹窗 */
-.help-btn {
+.topbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   margin-left: auto;
+}
+.group-btn {
+  white-space: nowrap;
+}
+.feedback-btn {
+  white-space: nowrap;
+  text-decoration: none;
 }
 .tabs {
   display: inline-flex;
@@ -1299,7 +1854,34 @@ body {
   min-height: 0;
   background: #fff;
 }
-
+/* 交流群按钮 hover 弹层 */
+.group-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.group-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 120;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px var(--shadow-lg);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 300px;
+}
+.group-qr-img {
+  display: block;
+  width: 280px;
+  height: auto;
+  border-radius: 8px;
+  background: #fff;
+}
 .toast {
   position: fixed;
   bottom: 24px;
