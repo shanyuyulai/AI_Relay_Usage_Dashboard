@@ -1,6 +1,6 @@
 {
   "name": "ai-hub",
-  "version": "0.3.10",
+  "version": "0.3.13",
   "private": true,
   "type": "module",
   "description": "AI 中转站用量看板 — Chrome MV3 侧边栏插件",

@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
 import type { DashboardData, CollectResultMsg, CurrencyTotal } from '../core/messaging/protocol'
-import type { SiteConfig } from '../shared/types'
+import type { SiteConfig, Snapshot } from '../shared/types'
 import { getThemeMode, setThemeMode, type ThemeMode } from '../shared/theme'
 import { fmtBalance, fmtTokens, fmtCompactTokens, fmtNum, fmtTime, fmtMs, fmtMsClass, statusBadge } from '../shared/format'
 import { registry } from '../adapters'
@@ -10,6 +10,8 @@ import { ensureOriginPermission, ensureOriginPermissions } from '../shared/permi
 import { isValidSiteUrl } from '../shared/util'
 import { shouldShowReauthorize } from '../core/authState'
 import { getLabShowDashboard, LAB_SHOWDASHBOARD_CHANGED } from '../storage/labConfig'
+import { fmtTodayCost, fmtTodayCostParts } from '../shared/recharge'
+import { AIHUB_SETTINGS_CHANGED } from '../shared/dashboardSettings'
 import SiteDetail from './components/SiteDetail.vue'
 
 const loading = ref(false)
@@ -76,6 +78,9 @@ const totalTodayRequests = computed(() => {
 
 const primaryTotal = computed<CurrencyTotal | null>(() => totalList.value[0] ?? null)
 const otherTotals = computed<CurrencyTotal[]>(() => totalList.value.slice(1))
+
+// 真实花费开关（来自 GET_DASHBOARD 响应 settings；缺省 false）
+const calcRealCost = computed(() => dashboard.value?.settings?.calcRealCost === true)
 
 async function loadDashboard() {
   loading.value = true
@@ -189,6 +194,16 @@ function todayCostSrcTitle(src: string | null | undefined): string {
   if (src === 'logs') return '今日使用金额来源：当日用量明细日志（降级）'
   return ''
 }
+// 今日花费「分段」包装（侧栏 sc-metrics 用）：把 RMB 部分单独缩小字号渲染
+function todayCostParts(site: SiteConfig, latest: Snapshot | undefined) {
+  return fmtTodayCostParts(
+    latest?.todayCost ?? null,
+    latest?.currency ?? null,
+    site.rechargeRate ?? null,
+    calcRealCost.value,
+  )
+}
+
 // 指标时间窗口标注（方案 §1.2）：calendar_day=自然日 / rolling_24h=近24h
 function usageWindowLabel(w: string | null | undefined): string {
   if (w === 'calendar_day') return '日'
@@ -232,6 +247,9 @@ function onRuntimeMessage(msg: { type?: string; detail?: string; enabled?: boole
     notice.value = msg.detail ?? '后台采集即将在最小化窗口进行（不打断你的操作），采完自动关闭'
     if (noticeTimer != null) clearTimeout(noticeTimer)
     noticeTimer = window.setTimeout(() => (notice.value = ''), 9000)
+  } else if (msg?.type === AIHUB_SETTINGS_CHANGED) {
+    // 设置页切换「计算真实花费 / 极简面板显示今日花费」：实时刷新今日花费展示
+    void loadDashboard()
   }
 }
 
@@ -378,7 +396,10 @@ onUnmounted(() => {
                   今日使用
                   <span v-if="s.latest?.todayCostSource" class="src" :title="todayCostSrcTitle(s.latest.todayCostSource)">{{ todayCostSrcLabel(s.latest.todayCostSource) }}</span>
                 </div>
-                <div class="v">{{ fmtBalance(s.latest?.todayCost ?? null, s.latest?.currency ?? null) }}</div>
+                <div class="v">
+                  <span>{{ todayCostParts(s.site, s.latest).main }}</span>
+                  <span v-if="todayCostParts(s.site, s.latest).realRmb" class="cost-real"> / ¥{{ todayCostParts(s.site, s.latest).realRmb }}</span>
+                </div>
               </div>
               <div class="m">
                 <div class="k">
@@ -716,7 +737,8 @@ body {
 }
 .sc-metrics {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* 余额 / 今日使用（加宽以容纳 "站点币 / ¥真实RMB" 两段）/ 累计 Token */
+  grid-template-columns: 1fr 1.35fr 1fr;
   margin-top: 11px;
   border-top: 1px dashed var(--line);
   padding-top: 10px;
@@ -770,6 +792,14 @@ body {
 .m .v.is-null {
   color: var(--sub);
   font-weight: 400;
+}
+/* 「/ ¥10.340」真实消费部分：单独小字号，避免挤压今日使用主数字 */
+.m .v .cost-real {
+  font-size: 10px;
+  color: var(--sub);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  margin-left: 2px;
 }
 .sc-foot {
   display: flex;

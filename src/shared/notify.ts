@@ -13,10 +13,10 @@ export type NotifyMode = 'system' | 'optionsOnly' | 'dailyFirst' | 'off'
 const NOTIFY_MODE_KEY = 'aihub.notifyMode'
 const NOTIFY_LAST_DATE_KEY = 'aihub.notifyLastDate'
 
-/** 读取当前通知档位，缺省回退到 'system'（保持现有行为）。 */
+/** 读取当前通知档位，缺省回退到 'dailyFirst'（新装/未设置用户默认每天首次采集才通知；已设置用户原值不变）。 */
 export async function resolveNotifyMode(): Promise<NotifyMode> {
   const v = await settingsRepo.get<NotifyMode>(NOTIFY_MODE_KEY)
-  return v === 'system' || v === 'optionsOnly' || v === 'dailyFirst' || v === 'off' ? v : 'system'
+  return v === 'system' || v === 'optionsOnly' || v === 'dailyFirst' || v === 'off' ? v : 'dailyFirst'
 }
 
 function todayKey(): string {

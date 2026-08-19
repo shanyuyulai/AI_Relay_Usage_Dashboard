@@ -4,6 +4,8 @@ import { send, MessagingError } from '../../core/messaging/client'
 import { normalizeOrigin, isValidSiteUrl } from '../../shared/util'
 import { registry } from '../../adapters'
 import type { SiteConfig } from '../../shared/types'
+import { dashboardSettings } from '../../shared/dashboardSettings'
+import { parseRechargeRate } from '../../shared/recharge'
 
 const props = defineProps<{
   visible: boolean
@@ -24,7 +26,7 @@ const CURRENCIES = [
   { id: 'EUR', label: 'EUR（€）' },
 ]
 
-const form = ref({ name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD' })
+const form = ref({ name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', rechargeRate: '' })
 const formError = ref('')
 const submitting = ref(false)
 
@@ -44,9 +46,10 @@ watch(
         baseUrl: props.site.baseUrl,
         adapter: props.site.adapter,
         currency: props.site.currency || 'USD',
+        rechargeRate: props.site.rechargeRate ?? '',
       }
     } else {
-      form.value = { name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD' }
+      form.value = { name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', rechargeRate: '' }
     }
   },
 )
@@ -55,10 +58,13 @@ watch(
 async function doSave(origin: string) {
   submitting.value = true
   try {
+    // 充值比例：空串 → null（handler 删除该字段）；否则传 trim 后的原始写法
+    const rr = form.value.rechargeRate.trim()
+    const rechargeRate = rr ? rr : null
     if (props.site) {
       await send('UPDATE_SITE', {
         id: props.site.id,
-        patch: { name: form.value.name, baseUrl: form.value.baseUrl, currency: form.value.currency },
+        patch: { name: form.value.name, baseUrl: form.value.baseUrl, currency: form.value.currency, rechargeRate },
       })
     } else {
       await send<{ siteId: string }>('ADD_SITE', {
@@ -66,6 +72,7 @@ async function doSave(origin: string) {
         name: form.value.name,
         baseUrl: form.value.baseUrl,
         currency: form.value.currency,
+        rechargeRate: rechargeRate ?? undefined,
       })
     }
     emit('submitted')
@@ -90,6 +97,13 @@ function handleSubmit() {
   // P0-1：主 UX 边界显式校验协议白名单，给出清晰报错（不依赖下方 normalizeOrigin 的间接拦截）
   if (!isValidSiteUrl(form.value.baseUrl)) {
     formError.value = '面板地址仅支持 http/https 链接（如 https://example.com）'
+    return
+  }
+
+  // 充值比例校验（仅在开启「计算真实花费」且用户填写时）：trim 后空串视为清空，否则必须能被 parseRechargeRate 解析
+  const rr = form.value.rechargeRate.trim()
+  if (rr && parseRechargeRate(rr) == null) {
+    formError.value = '充值比例格式无效，示例 10 或 1:1.1'
     return
   }
 
@@ -160,6 +174,18 @@ function handleSubmit() {
         <select v-model="form.currency">
           <option v-for="c in CURRENCIES" :key="c.id" :value="c.id">{{ c.label }}</option>
         </select>
+      </div>
+
+      <div v-if="dashboardSettings.calcRealCost" class="f">
+        <label>充值比例</label>
+        <input
+          v-model="form.rechargeRate"
+          placeholder="如 10 或 1:1.1"
+          @keyup.enter="handleSubmit"
+        />
+        <div class="f-hint">
+          充值 1 人民币到账多少本站货币。例如填写 <b>10</b> 表示 1 元到账 10 美刀；填写 <b>1:1.1</b> 表示 1 元到账 1.1 美刀。留空则清除已设比例。
+        </div>
       </div>
 
       <div v-if="!isEdit" class="steps">

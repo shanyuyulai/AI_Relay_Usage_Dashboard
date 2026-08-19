@@ -1,11 +1,14 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
-import type { GetDashboardSummaryResponse, DashboardSummaryItem } from '../core/messaging/protocol'
+import type { GetDashboardSummaryResponse, DashboardSummaryItem, DashboardSettings } from '../core/messaging/protocol'
 import { fmtBalance } from '../shared/format'
 import { isValidSiteUrl } from '../shared/util'
+import { fmtTodayCost } from '../shared/recharge'
+import { AIHUB_SETTINGS_CHANGED } from '../shared/dashboardSettings'
 
 const items = ref<DashboardSummaryItem[]>([])
+const settings = ref<DashboardSettings>({ calcRealCost: false, showTodayCostInPopup: false })
 const loading = ref(true)
 const error = ref('')
 
@@ -40,11 +43,17 @@ async function load() {
   try {
     const res = await send<GetDashboardSummaryResponse>('GET_DASHBOARD_SUMMARY', {})
     items.value = res.items
+    settings.value = res.settings
   } catch (e) {
     error.value = e instanceof MessagingError ? e.message : '加载失败'
   } finally {
     loading.value = false
   }
+}
+
+function onRuntimeMessage(msg: { type?: string }) {
+  // 设置页切换「计算真实花费 / 极简面板显示今日花费」后，实时刷新极简面板
+  if (msg?.type === AIHUB_SETTINGS_CHANGED) void load()
 }
 
 async function openFull() {
@@ -64,6 +73,11 @@ async function openFull() {
 
 onMounted(() => {
   load()
+  chrome.runtime.onMessage.addListener(onRuntimeMessage)
+})
+
+onUnmounted(() => {
+  chrome.runtime.onMessage.removeListener(onRuntimeMessage)
 })
 </script>
 
@@ -80,14 +94,23 @@ onMounted(() => {
 
     <ul v-else class="pop-list">
       <li v-for="it in items" :key="it.siteId" class="pop-row">
-        <div class="pop-name">
-          <span class="dot" :class="'st-' + it.status"></span>
-          <a class="pop-link" :href="safeHref(it)" target="_blank" rel="noopener noreferrer" :title="`打开 ${it.name}`">{{ it.name }}</a>
+        <!-- 第一行：左侧状态圆点 + 站点名称，右侧余额 -->
+        <div class="pop-row-main">
+          <div class="pop-name">
+            <span class="dot" :class="'st-' + it.status"></span>
+            <a class="pop-link" :href="safeHref(it)" target="_blank" rel="noopener noreferrer" :title="`打开 ${it.name}`">{{ it.name }}</a>
+          </div>
+          <div class="pop-bal" :class="balClass(it)">
+            {{ it.balance == null ? '—' : fmtBalance(it.balance, it.currency) }}
+          </div>
         </div>
-        <div class="pop-bal" :class="balClass(it)">
-          {{ it.balance == null ? '—' : fmtBalance(it.balance, it.currency) }}
+        <!-- 第二行：左侧更新时间，右侧今日花费（设置开启才显示） -->
+        <div v-if="it.updatedAt || settings.showTodayCostInPopup" class="pop-row-sub">
+          <div class="pop-sub">{{ relTime(it.updatedAt) }}</div>
+          <div v-if="settings.showTodayCostInPopup" class="pop-today">
+            {{ fmtTodayCost(it.todayCost ?? null, it.currency, it.rechargeRate ?? null, settings.calcRealCost) }}
+          </div>
         </div>
-        <div v-if="it.updatedAt" class="pop-sub">{{ relTime(it.updatedAt) }}</div>
       </li>
     </ul>
 
@@ -146,18 +169,31 @@ onMounted(() => {
   padding: 0;
 }
 .pop-row {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  grid-template-areas: 'name bal' 'sub bal';
-  column-gap: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   padding: 7px 0;
   border-top: 1px solid var(--line);
 }
 .pop-row:first-child {
   border-top: none;
 }
+/* 第一行 / 第二行：左右两端对齐（站点名+余额；更新时间+今日花费） */
+.pop-row-main,
+.pop-row-sub {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.pop-row-sub {
+  font-size: 11px;
+  color: var(--sub);
+}
 .pop-name {
-  grid-area: name;
+  flex: 1;
+  min-width: 0;
   font-size: 13px;
   display: flex;
   align-items: center;
@@ -165,7 +201,6 @@ onMounted(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  min-width: 0;
 }
 .pop-link {
   color: inherit;
@@ -181,11 +216,11 @@ onMounted(() => {
   text-decoration: underline;
 }
 .pop-bal {
-  grid-area: bal;
   font-size: 13px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   text-align: right;
+  flex-shrink: 0;
 }
 .pop-bal.bal-high {
   color: var(--ok);
@@ -201,9 +236,19 @@ onMounted(() => {
   font-weight: 400;
 }
 .pop-sub {
-  grid-area: sub;
   font-size: 11px;
   color: var(--sub);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.pop-today {
+  font-size: 11px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .dot {
   width: 7px;

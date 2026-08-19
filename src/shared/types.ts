@@ -146,6 +146,12 @@ export interface SiteConfig {
    * 仅同源、GET only，用于扩展采集本站任意可读接口供后续分析（与余额同步解耦）。
    */
   customRequests?: string
+  /**
+   * 充值比例（站点货币 / 1 人民币）。如 "10" 或 "1:1.1"。
+   * 含义：充值 1 人民币到账多少站点计价货币。仅用于真实花费换算展示，非凭证。
+   * 解析与校验统一走 `parseRechargeRate`（shared/recharge.ts），保存原始写法（trim 后）。
+   */
+  rechargeRate?: string
 }
 
 export type CollectErrorKind =

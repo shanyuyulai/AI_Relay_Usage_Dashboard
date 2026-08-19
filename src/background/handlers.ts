@@ -31,6 +31,8 @@ import { collectAllInTabs, collectSpecificInTabs, probeSessionInTab, captureCust
 import { applyInterval } from './scheduler'
 import { registry } from '../adapters'
 import { normalizeOrigin, isValidSiteUrl, todayKey, dateKey, dateKeyInTz, HUBWAY_TZ, HUBWAY_TZ_OFFSET_MIN, isValidDateKey } from '../shared/util'
+import { parseRechargeRate } from '../shared/recharge'
+import { readDashboardSettings } from '../shared/dashboardSettings'
 import type {
   CollectResultMsg,
   SiteSummary,
@@ -275,7 +277,7 @@ export const handlers: Record<string, Handler> = {
         t.sites += 1
       }
     }
-    const data: DashboardData = { sites: summaries, totals }
+    const data: DashboardData = { sites: summaries, totals, settings: await readDashboardSettings() }
     return data
   },
 
@@ -329,6 +331,11 @@ export const handlers: Record<string, Handler> = {
     const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] })
     if (!granted) throw new Error('未获得该站点的 host 权限，请在设置页添加并授权')
     const id = crypto.randomUUID()
+    // 充值比例（新建可预填）：trim 后严格校验，非法直接报错（不落库脏值）
+    const rrRaw = (typeof payload.rechargeRate === 'string' ? payload.rechargeRate : '').trim()
+    if (rrRaw && parseRechargeRate(rrRaw) == null) {
+      throw new Error('充值比例格式无效，示例 10 或 1:1.1')
+    }
     const site: SiteConfig = {
       id,
       name: payload.name || origin,
@@ -342,6 +349,7 @@ export const handlers: Record<string, Handler> = {
       lastCollectAt: null,
       lastStatus: 'unknown',
       currency: payload.currency || 'USD',
+      ...(rrRaw ? { rechargeRate: rrRaw } : {}),
     }
     await siteRepo.add(site)
     await credentialRepo.setAuthorized(id, false) // 尚未授权
@@ -371,6 +379,18 @@ export const handlers: Record<string, Handler> = {
     // 绝不在此暴露 discovered/lastStatus/lastCollectAt 等内部派生字段，防止 UI 误覆盖。
     // 新增可编辑字段只需在此数组追加，避免「忘了加白名单 → 配置丢失」的复发 bug。
     if (payload.patch.customRequests != null) patch.customRequests = payload.patch.customRequests
+    // 充值比例：白名单可编辑；清空语义用 null / 空串 → 删除字段（Dexie update 遇 undefined 即删）
+    if (payload.patch.rechargeRate !== undefined) {
+      if (payload.patch.rechargeRate === null || typeof payload.patch.rechargeRate !== 'string' || payload.patch.rechargeRate.trim().length === 0) {
+        patch.rechargeRate = undefined
+      } else {
+        const rr = payload.patch.rechargeRate.trim()
+        if (parseRechargeRate(rr) == null) {
+          throw new Error('充值比例格式无效，示例 10 或 1:1.1')
+        }
+        patch.rechargeRate = rr
+      }
+    }
     await siteRepo.update(payload.id, patch)
     void refreshCorsRules() // 若 CORS 放行开启，同步启用/禁用规则
     broadcastSitesChanged() // 通知侧边栏实时刷新
@@ -862,9 +882,13 @@ export const handlers: Record<string, Handler> = {
           currency: snap ? snap.currency : null,
           updatedAt: snap ? snap.takenAt : null,
           status: !snap ? 'no_data' : snap.status,
+          // 今日花费换算所需最小数据（极简面板本地换算，避免二次请求）
+          todayCost: snap ? (snap.todayCost ?? null) : null,
+          rechargeRate: site.rechargeRate ?? null,
         }
       })
-    return { items }
+    const settings = await readDashboardSettings()
+    return { items, settings }
   },
 
   /**

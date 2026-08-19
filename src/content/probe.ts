@@ -757,56 +757,120 @@ export async function collectInPage(
     }
   }
   const pageAuthContext = buildPageAuthContext()
+  // 采集重试基础设施（自包含，页面主世界可用）：指数退避 + 抖动 + 单站总预算。
+  // 仅重试瞬时/可恢复故障：超时 / 网络错误 / 5xx / 429(尊重 Retry-After)；绝不重试鉴权失效/路径变更/语义空。
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+  const SITE_FETCH_BUDGET_MS = 45000 // 单站全部 fetch 的总预算（线缆层 COLLECT_NOW 超时 60s，预留 SW 开销与标签页等待）
+  const COLLECT_DEADLINE = Date.now() + SITE_FETCH_BUDGET_MS
+  function parseRetryAfter(res: any): number {
+    const h = res && res.headers && res.headers.get ? res.headers.get('retry-after') : null
+    if (!h) return 0
+    const sec = parseInt(h, 10)
+    if (!Number.isNaN(sec)) return sec * 1000
+    const d = Date.parse(h)
+    if (!Number.isNaN(d)) return Math.max(0, d - Date.now())
+    return 0
+  }
+
   async function fetchJson(url: string): Promise<{ status: number; json: any; isJson: boolean }> {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 6000)
-    const headers: Record<string, string> = { ...pageAuthContext.headers }
-    const bearerToken = sessionAccessToken ?? pageAuthContext.token
-    if (bearerToken) headers.Authorization = 'Bearer ' + bearerToken
-    try {
-      const fetchOnce = async (requestHeaders: Record<string, string>) => {
-        const res = await fetch(url, {
-          credentials: 'include',
-          headers: requestHeaders,
-          signal: controller.signal,
-        })
-        const ct = res.headers.get('content-type') || ''
-        const isJson = ct.includes('json')
-        let json: any = null
-        if (isJson) {
-          try {
-            json = JSON.parse(await res.text())
-          } catch {
-            json = null
+    const TIMEOUT_MS = 5000
+    const BASE = 800
+    const MAX_DELAY = 5000
+    const MAX_ATTEMPTS = 3 // 1 次初始请求 + 最多 2 次重试
+    const JITTER = 300
+
+    const fetchOnce = async (requestHeaders: Record<string, string>, signal: AbortSignal) => {
+      const res = await fetch(url, {
+        credentials: 'include',
+        headers: requestHeaders,
+        signal,
+      })
+      const ct = res.headers.get('content-type') || ''
+      const isJson = ct.includes('json')
+      let json: any = null
+      if (isJson) {
+        try {
+          json = JSON.parse(await res.text())
+        } catch {
+          json = null
+        }
+      }
+      return { status: res.status, json, isJson }
+    }
+
+    let lastResult: { status: number; json: any; isJson: boolean } | null = null
+    let lastErr: unknown = null
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
+      try {
+        const headers: Record<string, string> = { ...pageAuthContext.headers }
+        const bearerToken = sessionAccessToken ?? pageAuthContext.token
+        if (bearerToken) headers.Authorization = 'Bearer ' + bearerToken
+        let result = await fetchOnce(headers, controller.signal)
+        // 鉴权重试：401/403 或业务层未授权时，去掉 Bearer 仅用 Cookie 再试一次（同一逻辑请求内单次触发）。
+        let rejectedByAuth = false
+        if (isRecord(result.json)) {
+          const error = isRecord(result.json.error) ? result.json.error : null
+          rejectedByAuth =
+            result.json.success === false ||
+            result.json.code === 'AUTH_UNAUTHORIZED' ||
+            result.json.code === 'UNAUTHORIZED' ||
+            error?.code === 'AUTH_UNAUTHORIZED' ||
+            error?.code === 'UNAUTHORIZED'
+        }
+        // New API 的完整上下文不仅是 Bearer；不能去掉 New-API-User 后再把失败误判为登出。
+        if ((sessionAccessToken || pageAuthContext.token) && pageAuthContext.provider !== 'new_api_user_object') {
+          const bearerRejected = result.status === 401 || result.status === 403 || rejectedByAuth
+          if (bearerRejected) {
+            const cookieHeaders = { Accept: 'application/json' }
+            result = await fetchOnce(cookieHeaders, controller.signal)
           }
         }
-        return { status: res.status, json, isJson }
-      }
-      let result = await fetchOnce(headers)
-      // 某些 SPA 同时保留了过期 localStorage token 和有效 HttpOnly Cookie。
-      // 先按站点常规 Bearer 流程请求，401/403 时去掉 Bearer 再用 Cookie 重试，避免误判为登录失效。
-      let rejectedByAuth = false
-      if (isRecord(result.json)) {
-        const error = isRecord(result.json.error) ? result.json.error : null
-        rejectedByAuth =
-          result.json.success === false ||
-          result.json.code === 'AUTH_UNAUTHORIZED' ||
-          result.json.code === 'UNAUTHORIZED' ||
-          error?.code === 'AUTH_UNAUTHORIZED' ||
-          error?.code === 'UNAUTHORIZED'
-      }
-      // New API 的完整上下文不仅是 Bearer；不能去掉 New-API-User 后再把失败误判为登出。
-      if ((sessionAccessToken || pageAuthContext.token) && pageAuthContext.provider !== 'new_api_user_object') {
-        const bearerRejected = result.status === 401 || result.status === 403 || rejectedByAuth
-        if (bearerRejected) {
-          const cookieHeaders = { Accept: 'application/json' }
-          result = await fetchOnce(cookieHeaders)
+        lastResult = result
+        if (result.status >= 200 && result.status < 300) return result // 成功（含语义空）不重试
+        if (result.status === 401 || result.status === 403) return result // 鉴权失效不重试，交上层语义处理
+        if (result.status === 404) return result // 路径变更不重试
+        if (result.status >= 500) {
+          const err: any = new Error(`HTTP ${result.status}`)
+          err.__kind = 'HTTP_5XX'
+          err.status = result.status
+          throw err
         }
+        if (result.status === 429) {
+          const err: any = new Error('HTTP 429')
+          err.__kind = 'HTTP_429'
+          err.retryAfter = parseRetryAfter(result) // ms
+          throw err
+        }
+        return result // 其他非 2xx（如 400）请求类错误，不重试
+      } catch (e: any) {
+        lastErr = e
+        // 页面世界中仅有本控制器 5s 超时会产生 AbortError，故 AbortError 一律视为可重试的 TIMEOUT。
+        const kind = e && e.__kind ? e.__kind : e && e.name === 'AbortError' ? 'TIMEOUT' : 'NETWORK'
+        const retryable = kind === 'TIMEOUT' || kind === 'NETWORK' || kind === 'HTTP_5XX' || kind === 'HTTP_429'
+        if (!retryable || attempt >= MAX_ATTEMPTS) {
+          if (lastResult && (lastResult.status === 401 || lastResult.status === 403)) return lastResult
+          throw e
+        }
+        // 指数退避 + 抖动；429 取服务端 Retry-After 与本地退避的较大值，并受 MAX_DELAY 约束。
+        let delay = Math.min(BASE * Math.pow(2, attempt - 1), MAX_DELAY) + Math.floor(Math.random() * (JITTER + 1))
+        if (kind === 'HTTP_429' && e.retryAfter) {
+          delay = Math.min(Math.max(delay, e.retryAfter), MAX_DELAY)
+        }
+        // 单站总预算约束：剩余时间不足以发起下次尝试则停止重试，收敛为失败。
+        if (Date.now() + delay > COLLECT_DEADLINE) {
+          if (lastResult && (lastResult.status === 401 || lastResult.status === 403)) return lastResult
+          throw e
+        }
+        console.warn(`[AI Relay][retry] fetch 瞬时故障(${kind}) 第${attempt}次, ${delay}ms 后重试 url=${url}`)
+        await sleep(delay)
+      } finally {
+        clearTimeout(timer)
       }
-      return result
-    } finally {
-      clearTimeout(timer)
     }
+    if (lastResult && (lastResult.status === 401 || lastResult.status === 403)) return lastResult
+    throw lastErr
   }
 
   // ikuncode 「/api/data/self」区间用量解析：宽匹配小时趋势数组或汇总对象。

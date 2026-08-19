@@ -27,6 +27,7 @@ import type {
   SettingsRow,
 } from '../shared/types'
 import type { ExportConfig, ExportTables, ImportResult } from '../core/messaging/protocol'
+import { parseRechargeRate } from '../shared/recharge'
 
 const COLORS = ['#5B8FF9', '#61DDAA', '#F6BD16', '#7262FD', '#78D3F8', '#F6903D', '#FF9D4D']
 
@@ -56,18 +57,66 @@ const USAGE_BATCH_KEYS: (keyof UsageRecordBatch)[] = [
 // diagnostics 为脱敏指纹，无秘密字段；导出保留 recordId、剔除自增 id，其余全留
 const DIAGNOSTIC_DROP_KEYS = ['id']
 
-// settings 可移植键：仅导入用户偏好，排除运行时键
+// —— 站点导出字段白名单（P0-1/P0-2：绝不整条 SiteConfig 原样导出，只导出用户配置 + 必要展示字段）——
+// 评审终审收紧：剔除纯运行时/诊断字段（lastCollectAt/lastStatus/lastError/lastFailureReason/
+// lastAuthEvidence/lastCollectRunId），这些字段在导入后会被重置（lastCollectAt=null, lastStatus='unknown'），
+// 且 lastError/lastAuthEvidence 可能携带诊断信息，不应随备份外泄。
+const SITE_KEYS: (keyof SiteConfig)[] = [
+  'id', 'name', 'baseUrl', 'origin', 'adapter', 'color', 'enabled', 'order',
+  'createdAt', 'currency', 'discovered', 'customRequests',
+  'rechargeRate',
+]
+// 递归扫描禁止的敏感字段名（仅查字段名，不查值，避免 URL 等正常内容误报）
+const FORBIDDEN_KEY = /^(cookie|token|authorization|session|password|secret|apikey|api_key|accesstoken|refreshtoken)$/i
+// 例外：这些字段名允许在备份里出现，扫描器跳过它们（值仍可能为 PII，但已超出本扫描器职责）。
+// - json：CustomCaptureRecord.json 是用户主动采集的 API 响应 JSON，可能含合法字段名（session/token），
+//   反复扫描会误报导致导出失败；用户对自己采集的数据负责。
+// - fieldFingerprint：DiagnosticEntry 脱敏指纹，按设计只存字段路径+类型，绝不存值（P0-1/P0-4），
+//   其 key 是用户站点的 JSON 顶层字段名，本身可能是 session/token 等；扫描器看到 key 即抛错是误报。
+const SKIP_SUBTREE_KEYS = new Set(['json', 'fieldFingerprint'])
+function assertNoForbiddenKeys(value: unknown, path = ''): void {
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => assertNoForbiddenKeys(v, `${path}[${i}]`))
+  } else if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (SKIP_SUBTREE_KEYS.has(k)) continue
+      if (FORBIDDEN_KEY.test(k)) {
+        throw new Error(`备份导出拒绝：含可疑敏感字段名 "${k}" @ ${path || 'root'}`)
+      }
+      assertNoForbiddenKeys(v, path ? `${path}.${k}` : k)
+    }
+  }
+}
+
+// 站点排序键（P0-3）：缺失/NaN 置末尾，保证稳定
+function orderKey(s: { order?: number }): number {
+  return typeof s.order === 'number' && Number.isFinite(s.order) ? s.order : Number.MAX_SAFE_INTEGER
+}
+// 导入前对备份站点做稳定排序（不改原对象 order 字段值，仅重排数组）；同值以原数组索引作次关键字
+export function sortSitesByOrder(sites: SiteConfig[]): SiteConfig[] {
+  return sites
+    .map((s, i) => ({ s, i }))
+    .sort((a, b) => orderKey(a.s) - orderKey(b.s) || a.i - b.i)
+    .map((x) => x.s)
+}
+
+// settings 可移植键：严格固定白名单（P0-3 终审修正：杜绝前缀通配，未来新增键必须显式加入）。
+// 仅导入用户偏好；排除运行时键（aihub.notifyLastDate / aihub.usage.rev.* 不在集合内，自然被拒）。
+const PORTABLE_SETTING_KEYS = new Set<string>([
+  'aihub.notifyMode',
+  'aihub.clickBehavior',
+  'aihub.theme',
+  'aihub.retentionDays',
+  'aihub.collectInterval',
+  'aihub.calcRealCost',
+  'aihub.showTodayCostInPopup',
+  // 实验室开关（均为用户偏好布尔，无敏感值）
+  'aihub.lab.zeroTab',
+  'aihub.lab.corsUnblock',
+  'aihub.lab.showDashboard',
+])
 function isPortableSetting(key: string): boolean {
-  if (key === 'aihub.notifyLastDate') return false
-  if (key.startsWith('aihub.usage.rev')) return false
-  return (
-    key === 'aihub.notifyMode' ||
-    key === 'aihub.clickBehavior' ||
-    key === 'aihub.theme' ||
-    key === 'aihub.retentionDays' ||
-    key === 'aihub.collectInterval' ||
-    key.startsWith('aihub.lab')
-  )
+  return PORTABLE_SETTING_KEYS.has(key)
 }
 
 function pick<T extends object>(obj: T, keys: (keyof T)[]): Partial<T> {
@@ -150,7 +199,9 @@ export async function exportAll(): Promise<ExportConfig> {
     captures: projCaptures,
     diagnostics: projDiagnostics,
     usageRecords: projUsage,
-    settings: (data.settings as SettingsRow[]).map((s) => ({ key: s.key, value: s.value })),
+    settings: (data.settings as SettingsRow[])
+      .filter((s) => isPortableSetting(s.key))
+      .map((s) => ({ key: s.key, value: s.value })),
   }
 
   const manifest = chrome.runtime.getManifest()
@@ -159,9 +210,25 @@ export async function exportAll(): Promise<ExportConfig> {
     exportedAt: Date.now(),
     appVersion: manifest?.version,
     schemaVersion: db.verno,
-    sites: data.sites.map((s) => ({ ...s })),
+    sites: [...(data.sites as SiteConfig[])]
+      .sort((a, b) => orderKey(a) - orderKey(b))
+      .map((s) => {
+        const picked = pick(s, SITE_KEYS) as SiteConfig
+        assertNoForbiddenKeys(picked)
+        return picked
+      }),
     tables,
   }
+  // 主题（明暗）存于 chrome.storage.local，独立于 db.settings，单独读入顶层字段
+  try {
+    const themeRes = await chrome.storage.local.get('aihub.theme')
+    const t = themeRes['aihub.theme']
+    if (t === 'light' || t === 'dark' || t === 'auto') config.theme = t
+  } catch {
+    /* 主题读取失败不影响其余备份 */
+  }
+  // P0-1 终检：整包不得含禁止字段名
+  assertNoForbiddenKeys(config)
   return config
 }
 
@@ -192,7 +259,7 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
     }
   }
 
-  const sites = config.sites ?? []
+  const sites = sortSitesByOrder(config.sites ?? [])
   let imported = 0
   let updated = 0
   // sourceSiteId -> targetSiteId
@@ -206,6 +273,8 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
   for (const s of sites) {
     const name = s.name || normalizeOrigin(s.baseUrl)
     try {
+      // P0-1 导入侧：拒绝含可疑敏感字段名的恶意站点对象（与导出终检同一扫描器）
+      assertNoForbiddenKeys(s)
       if (!s.baseUrl) {
         bumpSkip(name, '站点缺少 baseUrl')
         continue
@@ -226,16 +295,24 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
         continue
       }
       const found = byOrigin.get(origin)
+      // 导入侧：仅按 SITE_KEYS 投影（P0-1 双向白名单），非白名单字段一律丢弃；rechargeRate 复用严格校验
+      const pickSite = pick(s, SITE_KEYS) as Partial<SiteConfig>
+      if (pickSite.rechargeRate != null && parseRechargeRate(pickSite.rechargeRate) == null) {
+        pickSite.rechargeRate = undefined
+      }
       if (found) {
         const site: SiteConfig = {
           ...found,
-          name: s.name || found.name,
-          baseUrl: s.baseUrl,
+          ...pickSite,
+          id: found.id,
+          order: found.order,
+          createdAt: found.createdAt,
           origin,
+          baseUrl: s.baseUrl,
           adapter: s.adapter,
+          currency: s.currency || found.currency || 'USD',
           color: s.color || found.color,
           enabled: s.enabled ?? found.enabled,
-          currency: s.currency || found.currency || 'USD',
           lastStatus: 'unknown',
           lastCollectAt: null,
         }
@@ -245,6 +322,9 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
         updated += 1
       } else {
         const site: SiteConfig = {
+          ...pickSite,
+          // P0-1 终审修正：必须先展开 pickSite（可能含旧备份 id），再用全新 UUID 覆盖，
+          // 否则会复用备份中的旧站点 id，破坏跨安装身份隔离（旧 id 可能与本机既有站点主键冲突）。
           id: crypto.randomUUID(),
           name: s.name || origin,
           baseUrl: s.baseUrl,
@@ -383,6 +463,19 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
     }
   })
 
+  // —— 主题恢复（独立于 db.settings，存 chrome.storage.local）——
+  // 仅当备份含合法主题值时写回；缺失/非法跳过且不写；失败显式记录（不伪装成功）
+  let themeRestored: boolean | undefined
+  const theme = config.theme
+  if (theme === 'light' || theme === 'dark' || theme === 'auto') {
+    try {
+      await chrome.storage.local.set({ 'aihub.theme': theme })
+      themeRestored = true
+    } catch {
+      themeRestored = false
+    }
+  }
+
   return {
     imported,
     updated,
@@ -390,5 +483,6 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
     skippedByReason,
     data: stats,
     operationId: crypto.randomUUID(),
+    themeRestored,
   }
 }

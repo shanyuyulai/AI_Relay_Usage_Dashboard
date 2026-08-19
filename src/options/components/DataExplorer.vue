@@ -17,6 +17,12 @@ import { fmtBalance, fmtTokens, fmtNum, fmtDateTime } from '../../shared/format'
 import { settingsRepo } from '../../storage/config'
 import { getLabShowDashboard, setLabShowDashboard } from '../../storage/labConfig'
 import { resolveNotifyMode, type NotifyMode } from '../../shared/notify'
+import {
+  dashboardSettings,
+  loadDashboardSettings,
+  setCalcRealCost,
+  setShowTodayCostInPopup,
+} from '../../shared/dashboardSettings'
 
 const props = defineProps<{ sites: SiteConfig[] }>()
 
@@ -53,7 +59,7 @@ const labShowDashboard = ref<boolean>(false)
 // 配置界面：单击图标行为（默认「极简面板」）
 const clickBehavior = ref<'panel' | 'sidebar'>('panel')
 // 采集通知档位（设置页可切换）
-const notifyMode = ref<NotifyMode>('system')
+const notifyMode = ref<NotifyMode>('dailyFirst')
 async function onNotifyModeChange() {
   try {
     await settingsRepo.set('aihub.notifyMode', notifyMode.value)
@@ -68,6 +74,21 @@ async function loadNotify() {
     notifyMode.value = 'system'
   }
 }
+
+// 真实花费 / 极简面板今日花费 开关：绑定单一响应式源（dashboardSettings），切换即持久化 + 广播
+const calcRealCost = computed({
+  get: () => dashboardSettings.calcRealCost,
+  set: (v: boolean) => {
+    void setCalcRealCost(v)
+  },
+})
+const showTodayCostInPopup = computed({
+  get: () => dashboardSettings.showTodayCostInPopup,
+  set: (v: boolean) => {
+    void setShowTodayCostInPopup(v)
+  },
+})
+
 const data = ref<GetSiteDataResponse | null>(null)
 const loading = ref(false)
 const msg = ref('')
@@ -537,6 +558,7 @@ onMounted(() => {
   loadLabShowDashboard()
   loadClickBehavior()
   loadNotify()
+  loadDashboardSettings()
 })
 </script>
 
@@ -631,6 +653,26 @@ onMounted(() => {
           <span><b>侧边栏</b><br /><small>单击图标打开完整的用量看板侧边栏</small></span>
         </label>
       </div>
+    </details>
+
+    <details class="settings-card">
+      <summary>💰 真实花费与极简面板</summary>
+      <p class="settings-desc">
+        开启「计算真实花费」后，每个站点的编辑表单里会出现「充值比例」输入框；侧边栏与极简面板的「今日花费」将按真实人民币显示（如
+        <code>$18.67 / ¥1.867</code>）。「极简面板显示今日花费」独立控制极简面板是否在余额正下方显示今日花费行。
+      </p>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="calcRealCost" />
+        <span>计算真实花费（各站可设充值比例，今日花费按真实人民币显示）</span>
+      </label>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="showTodayCostInPopup" />
+        <span>极简面板显示今日花费（在余额正下方显示今日花费行）</span>
+      </label>
+      <p class="lab-warn">
+        充值比例含义：充值 <b>1 人民币</b> 到账多少站点计价货币。写法 <code>10</code>（=10）或
+        <code>1:1.1</code>（冒号左 RMB、右站点货币 =1.1）。关闭「计算真实花费」不会清除已保存的比例，重新开启后仍生效。
+      </p>
     </details>
 
     <details class="lab">

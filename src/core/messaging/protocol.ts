@@ -44,6 +44,8 @@ export type TotalsByCurrency = Record<string, CurrencyTotal>
 export interface DashboardData {
   sites: SiteSummary[]
   totals: TotalsByCurrency
+  /** 真实花费/极简面板相关全局开关（两 handler 必填下发，popup/side栏据以渲染）。 */
+  settings: DashboardSettings
 }
 
 export interface SiteDetailData {
@@ -66,6 +68,8 @@ export interface ExportConfig {
   sites: SiteConfig[]
   /** v2 全量数据；缺失时为 v1（仅站点）。 */
   tables?: ExportTables
+  /** 主题（明暗），存于 chrome.storage.local，独立于 db.settings；缺失表示旧备份，导入时跳过。 */
+  theme?: string
 }
 
 /** v2 全量备份的 7 类业务表（credentials/usageCache 故意缺失）。 */
@@ -90,6 +94,8 @@ export interface ImportResult {
   /** 本次导入操作标识（用于进度查询/审计）。 */
   operationId: string
   fatalError?: string
+  /** 主题是否成功恢复；undefined=备份无主题字段（旧备份），false=恢复失败（其余数据已恢复）。 */
+  themeRestored?: boolean
 }
 
 // 入参载荷类型
@@ -98,6 +104,8 @@ export interface AddSitePayload {
   name: string
   baseUrl: string
   currency?: string
+  /** 可选：新建站点时预填的充值比例（"10" 或 "1:1.1"），保存前严格校验。 */
+  rechargeRate?: string
 }
 export interface UpdateSitePayload {
   id: string
@@ -350,6 +358,14 @@ export interface ClickBehaviorResponse {
 }
 
 // ── 极简用量看板（popup）：各站名称 + 最新余额 ──────────────
+/** 真实花费 / 极简面板今日花费 两个全局开关（单一权威定义，handler 与 UI 共用）。 */
+export interface DashboardSettings {
+  /** 计算真实花费：开启后各站可设充值比例，侧栏/极简面板按真实人民币显示今日花费。 */
+  calcRealCost: boolean
+  /** 极简面板显示今日花费：开启后极简面板在余额正下方显示今日花费行（受 calcRealCost 决定是否换算 RMB）。 */
+  showTodayCostInPopup: boolean
+}
+
 export interface DashboardSummaryItem {
   siteId: string
   name: string
@@ -360,12 +376,17 @@ export interface DashboardSummaryItem {
   currency: string | null
   updatedAt: number | null // 最新快照时间
   status: 'ok' | 'auth_expired' | 'error' | 'no_data'
+  // 极简面板今日花费换算所需的最小数据（避免二次请求）
+  todayCost?: number | null // 取自最新快照 snap.todayCost（站点本币）
+  rechargeRate?: string | null // 取自 site.rechargeRate（原始写法）
 }
 export interface GetDashboardSummaryPayload {
   // 留空，便于未来扩展（如仅某站）
 }
 export interface GetDashboardSummaryResponse {
   items: DashboardSummaryItem[]
+  /** 真实花费/极简面板相关全局开关（必填下发）。 */
+  settings: DashboardSettings
 }
 
 // ── 站点类型与采集方案可视化（方案 028）──
