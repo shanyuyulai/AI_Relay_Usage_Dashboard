@@ -45,6 +45,45 @@ export function realRmb(todayCost: number | null, rate: number | null): number |
   return todayCost / rate
 }
 
+/** 朴素十进制正则：拒科学计数法、前导零(01)、尾随零(0.950)、负号、空串。小数部分必须以非 0 数字结尾。 */
+const DEC_RE = /^(0|[1-9]\d*)(\.(?:[0-9]*[1-9]))?$/
+
+/**
+ * 解析充值折扣 d（实付 RMB / 标价本站货币）。
+ * - d ∈ (0, 1]：0 视为非法（不允许"免费"），>1 视为非法。
+ * - 用朴素十进制正则 + 数值校验，拒 "0.95abc" / "1e-1" / "01" / "0.950" / "-0.5" 等畸形。
+ * - 合法返回 number，否则 null。与 032 `parseRechargeRate` 的严格串校验风格保持一致。
+ */
+export function parseRechargeDiscount(raw: string | null | undefined): number | null {
+  if (raw == null) return null
+  const s = raw.trim()
+  if (!s || s.length > MAX_LEN) return null
+  if (!DEC_RE.test(s)) return null // 拒科学计数法 / 前导零 / 尾随零 / 负号
+  const n = Number(s)
+  if (!Number.isFinite(n) || n <= 0 || n > 1) return null
+  return n
+}
+
+/**
+ * 把折扣 d 换算为充值比例 r（站点货币 / 1 RMB），r = 1 / d。**可失败**，返回 string | null。
+ * - d==null → null。
+ * - 1/d 非有限或 ≤0 → null。
+ * - 用 12 位小数 toFixed 降低误差（无金额上限时 12 位误差远小于 3 位 RMB 展示精度，回应评审 P0-3）。
+ * - 经 Number().toString() 后若为科学计数法（含 e/E）或长度 > MAX_LEN → null（032 严格解析器拒科学计数法，回应 P0-2）。
+ * - 最终必须通过 parseRechargeRate，否则 null。
+ * 不通过时调用方应显式报错并阻止保存，绝不可把 Infinity / 科学计数法写入表单。
+ */
+export function discountToRate(discount: number | null): string | null {
+  if (discount == null) return null
+  const rate = 1 / discount
+  if (!Number.isFinite(rate) || rate <= 0) return null
+  const s = Number(rate.toFixed(12)).toString()
+  if (/[eE]/.test(s)) return null
+  if (s.length > MAX_LEN) return null
+  if (parseRechargeRate(s) == null) return null
+  return s
+}
+
 /**
  * 今日花费展示（popup / 侧栏共用，避免两处不一致）：
  * - todayCost 为 null（未知）→ "—"；

@@ -4,7 +4,7 @@ import { defineManifest } from '@crxjs/vite-plugin'
 export default defineManifest({
   manifest_version: 3,
   name: 'AI 中转站用量看板',
-  version: '0.3.13',
+  version: '0.3.14',
   // 固定扩展公钥，使开发模式下扩展 ID 在 reload 后保持不变，避免 options 页面与 SW 的 runtime.id 漂移。
   // 该 key 仅在本地开发/侧载使用；发布到 Chrome Web Store 时会被商店签名覆盖，不影响线上分发。
   key: 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0UdikbhtN+wZW6Hh1uD7NfE9Oq5Q1PRDNcsxjoz/czRREWl1FCB4Uhl1TynEVATioiWBi7GSQbGQnKoRNPzHE0ACI8az1mLH4J1OaRl0/lRcPmgyweBrJB9vaGp5JJ8Ka/NtB/HyfcuQpsAwue+mkvm4Gl3Y05AGVX7kRUodmk+B7nfbA246MqheZaHvCOozQYysziJjDzQQg8JZkBW1v08UDtGIROsOQX8ZfJEVdbJb0sRXbD2HQA1TJrSASfGUiC49ScZPT10cUyRCIud9Ftq3v2afiZxr7+RaUwtRNA7lJ3Wvx3xLRc7Vnc21jybZxqOt7F3MvoKmO1DMmJjO3QIDAQAB',

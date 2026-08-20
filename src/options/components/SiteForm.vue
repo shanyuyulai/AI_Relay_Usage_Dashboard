@@ -5,7 +5,7 @@ import { normalizeOrigin, isValidSiteUrl } from '../../shared/util'
 import { registry } from '../../adapters'
 import type { SiteConfig } from '../../shared/types'
 import { dashboardSettings } from '../../shared/dashboardSettings'
-import { parseRechargeRate } from '../../shared/recharge'
+import { parseRechargeRate, parseRechargeDiscount, discountToRate } from '../../shared/recharge'
 
 const props = defineProps<{
   visible: boolean
@@ -26,7 +26,7 @@ const CURRENCIES = [
   { id: 'EUR', label: 'EUR（€）' },
 ]
 
-const form = ref({ name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', rechargeRate: '' })
+const form = ref({ name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', rechargeRate: '', rechargeDiscount: '' })
 const formError = ref('')
 const submitting = ref(false)
 
@@ -47,9 +47,10 @@ watch(
         adapter: props.site.adapter,
         currency: props.site.currency || 'USD',
         rechargeRate: props.site.rechargeRate ?? '',
+        rechargeDiscount: '', // 折扣是 UI 派生输入，编辑时不预填（rate 已有等价信息）
       }
     } else {
-      form.value = { name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', rechargeRate: '' }
+      form.value = { name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', rechargeRate: '', rechargeDiscount: '' }
     }
   },
 )
@@ -83,6 +84,65 @@ async function doSave(origin: string) {
   }
 }
 
+// —— 033：充值折扣辅助输入（UI 派生，不入库）——
+// 折扣输入变化（同步，无 debounce，消除保存竞态，回应评审 P0-4）：
+// 立即清空旧比例，避免"旧比例掩盖非法折扣"（P0-1），再解析折扣写回派生比例。
+function onDiscountInput() {
+  const disc = form.value.rechargeDiscount.trim()
+  if (!disc) {
+    // 折扣清空：不动比例（避免误清用户已填的比例）
+    if (formError.value.includes('折扣')) formError.value = ''
+    return
+  }
+  // 先清空旧比例，防止旧值被"比例优先"逻辑静默保留
+  form.value.rechargeRate = ''
+  const d = parseRechargeDiscount(disc)
+  if (d == null) {
+    formError.value = '充值折扣需为大于 0 且不超过 1 的十进制数（如 0.95）'
+    return
+  }
+  const r = discountToRate(d)
+  if (r == null) {
+    formError.value = '充值折扣换算失败，请重新填写'
+    return
+  }
+  form.value.rechargeRate = r
+  formError.value = ''
+}
+
+// 比例输入变化：清空折扣框（双向互斥，回应 Q3），避免两框同时有值造成歧义
+function onRateInput() {
+  if (form.value.rechargeRate.trim()) {
+    form.value.rechargeDiscount = ''
+    if (formError.value.includes('折扣')) formError.value = ''
+  }
+}
+
+// 保存前兜底同步 + 校验（回应 P0-1 / P0-4）：
+// 折扣合法但未反映到比例（如粘贴后立即保存、@blur 场景）→ 重算写回；
+// 两框都空 → 合法（清空）；比例非空 → 校验比例；折扣非法非空 → 报错。
+function validateRechargeInputs(): string | null {
+  const rate = form.value.rechargeRate.trim()
+  const disc = form.value.rechargeDiscount.trim()
+
+  // 比例优先：有比例则只校验比例（折扣视为已同步/已清空）
+  if (rate) {
+    if (parseRechargeRate(rate) == null) return '充值比例格式无效，示例 10 或 1:1.1'
+    return null
+  }
+  // 比例空 + 折扣非空：兜底重算（覆盖粘贴/blur 立即保存）
+  if (disc) {
+    const d = parseRechargeDiscount(disc)
+    if (d == null) return '充值折扣需为大于 0 且不超过 1 的十进制数（如 0.95）'
+    const r = discountToRate(d)
+    if (r == null) return '充值折扣换算失败，请重新填写'
+    form.value.rechargeRate = r // 写回，doSave 直接读
+    return null
+  }
+  // 都空：合法（清空字段）
+  return null
+}
+
 function handleSubmit() {
   formError.value = ''
   if (!form.value.name.trim()) {
@@ -100,10 +160,10 @@ function handleSubmit() {
     return
   }
 
-  // 充值比例校验（仅在开启「计算真实花费」且用户填写时）：trim 后空串视为清空，否则必须能被 parseRechargeRate 解析
-  const rr = form.value.rechargeRate.trim()
-  if (rr && parseRechargeRate(rr) == null) {
-    formError.value = '充值比例格式无效，示例 10 或 1:1.1'
+  // 033：充值比例 / 折扣 联合校验（保存前兜底同步折扣→比例，优先校验比例）
+  const rechargeErr = validateRechargeInputs()
+  if (rechargeErr) {
+    formError.value = rechargeErr
     return
   }
 
@@ -181,10 +241,25 @@ function handleSubmit() {
         <input
           v-model="form.rechargeRate"
           placeholder="如 10 或 1:1.1"
+          @input="onRateInput"
           @keyup.enter="handleSubmit"
         />
         <div class="f-hint">
           充值 1 人民币到账多少本站货币。例如填写 <b>10</b> 表示 1 元到账 10 美刀；填写 <b>1:1.1</b> 表示 1 元到账 1.1 美刀。留空则清除已设比例。
+        </div>
+      </div>
+
+      <div v-if="dashboardSettings.calcRealCost" class="f">
+        <label>充值折扣</label>
+        <input
+          v-model="form.rechargeDiscount"
+          placeholder="如 0.95（95 折）"
+          @input="onDiscountInput"
+          @blur="onDiscountInput"
+          @keyup.enter="handleSubmit"
+        />
+        <div class="f-hint">
+          实付 RMB / 标价本站货币（如 <b>0.95</b> = 95 折）。填写后自动换算并写入上方「充值比例」，保存以比例为准。留空无影响。
         </div>
       </div>
 
