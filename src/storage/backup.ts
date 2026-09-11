@@ -110,6 +110,7 @@ const PORTABLE_SETTING_KEYS = new Set<string>([
   'aihub.collectInterval',
   'aihub.calcRealCost',
   'aihub.showTodayCostInPopup',
+  'aihub.costWindow',
   // 实验室开关（均为用户偏好布尔，无敏感值）
   'aihub.lab.zeroTab',
   'aihub.lab.corsUnblock',

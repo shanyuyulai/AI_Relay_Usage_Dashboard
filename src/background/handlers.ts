@@ -32,7 +32,8 @@ import { applyInterval } from './scheduler'
 import { registry } from '../adapters'
 import { normalizeOrigin, isValidSiteUrl, todayKey, dateKey, dateKeyInTz, HUBWAY_TZ, HUBWAY_TZ_OFFSET_MIN, isValidDateKey } from '../shared/util'
 import { parseRechargeRate } from '../shared/recharge'
-import { readDashboardSettings } from '../shared/dashboardSettings'
+import { readDashboardSettings, setCostWindow } from '../shared/dashboardSettings'
+import { normalizeCostWindow } from '../shared/costWindow'
 import type {
   CollectResultMsg,
   SiteSummary,
@@ -55,6 +56,8 @@ import type {
   RetentionResponse,
   CollectIntervalPayload,
   CollectIntervalResponse,
+  SetCostWindowPayload,
+  SetCostWindowResponse,
   LabZeroTabPayload,
   LabZeroTabResponse,
   LabCorsPayload,
@@ -495,6 +498,8 @@ export const handlers: Record<string, Handler> = {
         else if (a.url.includes('/api/data/self')) pathKey = 'dataSelf'
         // 统计接口（Hubway 类 usage/dashboard/stats）：必须排在 /api/v1/usage 之前，否则会被误判为 usageV1 列表端点（方案 §3.1）
         else if (a.url.includes('/usage/dashboard/stats')) pathKey = 'usageDashboardStats'
+        // fork 变体：/api/v1/usage/stats（需 start_date/end_date 才是自然日口径）
+        else if (a.url.includes('/usage/stats')) pathKey = 'usageDashboardStats'
         else if (a.url.includes('/api/v1/usage')) pathKey = 'usageV1'
         else if (a.url.includes('/api/usage')) pathKey = 'usageList'
         else pathKey = new URL(a.url).pathname.replace(/\//g, '_').replace(/^_/, '')
@@ -805,6 +810,13 @@ export const handlers: Record<string, Handler> = {
     return { interval: await getCollectInterval() }
   },
 
+  // ── 花费统计周期（今日 / 24 小时）：极简面板与侧边栏同步生效 ──
+  async SET_COST_WINDOW(payload: SetCostWindowPayload): Promise<SetCostWindowResponse> {
+    // 非法值由 normalizeCostWindow 归一为默认（'today'）；写入后 setCostWindow 内部广播给各面板
+    await setCostWindow(normalizeCostWindow(payload?.window))
+    return { window: (await readDashboardSettings()).costWindow }
+  },
+
   // ── 实验室：SW 零标签后台采集开关（默认关闭，需用户显式知情同意）──
   async GET_LAB_ZEROTAB(): Promise<LabZeroTabResponse> {
     return { enabled: await getLabZeroTab() }
@@ -882,8 +894,9 @@ export const handlers: Record<string, Handler> = {
           currency: snap ? snap.currency : null,
           updatedAt: snap ? snap.takenAt : null,
           status: !snap ? 'no_data' : snap.status,
-          // 今日花费换算所需最小数据（极简面板本地换算，避免二次请求）
+          // 花费换算所需最小数据（极简面板本地换算，避免二次请求）；两个周期字段一并发，切换周期无需重新请求
           todayCost: snap ? (snap.todayCost ?? null) : null,
+          recent24hCost: snap ? (snap.recent24hCost ?? null) : null,
           rechargeRate: site.rechargeRate ?? null,
         }
       })

@@ -1,16 +1,55 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
-import type { GetDashboardSummaryResponse, DashboardSummaryItem, DashboardSettings } from '../core/messaging/protocol'
+import type {
+  GetDashboardSummaryResponse,
+  DashboardSummaryItem,
+  DashboardSettings,
+  SetCostWindowResponse,
+} from '../core/messaging/protocol'
 import { fmtBalance } from '../shared/format'
 import { isValidSiteUrl } from '../shared/util'
 import { fmtTodayCost } from '../shared/recharge'
 import { AIHUB_SETTINGS_CHANGED } from '../shared/dashboardSettings'
+import {
+  normalizeCostWindow,
+  costWindowShortLabel,
+  pickCost,
+  sumCostTotal,
+  fmtCostTotal,
+  type CostWindow,
+} from '../shared/costWindow'
 
 const items = ref<DashboardSummaryItem[]>([])
-const settings = ref<DashboardSettings>({ calcRealCost: false, showTodayCostInPopup: false })
+const settings = ref<DashboardSettings>({
+  calcRealCost: false,
+  showTodayCostInPopup: false,
+  costWindow: 'today',
+})
 const loading = ref(true)
 const error = ref('')
+
+// 花费统计周期（今日 / 24 小时）+ 真实总花费（跨币种不直接相加，先换算人民币再求和）
+const costWindow = computed<CostWindow>(() => normalizeCostWindow(settings.value.costWindow))
+const calcRealCost = computed(() => settings.value.calcRealCost === true)
+const costTotal = computed(() => sumCostTotal(items.value, costWindow.value, calcRealCost.value))
+const costText = computed(() => fmtCostTotal(costTotal.value, calcRealCost.value, costWindow.value))
+
+/** 切换花费统计周期：本地乐观更新（两个周期字段已随摘要下发），并持久化 + 广播给侧边栏。 */
+async function toggleCostWindow() {
+  const next: CostWindow = costWindow.value === 'h24' ? 'today' : 'h24'
+  settings.value = { ...settings.value, costWindow: next }
+  try {
+    await send<SetCostWindowResponse>('SET_COST_WINDOW', { window: next })
+  } catch {
+    void load() // 写入失败：回退为服务端实际值
+  }
+}
+
+/** 站点行花费：按当前周期取 todayCost / recent24hCost，无数据显示「—」。 */
+function rowCost(it: DashboardSummaryItem): string {
+  return fmtTodayCost(pickCost(it, costWindow.value), it.currency, it.rechargeRate ?? null, calcRealCost.value)
+}
 
 function balClass(it: DashboardSummaryItem): string {
   if (it.balance == null) return 'is-null'
@@ -85,6 +124,11 @@ onUnmounted(() => {
   <div class="pop">
     <header class="pop-head">
       <span class="pop-title">极简面板</span>
+      <button class="pop-total" :title="costText.title" @click="toggleCostWindow">
+        <span class="pt-label">真实总花费</span>
+        <span class="pt-val">{{ costText.text }}</span>
+        <span class="pt-win">{{ costWindowShortLabel(costWindow) }}</span>
+      </button>
       <button class="pop-refresh" title="刷新" @click="load">↻</button>
     </header>
 
@@ -107,8 +151,8 @@ onUnmounted(() => {
         <!-- 第二行：左侧更新时间，右侧今日花费（设置开启才显示） -->
         <div v-if="it.updatedAt || settings.showTodayCostInPopup" class="pop-row-sub">
           <div class="pop-sub">{{ relTime(it.updatedAt) }}</div>
-          <div v-if="settings.showTodayCostInPopup" class="pop-today">
-            {{ fmtTodayCost(it.todayCost ?? null, it.currency, it.rechargeRate ?? null, settings.calcRealCost) }}
+          <div v-if="settings.showTodayCostInPopup" class="pop-today" :title="`${costWindowShortLabel(costWindow)}花费`">
+            {{ rowCost(it) }}
           </div>
         </div>
       </li>
@@ -136,11 +180,54 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 6px;
   margin-bottom: 8px;
 }
 .pop-title {
   font-weight: 600;
   font-size: 13px;
+  flex: 0 0 auto;
+}
+/* 顶栏中部「真实总花费」：点击切换 今日 / 24 小时 */
+.pop-total {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  color: inherit;
+  font-family: inherit;
+  cursor: pointer;
+  overflow: hidden;
+}
+.pop-total:hover {
+  border-color: var(--brand);
+  color: var(--brand);
+}
+.pt-label {
+  font-size: 10px;
+  color: var(--sub);
+  white-space: nowrap;
+}
+.pt-val {
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.pt-win {
+  font-size: 9px;
+  color: var(--sub);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 3px;
+  white-space: nowrap;
+  flex: 0 0 auto;
 }
 .pop-refresh {
   border: none;
@@ -150,6 +237,7 @@ onUnmounted(() => {
   cursor: pointer;
   line-height: 1;
   padding: 2px 4px;
+  flex: 0 0 auto;
 }
 .pop-refresh:hover {
   color: var(--brand);

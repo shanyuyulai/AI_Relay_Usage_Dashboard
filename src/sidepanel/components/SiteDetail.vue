@@ -8,9 +8,13 @@ import { fmtBalance, fmtTokens, fmtCompactTokens, fmtNum, fmtTime, fmtMs, fmtMsC
 import { ensureOriginPermission } from '../../shared/permissions'
 import { isValidSiteUrl } from '../../shared/util'
 import { shouldShowReauthorize } from '../../core/authState'
+import { costWindowShortLabel, pickCost, type CostWindow } from '../../shared/costWindow'
 import CollectionProfileCard from '../../options/components/CollectionProfileCard.vue'
 
-const props = defineProps<{ siteId: string }>()
+const props = withDefaults(
+  defineProps<{ siteId: string; costWindow?: CostWindow }>(),
+  { costWindow: 'today' },
+)
 const emit = defineEmits<{ back: [] }>()
 
 const loading = ref(false)
@@ -618,10 +622,10 @@ function openOrigin(url: string) {
           </div>
           <div class="m">
             <div class="k">
-              今日使用
-              <span v-if="latest?.todayCostSource" class="src" :title="todayCostSrcTitle(latest.todayCostSource)">{{ todayCostSrcLabel(latest.todayCostSource) }}</span>
+              {{ costWindowShortLabel(costWindow) }}使用
+              <span v-if="costWindow === 'today' && latest?.todayCostSource" class="src" :title="todayCostSrcTitle(latest.todayCostSource)">{{ todayCostSrcLabel(latest.todayCostSource) }}</span>
             </div>
-            <div class="v">{{ fmtBalance(latest?.todayCost ?? null, latest?.currency ?? null) }}</div>
+            <div class="v">{{ fmtBalance(pickCost(latest, costWindow), latest?.currency ?? null) }}</div>
           </div>
           <div class="m">
             <div class="k">今日 Token</div>

@@ -224,7 +224,8 @@ export function classifySite(fp: SiteFingerprint): SiteClassification {
   let usageStatsKind: UsageStatsKind | null = null
   if (statsSignal) {
     const names = statsSignal.dataFieldNames || []
-    const hitStatsField = ['today_actual_cost', 'total_tokens', 'total_input_tokens', 'total_output_tokens', 'average_duration_ms'].some(
+    // total_actual_cost：带 start_date/end_date 的区间统计接口（fork 变体）返回的是该字段，而非 today_actual_cost
+    const hitStatsField = ['today_actual_cost', 'total_actual_cost', 'total_tokens', 'total_input_tokens', 'total_output_tokens', 'average_duration_ms'].some(
       (n) => names.includes(n),
     )
     if (hitStatsField) {

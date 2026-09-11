@@ -7,26 +7,31 @@
  * - popup / sidepanel 各自在加载时从 GET_DASHBOARD_SUMMARY / GET_DASHBOARD 响应的 settings 读取，
  *   并监听 AIHUB_SETTINGS_CHANGED 广播实时刷新（跨页联动）。
  * - 两个开关默认均 false；仅当 db 中值为严格 true 才启用，缺失/非法值回退 false（不覆盖既有用户配置）。
+ * - 花费统计周期 costWindow 默认 'today'（自然日），'h24' 为滚动近 24 小时；非法值回退默认。
  */
 import { reactive } from 'vue'
 import { settingsRepo } from '../storage/config'
 import type { DashboardSettings } from '../core/messaging/protocol'
+import { normalizeCostWindow } from './costWindow'
 
 const CALC_REAL_COST_KEY = 'aihub.calcRealCost'
 const SHOW_TODAY_COST_KEY = 'aihub.showTodayCostInPopup'
+const COST_WINDOW_KEY = 'aihub.costWindow'
 
 /** 广播消息类型（popup / sidepanel 监听后重载）。 */
 export const AIHUB_SETTINGS_CHANGED = 'AIHUB_SETTINGS_CHANGED'
 
-/** 从 db.settings 读取两个开关（缺失/非法 → false）。 */
+/** 从 db.settings 读取两个开关与花费周期（缺失/非法 → 默认值）。 */
 export async function readDashboardSettings(): Promise<DashboardSettings> {
-  const [a, b] = await Promise.all([
+  const [a, b, c] = await Promise.all([
     settingsRepo.get<boolean>(CALC_REAL_COST_KEY),
     settingsRepo.get<boolean>(SHOW_TODAY_COST_KEY),
+    settingsRepo.get<string>(COST_WINDOW_KEY),
   ])
   return {
     calcRealCost: a === true,
     showTodayCostInPopup: b === true,
+    costWindow: normalizeCostWindow(c),
   }
 }
 
@@ -34,6 +39,7 @@ export async function readDashboardSettings(): Promise<DashboardSettings> {
 export const dashboardSettings = reactive<DashboardSettings>({
   calcRealCost: false,
   showTodayCostInPopup: false,
+  costWindow: 'today',
 })
 
 /** options 页面挂载时载入一次，同步响应式 store。 */
@@ -41,21 +47,37 @@ export async function loadDashboardSettings(): Promise<DashboardSettings> {
   const s = await readDashboardSettings()
   dashboardSettings.calcRealCost = s.calcRealCost
   dashboardSettings.showTodayCostInPopup = s.showTodayCostInPopup
+  dashboardSettings.costWindow = s.costWindow
   return s
 }
 
 export async function setCalcRealCost(v: boolean): Promise<void> {
   await settingsRepo.set(CALC_REAL_COST_KEY, v)
   dashboardSettings.calcRealCost = v
+  // 真实总花费依赖本开关，切换后须让已打开的 popup / sidepanel 同步刷新
+  await broadcastSettingsChanged()
+}
+
+/** 向已打开的 popup / sidepanel 广播设置变更（无接收方时静默忽略）。 */
+async function broadcastSettingsChanged(): Promise<void> {
+  try {
+    await chrome.runtime.sendMessage({ type: AIHUB_SETTINGS_CHANGED })
+  } catch {
+    /* 跨页广播失败静默忽略（目标页面可能未打开） */
+  }
+}
+
+/** 写入花费统计周期并广播（popup / sidepanel / options 三处同步）。 */
+export async function setCostWindow(v: 'today' | 'h24'): Promise<void> {
+  const w = normalizeCostWindow(v)
+  await settingsRepo.set(COST_WINDOW_KEY, w)
+  dashboardSettings.costWindow = w
+  await broadcastSettingsChanged()
 }
 
 export async function setShowTodayCostInPopup(v: boolean): Promise<void> {
   await settingsRepo.set(SHOW_TODAY_COST_KEY, v)
   dashboardSettings.showTodayCostInPopup = v
   // 广播给已打开的 popup / sidepanel，触发其实时刷新
-  try {
-    await chrome.runtime.sendMessage({ type: AIHUB_SETTINGS_CHANGED })
-  } catch {
-    /* 跨页广播失败静默忽略（目标页面可能未打开） */
-  }
+  await broadcastSettingsChanged()
 }

@@ -10,8 +10,16 @@ import { ensureOriginPermission, ensureOriginPermissions } from '../shared/permi
 import { isValidSiteUrl } from '../shared/util'
 import { shouldShowReauthorize } from '../core/authState'
 import { getLabShowDashboard, LAB_SHOWDASHBOARD_CHANGED } from '../storage/labConfig'
-import { fmtTodayCost, fmtTodayCostParts } from '../shared/recharge'
+import { fmtTodayCostParts } from '../shared/recharge'
 import { AIHUB_SETTINGS_CHANGED } from '../shared/dashboardSettings'
+import {
+  normalizeCostWindow,
+  costWindowShortLabel,
+  pickCost,
+  sumCostTotal,
+  fmtCostTotal,
+  type CostWindow,
+} from '../shared/costWindow'
 import SiteDetail from './components/SiteDetail.vue'
 
 const loading = ref(false)
@@ -81,6 +89,32 @@ const otherTotals = computed<CurrencyTotal[]>(() => totalList.value.slice(1))
 
 // 真实花费开关（来自 GET_DASHBOARD 响应 settings；缺省 false）
 const calcRealCost = computed(() => dashboard.value?.settings?.calcRealCost === true)
+
+// 花费统计周期（今日 / 24 小时）：影响总花费与每站「使用金额」取哪个字段
+const costWindow = computed<CostWindow>(() => normalizeCostWindow(dashboard.value?.settings?.costWindow))
+const costTotal = computed(() =>
+  sumCostTotal(
+    sites.value.map((s) => ({
+      todayCost: s.latest?.todayCost ?? null,
+      recent24hCost: s.latest?.recent24hCost ?? null,
+      currency: s.latest?.currency ?? null,
+      rechargeRate: s.site.rechargeRate ?? null,
+    })),
+    costWindow.value,
+    calcRealCost.value,
+  ),
+)
+const costText = computed(() => fmtCostTotal(costTotal.value, calcRealCost.value, costWindow.value))
+
+/** 切换花费统计周期：持久化 + 广播后重载，侧边栏与极简面板保持一致。 */
+async function toggleCostWindow() {
+  const next: CostWindow = costWindow.value === 'h24' ? 'today' : 'h24'
+  try {
+    await send<{ window: CostWindow }>('SET_COST_WINDOW', { window: next })
+  } finally {
+    await loadDashboard()
+  }
+}
 
 async function loadDashboard() {
   loading.value = true
@@ -194,10 +228,10 @@ function todayCostSrcTitle(src: string | null | undefined): string {
   if (src === 'logs') return '今日使用金额来源：当日用量明细日志（降级）'
   return ''
 }
-// 今日花费「分段」包装（侧栏 sc-metrics 用）：把 RMB 部分单独缩小字号渲染
-function todayCostParts(site: SiteConfig, latest: Snapshot | undefined) {
+// 花费「分段」包装（侧栏 sc-metrics 用）：把 RMB 部分单独缩小字号渲染；金额按当前周期取 todayCost / recent24hCost
+function windowCostParts(site: SiteConfig, latest: Snapshot | undefined) {
   return fmtTodayCostParts(
-    latest?.todayCost ?? null,
+    pickCost(latest, costWindow.value),
     latest?.currency ?? null,
     site.rechargeRate ?? null,
     calcRealCost.value,
@@ -297,6 +331,7 @@ onUnmounted(() => {
       <SiteDetail
         v-if="view === 'detail' && detailSiteId"
         :site-id="detailSiteId"
+        :cost-window="costWindow"
         @back="backToDashboard"
       />
 
@@ -320,7 +355,10 @@ onUnmounted(() => {
           <!-- 总览 4 卡 -->
           <div class="ov-grid">
             <div class="ov-card">
-              <div class="ov-label">总余额（按币种）</div>
+              <div class="ov-label ov-label-row">
+                <span class="ov-label-txt">总余额（按币种）</span>
+                <button class="ov-cost" :title="costText.title" @click="toggleCostWindow">{{ costText.text }}</button>
+              </div>
               <div class="ov-value">
                 {{ primaryTotal ? fmtBalance(primaryTotal.totalBalance, primaryTotal.currency) : '—' }}
               </div>
@@ -392,13 +430,13 @@ onUnmounted(() => {
                 <div class="v" :class="balanceClass(s.latest?.balance)">{{ fmtBalance(s.latest?.balance ?? null, s.latest?.currency ?? null) }}</div>
               </div>
               <div class="m">
-                <div class="k" title="今日使用金额（来自用量日志的消耗字段；站点未返回则显 —）">
-                  今日使用
-                  <span v-if="s.latest?.todayCostSource" class="src" :title="todayCostSrcTitle(s.latest.todayCostSource)">{{ todayCostSrcLabel(s.latest.todayCostSource) }}</span>
+                <div class="k" :title="`${costWindowShortLabel(costWindow)}使用金额（站点未返回则显 —）`">
+                  {{ costWindowShortLabel(costWindow) }}使用
+                  <span v-if="costWindow === 'today' && s.latest?.todayCostSource" class="src" :title="todayCostSrcTitle(s.latest.todayCostSource)">{{ todayCostSrcLabel(s.latest.todayCostSource) }}</span>
                 </div>
                 <div class="v">
-                  <span>{{ todayCostParts(s.site, s.latest).main }}</span>
-                  <span v-if="todayCostParts(s.site, s.latest).realRmb" class="cost-real"> / ¥{{ todayCostParts(s.site, s.latest).realRmb }}</span>
+                  <span>{{ windowCostParts(s.site, s.latest).main }}</span>
+                  <span v-if="windowCostParts(s.site, s.latest).realRmb" class="cost-real"> / ¥{{ windowCostParts(s.site, s.latest).realRmb }}</span>
                 </div>
               </div>
               <div class="m">
@@ -612,6 +650,35 @@ body {
 .ov-label {
   font-size: 11px;
   color: var(--sub);
+}
+/* 总余额卡：标签右侧的「真实总花费」（点击切换 今日 / 24 小时） */
+.ov-label-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+}
+.ov-label-txt {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ov-cost {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ov-cost:hover {
+  color: var(--brand);
 }
 .ov-value {
   font-size: 20px;

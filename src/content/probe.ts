@@ -515,6 +515,9 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
     '/api/usage?page=1&page_size=50',
     // 统计接口（Hubway 类 usage/dashboard/stats），按结构指纹识别，不按域名硬编码（方案 §3.1）
     '/api/v1/usage/dashboard/stats?timezone=Asia%2FShanghai',
+    // 区间统计接口（fork 变体）：靠 start_date/end_date 区分口径——
+    // 今日 = TODAY~TODAY，24 小时 = YESTERDAY~TODAY。探测期仅验证可达性，采集时由 queryTemplate 注入真实日期。
+    `/api/v1/usage/stats?start_date=${probeDayKey}&end_date=${probeDayKey}&timezone=Asia%2FShanghai`,
     '/api/data/self',
     '/api/v1/data/self',
     '/api/user/usage',
@@ -1523,7 +1526,11 @@ export async function collectInPage(
       'average_duration_ms',
     ])
     if (!metric) return null
-    const todayCost = toFiniteNonNegative(getPath(metric, 'today_actual_cost'))
+    // 字段兼容：Hubway 类返回 today_actual_cost；带 start_date/end_date 的区间统计接口返回 total_actual_cost
+    // （绝不退回 total_cost 标价，避免把未折扣的原价当成实际花费）
+    const todayCost =
+      toFiniteNonNegative(getPath(metric, 'today_actual_cost')) ??
+      toFiniteNonNegative(getPath(metric, 'total_actual_cost'))
     const cumulativeTokens = toFiniteNonNegative(getPath(metric, 'total_tokens'))
     const cumulativeInputTokens = toFiniteNonNegative(getPath(metric, 'total_input_tokens'))
     const cumulativeOutputTokens = toFiniteNonNegative(getPath(metric, 'total_output_tokens'))
@@ -2358,13 +2365,41 @@ export async function collectInPage(
     })
     for (const ep of orderedStatsEps) {
       try {
-        const { status, json, isJson, elapsedMs } = await requestEndpoint(ep)
+        // usage_stats 只认显式日期区间，循环开头的默认（无日期）请求对它无意义，
+        // 故跳过、只在 dated 请求失败时才作为兜底发出，避免多发一次请求。
+        const base = ep.role === 'usage_stats' ? null : await requestEndpoint(ep)
+        const status = base ? base.status : 0
+        const json = base ? base.json : null
+        const isJson = base ? base.isJson : false
+        const elapsedMs = base ? base.elapsedMs : 0
         if (ep.role === 'usage_stats') {
-          if (status >= 200 && status < 400 && isJson && json) {
-            const data = unwrapStats(json)
-            if (data) {
-              recordDiag('usage', `${origin}${ep.path}`, status, 'application/json', elapsedMs, data, 'usage_stats 响应')
-              const r = extractDashboardStats(data)
+          // 区间统计接口的两种口径**都靠 start_date/end_date 区分**，两者都必须显式传参：
+          //   今日    → start_date=TODAY     & end_date=TODAY
+          //   24 小时 → start_date=YESTERDAY & end_date=TODAY（站点 UI 上「近 24 小时」就是这个区间）
+          // 注意：不带日期不是「24 小时」，只是服务端默认区间，不能当作任何确定口径使用。
+          const fmtShDay = (ms: number) => {
+            const d = new Date(ms)
+            return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
+          }
+          const shNow = new Date(Date.now() + 480 * 60 * 1000)
+          const shTodayMs = Date.UTC(shNow.getUTCFullYear(), shNow.getUTCMonth(), shNow.getUTCDate())
+          const dayKey = fmtShDay(shTodayMs)
+          const prevDayKey = fmtShDay(shTodayMs - 86400000)
+          const rawQuery = (ep as any).queryTemplate
+          const baseQuery = isRecord(rawQuery) ? { ...(rawQuery as Record<string, unknown>) } : {}
+          const mkDatedEp = (startDate: string, endDate: string) => ({
+            ...ep,
+            queryTemplate: { ...baseQuery, start_date: startDate, end_date: endDate, timezone: 'Asia/Shanghai' },
+          })
+
+          // ── 今日：TODAY ~ TODAY ──────────────────────────────
+          const dated = await requestEndpoint(mkDatedEp(dayKey, dayKey))
+          let datedOk = false
+          if (dated.status >= 200 && dated.status < 400 && dated.isJson && dated.json) {
+            const d0 = unwrapStats(dated.json)
+            if (d0) {
+              recordDiag('usage', `${origin}${ep.path}`, dated.status, 'application/json', dated.elapsedMs, d0, `usage_stats 响应（今日 ${dayKey}）`)
+              const r = extractDashboardStats(d0)
               if (r) {
                 dsTodayCost = r.todayCost
                 dsCumulativeTokens = r.cumulativeTokens
@@ -2373,16 +2408,55 @@ export async function collectInPage(
                 dsAvgResponseTimeMs = r.avgResponseTimeMs
                 usageStatsSource = 'dashboard_stats'
                 if (r.todayCost != null) usageWindowVal = 'calendar_day'
+                datedOk = true
+              }
+            }
+          }
+          // ── 24 小时：YESTERDAY ~ TODAY ───────────────────────
+          const h24 = await requestEndpoint(mkDatedEp(prevDayKey, dayKey))
+          if (h24.status >= 200 && h24.status < 400 && h24.isJson && h24.json) {
+            const h0 = unwrapStats(h24.json)
+            if (h0) {
+              recordDiag('usage', `${origin}${ep.path}`, h24.status, 'application/json', h24.elapsedMs, h0, `usage_stats 响应（24h ${prevDayKey}~${dayKey}）`)
+              const p = extractDashboardStats(h0)
+              if (p) {
+                ruRecent24hCost = p.todayCost
+                ruRecent24hTokens = p.cumulativeTokens
+              }
+            }
+          }
+
+          if (!datedOk) {
+            // 回退：站点不接受日期过滤时退回默认区间（仅用于「今日」，且不打 calendar_day 标记；
+            // 24 小时拿不到确定口径就保持 null → UI 显「—」，不用默认区间冒充 24 小时）
+            const plain = await requestEndpoint(ep)
+            const pStatus = plain.status
+            const pJson = plain.json
+            const pIsJson = plain.isJson
+            const pElapsed = plain.elapsedMs
+            if (pStatus >= 200 && pStatus < 400 && pIsJson && pJson) {
+              const data = unwrapStats(pJson)
+              if (data) {
+                recordDiag('usage', `${origin}${ep.path}`, pStatus, 'application/json', pElapsed, data, 'usage_stats 响应（默认区间，站点不接受日期过滤）')
+                const r = extractDashboardStats(data)
+                if (r) {
+                  dsTodayCost = r.todayCost
+                  dsCumulativeTokens = r.cumulativeTokens
+                  dsCumulativeInputTokens = r.cumulativeInputTokens
+                  dsCumulativeOutputTokens = r.cumulativeOutputTokens
+                  dsAvgResponseTimeMs = r.avgResponseTimeMs
+                  usageStatsSource = 'dashboard_stats'
+                } else {
+                  isPartial = true
+                }
               } else {
+                recordDiag('usage', `${origin}${ep.path}`, pStatus, 'application/json', pElapsed, null, 'usage_stats 无法 unwrap')
                 isPartial = true
               }
             } else {
-              recordDiag('usage', `${origin}${ep.path}`, status, 'application/json', elapsedMs, null, 'usage_stats 无法 unwrap')
+              recordDiag('usage', `${origin}${ep.path}`, pStatus || 0, pIsJson ? 'application/json' : '', pElapsed, null, `usage_stats HTTP ${pStatus ?? '?'} 或非 JSON`)
               isPartial = true
             }
-          } else {
-            recordDiag('usage', `${origin}${ep.path}`, status || 0, isJson ? 'application/json' : '', elapsedMs, null, `usage_stats HTTP ${status ?? '?'} 或非 JSON`)
-            isPartial = true
           }
         } else if (ep.role === 'account_snapshot') {
           let parsed: any = null

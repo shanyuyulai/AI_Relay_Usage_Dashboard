@@ -22,6 +22,7 @@ import {
   loadDashboardSettings,
   setCalcRealCost,
   setShowTodayCostInPopup,
+  setCostWindow,
 } from '../../shared/dashboardSettings'
 
 const props = defineProps<{ sites: SiteConfig[] }>()
@@ -86,6 +87,13 @@ const showTodayCostInPopup = computed({
   get: () => dashboardSettings.showTodayCostInPopup,
   set: (v: boolean) => {
     void setShowTodayCostInPopup(v)
+  },
+})
+// 花费统计周期（24 小时 / 今日）：决定总花费与所有「使用金额」取哪个口径
+const costWindow = computed<'today' | 'h24'>({
+  get: () => (dashboardSettings.costWindow === 'h24' ? 'h24' : 'today'),
+  set: (v: 'today' | 'h24') => {
+    void setCostWindow(v)
   },
 })
 
@@ -659,7 +667,8 @@ onMounted(() => {
       <summary>💰 真实花费与极简面板</summary>
       <p class="settings-desc">
         开启「计算真实花费」后，每个站点的编辑表单里会出现「充值比例」输入框；侧边栏与极简面板的「今日花费」将按真实人民币显示（如
-        <code>$18.67 / ¥1.867</code>）。「极简面板显示今日花费」独立控制极简面板是否在余额正下方显示今日花费行。
+        <code>$18.67 / ¥1.867</code>）。「极简面板显示今日花费」独立控制极简面板是否在余额正下方显示花费行。<br />
+        下方「花费统计周期」切换后，极简面板顶栏的「真实总花费」、侧边栏「总余额（按币种）」右侧的真实总花费，以及极简面板 / 侧边栏所有「今日使用 / 24h 使用」金额，都会同步切换为对应口径的数据。
       </p>
       <label class="lab-toggle">
         <input type="checkbox" v-model="calcRealCost" />
@@ -667,8 +676,18 @@ onMounted(() => {
       </label>
       <label class="lab-toggle">
         <input type="checkbox" v-model="showTodayCostInPopup" />
-        <span>极简面板显示今日花费（在余额正下方显示今日花费行）</span>
+        <span>极简面板显示今日花费（在余额正下方显示花费行）</span>
       </label>
+      <div class="radio-group">
+        <label class="radio-item">
+          <input type="radio" value="h24" v-model="costWindow" />
+          <span><b>24 小时</b><br /><small>花费统计周期为滚动近 24 小时：极简面板顶栏「真实总花费」与所有「使用金额」取近 24h 数据（需站点支持该口径，不支持者显「—」）</small></span>
+        </label>
+        <label class="radio-item">
+          <input type="radio" value="today" v-model="costWindow" />
+          <span><b>今日</b><br /><small>花费统计周期为自然日（当日 0 点起）：兼容性最好，默认选项</small></span>
+        </label>
+      </div>
       <p class="lab-warn">
         充值比例含义：充值 <b>1 人民币</b> 到账多少站点计价货币。写法 <code>10</code>（=10）或
         <code>1:1.1</code>（冒号左 RMB、右站点货币 =1.1）。关闭「计算真实花费」不会清除已保存的比例，重新开启后仍生效。

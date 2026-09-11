@@ -358,12 +358,17 @@ export interface ClickBehaviorResponse {
 }
 
 // ── 极简用量看板（popup）：各站名称 + 最新余额 ──────────────
-/** 真实花费 / 极简面板今日花费 两个全局开关（单一权威定义，handler 与 UI 共用）。 */
+/** 花费统计周期：today=自然日 / h24=滚动近 24 小时（决定「今日使用」取哪个字段）。 */
+export type CostWindow = 'today' | 'h24'
+
+/** 真实花费 / 极简面板今日花费 / 花费统计周期 三个全局设置（单一权威定义，handler 与 UI 共用）。 */
 export interface DashboardSettings {
   /** 计算真实花费：开启后各站可设充值比例，侧栏/极简面板按真实人民币显示今日花费。 */
   calcRealCost: boolean
   /** 极简面板显示今日花费：开启后极简面板在余额正下方显示今日花费行（受 calcRealCost 决定是否换算 RMB）。 */
   showTodayCostInPopup: boolean
+  /** 花费统计周期：'today' 取 todayCost、'h24' 取 recent24hCost；极简面板与侧边栏同步生效。 */
+  costWindow: CostWindow
 }
 
 export interface DashboardSummaryItem {
@@ -376,12 +381,22 @@ export interface DashboardSummaryItem {
   currency: string | null
   updatedAt: number | null // 最新快照时间
   status: 'ok' | 'auth_expired' | 'error' | 'no_data'
-  // 极简面板今日花费换算所需的最小数据（避免二次请求）
-  todayCost?: number | null // 取自最新快照 snap.todayCost（站点本币）
+  // 极简面板花费换算所需的最小数据（避免二次请求）
+  todayCost?: number | null // 取自最新快照 snap.todayCost（站点本币，自然日口径）
+  recent24hCost?: number | null // 取自最新快照 snap.recent24hCost（站点本币，滚动近 24h 口径）
   rechargeRate?: string | null // 取自 site.rechargeRate（原始写法）
 }
 export interface GetDashboardSummaryPayload {
   // 留空，便于未来扩展（如仅某站）
+}
+
+// ── 花费统计周期设置（今日 / 24 小时）──
+export interface SetCostWindowPayload {
+  /** 目标周期；非法值由 handler 归一化为 'today'。 */
+  window: CostWindow
+}
+export interface SetCostWindowResponse {
+  window: CostWindow
 }
 export interface GetDashboardSummaryResponse {
   items: DashboardSummaryItem[]
