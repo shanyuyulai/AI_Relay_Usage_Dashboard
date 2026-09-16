@@ -15,7 +15,8 @@ function setup(send) {
   return { ...context.api, errors, loads: () => loads }
 }
 test('site switch binds current state, accessible name and pending disabled state', () => {
-  const markup = source.slice(source.indexOf('<div class="site-switch"'), source.indexOf('<button class="mini" @click="openEdit(site)">编辑'))
+  const start = source.indexOf('<div class="site-switch"')
+  const markup = source.slice(start, source.indexOf('</div>', start) + 6)
   for (const binding of ['role="switch"', 'type="button"', ':aria-checked="site.enabled"', ':aria-label="\'启用站点 \' + site.name"', ':disabled="!!togglingSiteIds[site.id]"', '@click="toggleEnabled(site)"']) assert.ok(markup.includes(binding), binding)
   assert.ok(markup.includes('已启用') && markup.includes('已禁用'))
 })
@@ -45,4 +46,28 @@ test('failed update leaves state intact, reports error and unlocks retry', async
   assert.equal(api.loads(), 0); assert.ok(!api.togglingSiteIds.value.a)
   await api.toggleEnabled(site)
   assert.equal(calls, 2); assert.equal(api.loads(), 1)
+})
+
+test('site switch follows adapter chip in name row, not the action toolbar', () => {
+  const { parse } = require('@vue/compiler-sfc')
+  const { descriptor, errors } = parse(source)
+  assert.equal(errors.length, 0)
+  function find(node, name) {
+    if (node.type === 1 && node.props.some((p) => p.name === 'class' && p.value?.content.split(' ').includes(name))) return node
+    for (const child of node.children ?? []) { const match = find(child, name); if (match) return match }
+  }
+  const nameRow = find(descriptor.template.ast, 'nm')
+  const children = nameRow.children.filter((node) => node.type === 1)
+  assert.equal(children[1].props.find((p) => p.name === 'class').value.content, 'chip')
+  assert.equal(children[2].props.find((p) => p.name === 'class').value.content, 'site-switch')
+  assert.ok(!find(find(descriptor.template.ast, 'ops'), 'site-switch'))
+  assert.equal((source.match(/class="site-switch"/g) ?? []).length, 1)
+})
+test('embedded help changelog lists current manifest version and latest UI changes', () => {
+  const html = fs.readFileSync(path.resolve(__dirname, '../../public/README.html'), 'utf8')
+  const version = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../package.json'), 'utf8')).version
+  const changelog = html.slice(html.indexOf('<section id="changelog">'))
+  assert.ok(changelog.includes('<td><b>' + version + '</b></td>'))
+  assert.ok(changelog.indexOf(version) < changelog.indexOf('0.3.17'))
+  for (const text of ['适配器标记右侧', '极简面板不显示站点图标', '× 关闭', '余额警报']) assert.ok(changelog.includes(text))
 })

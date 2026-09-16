@@ -882,9 +882,23 @@ onUnmounted(() => {
           <SiteAvatar :name="site.name" :origin="site.origin" :color="site.color" :size="36" />
           <div class="info">
             <div class="nm">
-              {{ site.name }}
+              <span class="site-name" :title="site.name">{{ site.name }}</span>
               <span class="chip">{{ adapterMap[site.adapter] || site.adapter }}</span>
-              <span v-if="!site.enabled" class="chip chip-off">已禁用</span>
+              <!-- 站点开关显示当前状态；原生button支持Space/Enter，保存期间防重。 -->
+              <div class="site-switch" :class="{ on: site.enabled }">
+                <button
+                  type="button"
+                  class="switch"
+                  role="switch"
+                  :aria-checked="site.enabled"
+                  :aria-label="'启用站点 ' + site.name"
+                  :aria-busy="!!togglingSiteIds[site.id]"
+                  :disabled="!!togglingSiteIds[site.id]"
+                  :title="site.enabled ? '点击禁用该站点（不采集、不在侧边栏展示）' : '点击启用该站点'"
+                  @click="toggleEnabled(site)"
+                ><span class="knob" aria-hidden="true"></span></button>
+                <span class="site-switch-state" aria-live="polite">{{ togglingSiteIds[site.id] ? '保存中' : site.enabled ? '已启用' : '已禁用' }}</span>
+              </div>
             </div>
             <div class="meta">
               {{ site.origin.replace('https://', '') }} · 凭证：Cookie 会话 ·
@@ -927,21 +941,6 @@ onUnmounted(() => {
                 :disabled="!canMoveDown(site)"
               >▼</button>
             </template>
-            <!-- 站点开关显示当前状态；原生button支持Space/Enter，保存期间防重。 -->
-            <div class="site-switch" :class="{ on: site.enabled }">
-              <button
-                type="button"
-                class="switch"
-                role="switch"
-                :aria-checked="site.enabled"
-                :aria-label="'启用站点 ' + site.name"
-                :aria-busy="!!togglingSiteIds[site.id]"
-                :disabled="!!togglingSiteIds[site.id]"
-                :title="site.enabled ? '点击禁用该站点（不采集、不在侧边栏展示）' : '点击启用该站点'"
-                @click="toggleEnabled(site)"
-              ><span class="knob" aria-hidden="true"></span></button>
-              <span class="site-switch-state" aria-live="polite">{{ togglingSiteIds[site.id] ? '保存中' : site.enabled ? '已启用' : '已禁用' }}</span>
-            </div>
             <button class="mini" @click="openEdit(site)">编辑</button>
             <button class="mini" title="配置余额临界值与系统警报" @click="openEdit(site)">🔔 余额警报<span v-if="site.alerts?.length">（{{ site.alerts.filter(r => r.enabled).length }}）</span></button>
             <button
@@ -1547,6 +1546,9 @@ body {
   align-items: center;
   gap: 8px;
 }
+.nm .site-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nm > .chip { flex-shrink: 0; white-space: nowrap; }
+.nm .site-switch-state { font-weight: 400; }
 .chip {
   font-size: 10px;
   padding: 2px 8px;
