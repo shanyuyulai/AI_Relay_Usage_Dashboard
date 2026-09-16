@@ -3,7 +3,9 @@ import { ref, computed, watch } from 'vue'
 import { send, MessagingError } from '../../core/messaging/client'
 import { normalizeOrigin, isValidSiteUrl } from '../../shared/util'
 import { registry } from '../../adapters'
-import type { SiteConfig } from '../../shared/types'
+import BalanceAlertEditor from './BalanceAlertEditor.vue'
+import { normalizeAlertRules, parseAlertThreshold } from '../../shared/alertRules'
+import type { AlertRuleDraft, SiteConfig } from '../../shared/types'
 import { dashboardSettings } from '../../shared/dashboardSettings'
 import { parseRechargeRate, parseRechargeDiscount, discountToRate } from '../../shared/recharge'
 
@@ -27,6 +29,7 @@ const CURRENCIES = [
 ]
 
 const form = ref({ name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', rechargeRate: '', rechargeDiscount: '' })
+const alertDrafts = ref<AlertRuleDraft[]>([])
 const formError = ref('')
 const submitting = ref(false)
 
@@ -40,6 +43,7 @@ watch(
   (v) => {
     if (!v) return
     formError.value = ''
+    alertDrafts.value = (props.site?.alerts ?? []).map((r) => ({ ...r, threshold: String(r.threshold) }))
     if (props.site) {
       form.value = {
         name: props.site.name,
@@ -60,12 +64,13 @@ async function doSave(origin: string) {
   submitting.value = true
   try {
     // 充值比例：空串 → null（handler 删除该字段）；否则传 trim 后的原始写法
+    const alerts = normalizedAlerts()
     const rr = form.value.rechargeRate.trim()
     const rechargeRate = rr ? rr : null
     if (props.site) {
       await send('UPDATE_SITE', {
         id: props.site.id,
-        patch: { name: form.value.name, baseUrl: form.value.baseUrl, currency: form.value.currency, rechargeRate },
+        patch: { name: form.value.name, baseUrl: form.value.baseUrl, currency: form.value.currency, rechargeRate, alerts },
       })
     } else {
       await send<{ siteId: string }>('ADD_SITE', {
@@ -74,6 +79,7 @@ async function doSave(origin: string) {
         baseUrl: form.value.baseUrl,
         currency: form.value.currency,
         rechargeRate: rechargeRate ?? undefined,
+        alerts,
       })
     }
     emit('submitted')
@@ -143,8 +149,13 @@ function validateRechargeInputs(): string | null {
   return null
 }
 
+function normalizedAlerts() {
+  return normalizeAlertRules(alertDrafts.value.map((r) => ({ ...r, threshold: parseAlertThreshold(r.threshold) })),
+    form.value.currency, props.site?.alerts)
+}
 function handleSubmit() {
   formError.value = ''
+  try { normalizedAlerts() } catch (e) { formError.value = e instanceof Error ? e.message : String(e); return }
   if (!form.value.name.trim()) {
     formError.value = '请输入站点名称'
     return
@@ -207,20 +218,31 @@ function handleSubmit() {
 
 <template>
   <div v-if="visible" class="modal-mask" @click.self="emit('close')">
-    <div class="modal">
-      <h3>{{ isEdit ? '编辑站点' : '＋ 添加站点' }}</h3>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="site-form-title">
+      <header class="modal-header">
+        <h3 id="site-form-title">{{ isEdit ? '编辑站点' : '＋ 添加站点' }}</h3>
+        <span class="modal-subtitle">站点配置与余额提醒</span>
+      </header>
+      <div class="modal-body">
+        <div class="editor-columns">
+          <section class="site-settings" aria-labelledby="site-settings-title">
+            <h4 id="site-settings-title" class="section-title">基本信息</h4>
+            <div class="fields-grid">
 
-      <div class="f">
+      <div class="f field-wide">
         <label>站点名称</label>
         <input v-model="form.name" placeholder="如 RayinAI" @keyup.enter="handleSubmit" />
       </div>
-      <div class="f">
+      <div class="f field-wide">
         <label>面板地址</label>
         <input v-model="form.baseUrl" placeholder="https://example.com" @keyup.enter="handleSubmit" />
-        <div class="f-hint">请填写你实际登录的控制台地址（如 https://docode.cc/console），不要填单独的 API Base URL（如 https://api.docode.cc）。两者域名不同会导致找不到已登录会话，并触发「面板域与控制台不一致」诊断。</div>
+        <details class="f-hint">
+          <summary>填写实际登录的控制台地址，而非 API 地址</summary>
+          请填写你实际登录的控制台地址（如 https://docode.cc/console），不要填单独的 API Base URL（如 https://api.docode.cc）。两者域名不同会导致找不到已登录会话，并触发「面板域与控制台不一致」诊断。
+        </details>
       </div>
 
-      <div v-if="showPanelMismatch" class="form-err">
+      <div v-if="showPanelMismatch" class="form-err field-wide">
         ⚠️ 该站点上次采集因「面板地址与已登录控制台域不一致」失败：请核对面板地址是否为你实际登录的控制台（含正确子域，如 <b>/console</b>），而非 API Base URL。修改后保存即可清除该诊断。
       </div>
       <div class="f">
@@ -244,9 +266,9 @@ function handleSubmit() {
           @input="onRateInput"
           @keyup.enter="handleSubmit"
         />
-        <div class="f-hint">
+        <details class="f-hint"><summary>充值比例填写说明</summary>
           充值 1 人民币到账多少本站货币。例如填写 <b>10</b> 表示 1 元到账 10 美刀；填写 <b>1:1.1</b> 表示 1 元到账 1.1 美刀。留空则清除已设比例。
-        </div>
+        </details>
       </div>
 
       <div v-if="dashboardSettings.calcRealCost" class="f">
@@ -258,10 +280,15 @@ function handleSubmit() {
           @blur="onDiscountInput"
           @keyup.enter="handleSubmit"
         />
-        <div class="f-hint">
-          实付 RMB / 标价本站货币（如 <b>0.95</b> = 95 折）。填写后自动换算并写入上方「充值比例」，保存以比例为准。留空无影响。
-        </div>
+        <details class="f-hint"><summary>折扣自动换算为比例</summary>
+          实付 RMB / 标价本站货币（如 <b>0.95</b> = 95 折）。填写后自动换算并写入「充值比例」，保存以比例为准。留空无影响。
+        </details>
       </div>
+
+            </div>
+          </section>
+          <BalanceAlertEditor v-model="alertDrafts" :currency="form.currency" :site-id="site?.id" />
+        </div>
 
       <div v-if="!isEdit" class="steps">
         <b>授权流程（无需输入账号密码）：</b><br />
@@ -270,16 +297,20 @@ function handleSubmit() {
         ③ 回到插件点击「去授权」或「立即同步」，自动读取登录态
       </div>
 
-      <div v-if="formError" class="form-err">{{ formError }}</div>
-
-      <div class="foot">
+      </div>
+      <footer class="modal-footer">
+        <div v-if="formError" class="form-err" role="alert">{{ formError }}</div>
+        <div class="footer-row">
+          <div class="note">🔐 仅使用本站 Cookie 会话，凭证不会导出。</div>
+          <div class="foot">
         <button class="btn" @click="emit('close')">取消</button>
         <button class="btn primary" :disabled="submitting" @click="handleSubmit">
           {{ submitting ? '保存中…' : isEdit ? '保存' : '授权并添加' }}
         </button>
       </div>
 
-      <div class="note">🔐 凭证仅使用 Cookie 会话，按站点隔离，永不回退共用，导出时自动剔除。</div>
+        </div>
+      </footer>
     </div>
   </div>
 </template>
@@ -290,36 +321,50 @@ function handleSubmit() {
   inset: 0;
   background: var(--mask);
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: center;
   z-index: 100;
-  padding-top: 60px;
+  padding: 24px;
+  box-sizing: border-box;
 }
 .modal {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 14px;
   box-shadow: 0 18px 50px var(--shadow-lg);
-  width: 440px;
-  max-width: 90vw;
-  padding: 22px;
+  width: 980px;
+  max-width: 100%;
+  max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  box-sizing: border-box;
 }
-.modal h3 {
-  font-size: 14px;
-  margin-bottom: 16px;
+.modal-header {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
 }
-.f {
-  margin-bottom: 13px;
-}
-.f label {
-  display: block;
-  font-size: 11px;
-  color: var(--sub);
-  margin-bottom: 5px;
-}
-.f input,
-.f select {
+.modal-header h3 { font-size: 16px; margin: 0; }
+.modal-subtitle { font-size: 11px; color: var(--sub); }
+.modal-body { padding: 20px 22px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.editor-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 22px; align-items: start; }
+.site-settings { min-width: 0; }
+.section-title { margin: 0 0 16px; font-size: 14px; }
+.fields-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.field-wide { grid-column: 1 / -1; }
+.f { min-width: 0; }
+.f label { display: block; font-size: 11px; color: var(--sub); margin-bottom: 5px; }
+.f input, .f select {
+  box-sizing: border-box;
   width: 100%;
+  min-width: 0;
   padding: 9px 12px;
   border: 1px solid var(--line);
   border-radius: 9px;
@@ -327,64 +372,31 @@ function handleSubmit() {
   color: var(--text);
   background: var(--panel);
 }
-.f input:focus,
-.f select:focus {
-  outline: none;
-  border-color: var(--brand);
+.f input:focus, .f select:focus { outline: 2px solid var(--brand); outline-offset: 1px; }
+.f-hint { margin-top: 5px; font-size: 11px; color: var(--sub); line-height: 1.6; overflow-wrap: anywhere; }
+.f-hint summary { cursor: pointer; }
+.f-hint[open] summary { margin-bottom: 5px; }
+.steps { background: var(--panel-soft); border-radius: 10px; padding: 10px 14px; font-size: 11px; color: var(--sub); line-height: 1.7; margin-top: 16px; }
+.steps b { color: var(--text); }
+.form-err { background: var(--err-soft); color: var(--err); border-radius: 8px; padding: 8px 12px; font-size: 11px; overflow-wrap: anywhere; }
+.modal-footer { flex-shrink: 0; padding: 14px 22px; border-top: 1px solid var(--line); background: var(--panel); }
+.modal-footer .form-err { margin-bottom: 10px; max-height: 72px; overflow-y: auto; }
+.footer-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.foot { display: flex; justify-content: flex-end; gap: 10px; flex-shrink: 0; }
+.btn { padding: 8px 16px; border-radius: 9px; font-size: 12px; border: 1px solid var(--line); background: var(--panel); cursor: pointer; color: var(--text); }
+.btn.primary { background: var(--brand); border-color: var(--brand); color: #fff; font-weight: 600; }
+.btn.primary:disabled { opacity: .6; cursor: default; }
+.note { font-size: 10px; color: var(--sub); line-height: 1.6; }
+@media (max-width: 760px) {
+  .modal-mask { padding: 12px; }
+  .modal { max-height: calc(100vh - 24px); max-height: calc(100dvh - 24px); }
+  .modal-header, .modal-footer { padding: 14px 16px; }
+  .modal-body { padding: 16px; }
+  .editor-columns { grid-template-columns: minmax(0, 1fr); gap: 20px; }
 }
-.f-hint {
-  margin-top: 5px;
-  font-size: 10px;
-  color: var(--sub);
-  line-height: 1.6;
-}
-.steps {
-  background: var(--panel-soft);
-  border-radius: 10px;
-  padding: 12px 14px;
-  font-size: 11px;
-  color: var(--sub);
-  line-height: 1.9;
-  margin: 14px 0;
-}
-.steps b {
-  color: var(--text);
-}
-.form-err {
-  background: var(--err-soft);
-  color: var(--err);
-  border-radius: 8px;
-  padding: 8px 12px;
-  font-size: 11px;
-  margin-bottom: 12px;
-}
-.foot {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-}
-.btn {
-  padding: 8px 16px;
-  border-radius: 9px;
-  font-size: 12px;
-  border: 1px solid var(--line);
-  background: var(--panel);
-  cursor: pointer;
-  color: var(--text);
-}
-.btn.primary {
-  background: var(--brand);
-  border-color: var(--brand);
-  color: #fff;
-  font-weight: 600;
-}
-.btn.primary:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
-.note {
-  font-size: 10px;
-  color: var(--sub);
-  margin-top: 10px;
+@media (max-width: 420px) {
+  .fields-grid { grid-template-columns: minmax(0, 1fr); }
+  .footer-row { flex-wrap: wrap; }
+  .foot { margin-left: auto; }
 }
 </style>

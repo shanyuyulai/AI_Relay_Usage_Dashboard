@@ -1,3 +1,4 @@
+import { pruneAlertRuntime } from './alerts'
 import { db } from './db'
 import { settingsRepo } from './config'
 import { usageRecordsRepo } from './usageRecords'
@@ -44,6 +45,7 @@ export interface PurgeCounts {
  * 仅删采集数据，不动站点配置 / 凭证 / 设置（红线：配置隔离）。
  */
 export async function purgeOlderThan(days: number): Promise<PurgeCounts> {
+  await pruneAlertRuntime()
   if (days <= 0) return { snapshots: 0, dailyStats: 0, captures: 0, diagnostics: 0, usageRecords: 0 }
 
   const cutoffTs = Date.now() - days * 86_400_000

@@ -1,3 +1,5 @@
+import { assertPluginEnabled, getPluginState } from './pluginGate'
+import { commitBalanceSnapshot } from './balanceCommit'
 import { registry } from '../adapters'
 import { siteRepo, snapshotRepo, dailyStatRepo } from '../storage'
 import { CollectError, type CollectContext, type SiteAdapter, type UsageRange } from '../core/adapter/contracts'
@@ -115,6 +117,8 @@ async function getCookiesForOrigin(origin: string): Promise<{
 
 /** 单站采集（已在 perSiteLock 内）。含指数退避重试（P1-2）。 */
 async function doCollect(site: SiteConfig, channel: Channel): Promise<CollectResult> {
+  await assertPluginEnabled()
+  const alertRevision = getPluginState().revision
   let adapter: SiteAdapter
   try {
     adapter = registry.get(site.adapter)
@@ -160,7 +164,7 @@ async function doCollect(site: SiteConfig, channel: Channel): Promise<CollectRes
       const snapshot = await requestGate.run(() => adapter.collect(ctx))
       const enriched = await enrichUsage(adapter, ctx, snapshot)
       enriched.channel = channel // collector 按真实来源覆盖适配器占位
-      await snapshotRepo.append(enriched)
+      await commitBalanceSnapshot(site, enriched, alertRevision)
       // 仅当有精确用量（todayTokens != null）才落日聚合；否则不落（P0-3 禁余额差分/不造 0）
       if (enriched.todayTokens != null) {
         await dailyStatRepo.upsertForDay(enriched)
@@ -245,7 +249,11 @@ async function enrichUsage(
 
 /** 对单站采集，外层套 perSiteLock 互斥（P1-2）。 */
 export function collectSite(site: SiteConfig, channel: Channel): Promise<CollectResult> {
-  return acquireSiteLock(site.id, () => doCollect(site, channel))
+  return acquireSiteLock(site.id, async () => {
+    const current = await siteRepo.get(site.id)
+    if (!current?.enabled) return { siteId: site.id, ok: false, message: '站点已停用或删除' }
+    return doCollect(current, channel)
+  })
 }
 
 /** 采集全部启用站点（手动「立即同步」/ 定时 alarm 共用）。 */

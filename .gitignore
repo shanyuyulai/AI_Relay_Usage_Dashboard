@@ -28,3 +28,6 @@ AI_documentation/
 # ===== OS / editor =====
 .DS_Store
 Thumbs.db
+
+# Release assets are uploaded to GitHub Releases, not committed as source.
+release-artifacts/

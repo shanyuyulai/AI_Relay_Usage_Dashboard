@@ -1,3 +1,4 @@
+import { reconcilePluginRuntime } from './pluginGate'
 import { siteRepo } from '../storage'
 
 const RULE_ID_BASE = 10_000
@@ -51,7 +52,7 @@ async function managedRuleIds(): Promise<number[]> {
  * 根据「CORS 放行开关」重建动态规则。
  * @param enabled true 时添加/更新规则；false 时删除本扩展管理的所有规则。
  */
-export async function applyCorsRules(enabled: boolean): Promise<void> {
+export async function reconcileCorsResources(enabled: boolean): Promise<void> {
   const existingIds = await managedRuleIds()
   if (!enabled) {
     if (existingIds.length) {
@@ -77,8 +78,10 @@ export async function applyCorsRules(enabled: boolean): Promise<void> {
   }
 }
 
-/** 站点增删改后调用，保持规则与启用站点同步。 */
+/** All callers reconcile current persisted preferences, never stale passed values. */
+export async function applyCorsRules(_enabled: boolean): Promise<void> {
+  await reconcilePluginRuntime()
+}
 export async function refreshCorsRules(): Promise<void> {
-  const enabled = (await import('../storage')).getLabCorsUnblock().catch(() => false)
-  await applyCorsRules(await enabled)
+  await reconcilePluginRuntime()
 }

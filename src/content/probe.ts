@@ -54,6 +54,8 @@ export interface ProbeResult {
 
 /** collectInPage 的返回结构（SW 侧据此落库）。完全可序列化。 */
 export interface PageCollectResult {
+  /** Non-secret unit metadata for compatible balance-alert comparisons. */
+  balanceUnits?: { quotaPerUnit: number | null; usdExchangeRate: number | null; customCurrencyExchangeRate: number | null } | null
   ok: boolean
   reason: string
   authExpired: boolean
@@ -115,6 +117,8 @@ export interface PageCollectResult {
   recent24hCost: number | null
   /** 滚动 24h Token（range_usage rolling_24h；否则 null） */
   recent24hTokens: number | null
+  /** 24h 口径来源：dashboard_stats=统计接口双区间；usage_list_2d(_partial)=明细「昨天~今天」兜底；null=无 24h 数据 */
+  recent24hSource?: 'dashboard_stats' | 'usage_list_2d' | 'usage_list_2d_partial' | null
   /** 指标时间窗口：calendar_day / rolling_24h / range */
   usageWindow: 'calendar_day' | 'rolling_24h' | 'range' | null
   /** 今日使用金额来源：dashboard_stats(权威) / range_usage / logs(降级) */
@@ -513,11 +517,11 @@ export async function probeSiteEndpoints(origin: string): Promise<ProbeResult> {
   const USAGE_CANDIDATE_PATHS = [
     `/api/v1/usage?page=1&page_size=20&start_date=${probeDayKey}&end_date=${probeDayKey}&sort_by=created_at&sort_order=desc&timezone=Asia%2FShanghai`,
     '/api/usage?page=1&page_size=50',
+    // 区间统计接口（fork 变体，037 修复）：排在标准路径之前——探测信号按顺序取第一个命中，
+    // fork 版优先才能保住真正支持 start_date/end_date 的端点路径
+    `/api/v1/usage/stats?start_date=${probeDayKey}&end_date=${probeDayKey}&timezone=Asia%2FShanghai`,
     // 统计接口（Hubway 类 usage/dashboard/stats），按结构指纹识别，不按域名硬编码（方案 §3.1）
     '/api/v1/usage/dashboard/stats?timezone=Asia%2FShanghai',
-    // 区间统计接口（fork 变体）：靠 start_date/end_date 区分口径——
-    // 今日 = TODAY~TODAY，24 小时 = YESTERDAY~TODAY。探测期仅验证可达性，采集时由 queryTemplate 注入真实日期。
-    `/api/v1/usage/stats?start_date=${probeDayKey}&end_date=${probeDayKey}&timezone=Asia%2FShanghai`,
     '/api/data/self',
     '/api/v1/data/self',
     '/api/user/usage',
@@ -1286,6 +1290,11 @@ export async function collectInPage(
   let ruTodayRequests: number | null = null
   let ruRecent24hCost: number | null = null
   let ruRecent24hTokens: number | null = null
+  // 24 小时口径的「明细兜底」结果（仅当站点无 usage_stats 端点时启用，方案 035 R2）
+  let luRecent24hCost: number | null = null
+  let luRecent24hTokens: number | null = null
+  let luRecent24hSource: 'usage_list_2d' | 'usage_list_2d_partial' | null = null
+  let recent24hSource: 'dashboard_stats' | 'usage_list_2d' | 'usage_list_2d_partial' | null = null
   let unitAssumed = false
   let usageStatsSource: 'dashboard_stats' | 'account_snapshot' | 'range_usage' | null = null
   let todayCostSource: 'dashboard_stats' | 'range_usage' | 'logs' | null = null
@@ -1891,6 +1900,8 @@ export async function collectInPage(
 
     // ===== 当日用量明细列表（usage_list）：采集 /api/v1/usage 等，供详情页「当日使用趋势」画图 =====
     // 完全自包含；仅白名单字段落账（P0-2）；按业务日过滤；分页读到终点或上限（P1：完整性）。
+    // 站点是否具备统计端点：决定 24 小时口径是否需要走明细兜底（方案 035 R2）。
+    const hasUsageStatsEndpoint = endpoints.some((e: any) => e.role === 'usage_stats' && e.path)
     const configuredUsageListEps = endpoints.filter((e: any) => e.role === 'usage_list' && e.path)
     const usageListCandidates = [...configuredUsageListEps]
     const candidatePaths = new Set(usageListCandidates.map((e: any) => e.path))
@@ -2346,6 +2357,52 @@ export async function collectInPage(
         if (recCostByCurrency[stratCurrency] != null) todayCost = todayCost ?? recCostByCurrency[stratCurrency]
         usageSource = usageSource ?? 'usage_list'
       }
+
+      // ── 24 小时口径兜底（方案 035 R2）──────────────────────────────
+      // 仅当站点**没有 usage_stats 端点**（拿不到统计接口的双区间）时才执行，避免多打一次请求。
+      // 用「昨天 ~ 今天」的用量明细聚合，与站点 UI「近 24 小时」= 昨天+今天 两个自然日 一致。
+      // 安全约束：只累加币种等于策略币种的记录（P1-3 不跨币种相加）；无 cost 字段 → 保持 null，绝不编造。
+      if (!hasUsageStatsEndpoint && kind === 'hubway_v1' && usageListEp?.path) {
+        const prevDay = fmtDate(new Date(Date.now() - 86400000 + tzOffMin * 60000))
+        const h24End = endDay // 多取一天，规避 end 独占/排他歧义，再按业务日过滤
+        let h24Cost: number | null = null
+        let h24Tokens = 0
+        let h24Truncated = false
+        for (let p = 1; p <= 3; p++) {
+          const hUrl = `${origin}${usageListEp.path}?page=${p}&page_size=20&start_date=${prevDay}&end_date=${h24End}&sort_by=created_at&sort_order=desc&timezone=Asia%2FShanghai`
+          const hT0 = performance.now()
+          const hr = await fetchJson(hUrl)
+          const hDt = performance.now() - hT0
+          if (!hr.status || hr.status >= 400 || !hr.isJson || !hr.json) break
+          const hd = unwrap(hr.json)
+          const hArr = hd ? findList(hd) : null
+          if (!hArr || hArr.length === 0) break
+          for (const item of hArr) {
+            const ts = recTs(item)
+            if (ts != null) {
+              const k = dayKeyOf(ts)
+              if (k !== prevDay && k !== targetDay) continue // 服务端区间可能含相邻日，客户端二次过滤
+            }
+            const cost = recCost(item)
+            if (cost != null) {
+              const cur = recCurrency(item, ['cost_currency', 'currency']) ?? stratCurrency
+              if (cur === stratCurrency) h24Cost = (h24Cost ?? 0) + cost
+            }
+            const tk =
+              recNum(item, ['token_used', 'total_tokens', 'tokens']) ??
+              ((recNum(item, ['prompt_tokens', 'input_tokens']) ?? 0) + (recNum(item, ['completion_tokens', 'output_tokens']) ?? 0))
+            h24Tokens += tk
+          }
+          recordDiag('usage', hUrl, hr.status, 'application/json', Math.round(hDt), null, `24h 兜底明细 p=${p}（${prevDay}~${targetDay}）`)
+          if (hArr.length < 20) break
+          if (p === 3) h24Truncated = true
+        }
+        if (h24Cost != null) {
+          luRecent24hCost = h24Cost
+          luRecent24hTokens = h24Tokens > 0 ? h24Tokens : null
+          luRecent24hSource = h24Truncated ? 'usage_list_2d_partial' : 'usage_list_2d'
+        }
+      }
     }
 
     // ===== 统计接口 + IKunCode provider 采集（方案 §4/§7）=====
@@ -2422,6 +2479,54 @@ export async function collectInPage(
               if (p) {
                 ruRecent24hCost = p.todayCost
                 ruRecent24hTokens = p.cumulativeTokens
+              }
+            }
+          }
+
+          // ── 区间有效性自愈（037 修复）──────────────────────────
+          // 「今日」与「24h」两次请求返回**完全相同**的数值，强烈提示当前端点不支持
+          // start_date/end_date 过滤（老版 dashboard/stats 默认就返回近 24h）。
+          // 此时若当前路径不是 fork 变体 /usage/stats，改用 fork 路径重试两个区间——
+          // fork 端点才真正按日期区间区分口径。fork 重试失败则保留原值（不回退今日为 null，
+          // 避免标准站点「昨日恰好零消耗」的合法同值被误杀）。
+          const epPathname = (() => {
+            try {
+              return new URL(origin + ep.path).pathname
+            } catch {
+              return ep.path
+            }
+          })()
+          const isForkPath = epPathname.endsWith('/usage/stats') && !epPathname.includes('/usage/dashboard/stats')
+          if (dsTodayCost != null && ruRecent24hCost != null && dsTodayCost === ruRecent24hCost && !isForkPath) {
+            const mkForkEp = (startDate: string, endDate: string) => ({
+              ...ep,
+              path: '/api/v1/usage/stats',
+              queryTemplate: { ...baseQuery, start_date: startDate, end_date: endDate, timezone: 'Asia/Shanghai' },
+            })
+            const fToday = await requestEndpoint(mkForkEp(dayKey, dayKey))
+            if (fToday.status >= 200 && fToday.status < 400 && fToday.isJson && fToday.json) {
+              const f0 = unwrapStats(fToday.json)
+              const fr = f0 ? extractDashboardStats(f0) : null
+              if (fr && fr.todayCost != null) {
+                recordDiag('usage', `${origin}${ep.path}`, fToday.status, 'application/json', fToday.elapsedMs, f0, `usage_stats fork 自愈·今日（${dayKey}，原端点两区间同值）`)
+                dsTodayCost = fr.todayCost
+                dsCumulativeTokens = fr.cumulativeTokens
+                dsCumulativeInputTokens = fr.cumulativeInputTokens
+                dsCumulativeOutputTokens = fr.cumulativeOutputTokens
+                dsAvgResponseTimeMs = fr.avgResponseTimeMs
+                usageStatsSource = 'dashboard_stats'
+                usageWindowVal = 'calendar_day'
+                datedOk = true
+                const fH24 = await requestEndpoint(mkForkEp(prevDayKey, dayKey))
+                if (fH24.status >= 200 && fH24.status < 400 && fH24.isJson && fH24.json) {
+                  const fh0 = unwrapStats(fH24.json)
+                  const fp2 = fh0 ? extractDashboardStats(fh0) : null
+                  if (fp2 && fp2.todayCost != null) {
+                    recordDiag('usage', `${origin}${ep.path}`, fH24.status, 'application/json', fH24.elapsedMs, fh0, `usage_stats fork 自愈·24h（${prevDayKey}~${dayKey}）`)
+                    ruRecent24hCost = fp2.todayCost
+                    ruRecent24hTokens = fp2.cumulativeTokens
+                  }
+                }
               }
             }
           }
@@ -2520,6 +2625,16 @@ export async function collectInPage(
     usageFailed = true
   }
 
+  // 24 小时口径最终取值（方案 035 R2）：统计接口（usage_stats 双区间）优先，
+  // 无 stats 端点时退回明细兜底「昨天~今天」。二者皆无 → 保持 null（UI 显示「24h 无数据」），绝不拿今日值冒充。
+  if (ruRecent24hCost == null && luRecent24hCost != null) {
+    ruRecent24hCost = luRecent24hCost
+    ruRecent24hTokens = ruRecent24hTokens ?? luRecent24hTokens
+    recent24hSource = luRecent24hSource
+  } else if (ruRecent24hCost != null) {
+    recent24hSource = 'dashboard_stats'
+  }
+
   // 所有独立 provider 都完成后再判定整轮失败。
   // 余额接口未命中不应吞掉 Hubway 统计接口已取得的指标。
   const resolvedAuthEvidence = resolveAuthEvidence()
@@ -2587,6 +2702,7 @@ export async function collectInPage(
       totalConsumedCost: null,
       recent24hCost: null,
       recent24hTokens: null,
+      recent24hSource: null,
       usageWindow: null,
       todayCostSource: null,
       usageStatsSource: null,
@@ -2661,6 +2777,7 @@ export async function collectInPage(
     // 只有已验证的账户语义契约才允许把 quota 按货币单位换算；其余站点仍走原有余额字段，
     // 防止某个同名 quota 字段在缺少 quota_per_unit 时被猜测性换算。
     // 对 DoCode，若同轮没取得 quota_per_unit，宁可留空也绝不回退为 quota - used_quota。
+    balanceUnits: applyContract ? billingConfig : null,
     balance: docodeUnitUnavailable ? null : accountBalance ?? balance,
     used: docodeUnitUnavailable ? null : accountConsumed ?? used,
     totalQuota: accountTotalQuota != null
@@ -2694,6 +2811,7 @@ export async function collectInPage(
     totalConsumedCost: accountConsumed != null ? accountConsumed : ikTotalConsumedCost,
     recent24hCost: ruRecent24hCost,
     recent24hTokens: ruRecent24hTokens,
+    recent24hSource,
     usageWindow: usageWindowVal,
     todayCostSource: finalTodayCostSource,
     usageStatsSource,

@@ -1,28 +1,35 @@
+import { setupBalanceAlerts, stopBalanceAlerts, restoreBalanceAlertSchedule, flushBalanceAlerts } from './alerts'
 // AI Relay Service Worker — 唤醒入口
 // 职责：图标点击行为（实验室「用量看板」开关 + 配置界面的「单击行为」单选共同决定单击弹极简面板还是开侧栏）、
 // 确保采集 alarm、注册消息路由。无长驻状态（MV3）。
-import { ensureSchedulers, setupScheduler } from './scheduler'
+import { reconcileSchedulerResources, setupScheduler } from './scheduler'
+import { configurePluginResources, initializePlugin, reconcilePluginRuntime, runPluginTask } from './pluginGate'
 import { registerMessageRouter } from './router'
-import { getLabCorsUnblock, db, runAuthStateMigration } from '../storage'
-import { applyCorsRules } from './corsRules'
+import { getLabCorsUnblock, runAuthStateMigration } from '../storage'
+import { reconcileCorsResources } from './corsRules'
 import { applyIconBehavior } from './popupBehavior'
 
 console.log('[AI Relay] Service Worker started')
 
-// 预打开 IndexedDB（含一次性迁移）：避免在首条消息的异步 handler 内才懒打开，
-// 降低 MV3 SW 在「打开+迁移」期间被休眠、导致 handler 挂死/客户端超时的概率。
-void db.open()
-  .then(() => runAuthStateMigration())
-  .catch((e) => console.warn('[AI Relay] DB 预打开/授权状态迁移失败', e))
+// Register one resource writer before any business handler or alarm can run.
+configurePluginResources(async (enabled) => {
+  if (enabled) {
+    await reconcileSchedulerResources(true)
+    await reconcileCorsResources(await getLabCorsUnblock())
+    await restoreBalanceAlertSchedule()
+  } else {
+    // Attempt both cleanup paths even if one Chrome API fails.
+    const results = await Promise.allSettled([
+      reconcileSchedulerResources(false), reconcileCorsResources(false), stopBalanceAlerts(),
+    ])
+    const failure = results.find((r) => r.status === 'rejected')
+    if (failure?.status === 'rejected') throw failure.reason
+  }
+  await applyIconBehavior()
+})
 
 chrome.runtime.onInstalled.addListener(() => {
-  // 确保采集 + 清理 alarm 存在且周期与设置一致
-  void ensureSchedulers()
-  // 若实验室 CORS 放行开启，重建规则
-  void getLabCorsUnblock().then((enabled) => applyCorsRules(enabled))
-  // 同步图标点击行为：实验室「用量看板」开关 + 配置界面「单击行为」单选共同决定
-  // 单击是弹极简面板还是开侧边栏（详见 popupBehavior.ts）。
-  void applyIconBehavior()
+  void initializePlugin().then(() => reconcilePluginRuntime())
 })
 
 // 配置侧栏路径（不靠 manifest default_path，避免「点击必弹侧栏」抢走 popup 点击）。
@@ -41,10 +48,17 @@ chrome.action.onClicked.addListener((tab) => {
 })
 
 // 每次 SW 唤醒都确保图标点击行为正确（setPopup 为持久化状态，重复执行幂等）。
-void applyIconBehavior()
+void applyIconBehavior().catch(() => {
+  // Keep a recovery page accessible even when preferences cannot be read.
+  void chrome.action.setPopup({ popup: 'src/popup/index.html' })
+})
 
 // 启动采集调度 + 消息路由（SW 唤醒即装配，休眠即释放，不依赖内存单例）
 setupScheduler()
+setupBalanceAlerts()
 registerMessageRouter()
+void initializePlugin().then(async (state) => {
+  if (state.effectiveState === 'enabled') await runPluginTask(async () => { await runAuthStateMigration(); await flushBalanceAlerts() })
+}).catch((e) => console.warn('[AI Relay] 初始化失败', e))
 
 console.log('[AI Relay] scheduler & message router registered')

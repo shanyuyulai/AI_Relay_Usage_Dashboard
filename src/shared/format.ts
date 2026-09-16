@@ -17,6 +17,8 @@ export function currencySymbol(currency: string | null | undefined): string {
 /** 余额格式化：null → 「—」；否则带币种符号 + 两位小数。 */
 export function fmtBalance(val: number | null, currency: string | null): string {
   if (val == null) return '—'
+  // 负号放符号前：-$1.23（比 $-1.23 更符合阅读习惯；负余额=欠费，是真实状态须显示）
+  if (val < 0) return '-' + currencySymbol(currency) + Math.abs(val).toFixed(2)
   return currencySymbol(currency) + val.toFixed(2)
 }
 

@@ -88,7 +88,40 @@ export type CollectFailureReason =
   | 'SCRIPT_INJECTION_FAILED'
   | 'SW_SESSION_UNAVAILABLE'
 
+
+/** 038: per-site original-currency rules; runtime revision is maintained by the backend. */
+export interface BalanceAlertRule {
+  id: string
+  label: string
+  threshold: number
+  currency: string
+  enabled: boolean
+  requireInteraction: boolean
+  revision: number
+  createdAt: number
+  updatedAt: number
+}
+export interface AlertRuleDraft {
+  id: string; label: string; threshold: string; currency: string
+  enabled: boolean; requireInteraction: boolean
+}
+export interface AlertBaseline {
+  key: string; siteId: string; ruleId: string; ruleSignature: string
+  context: string; balance: number; sequence: number; observationId: string
+}
+export interface AlertDelivery {
+  eventId: string; siteId: string; observationId: string; sequence: number
+  pluginRevision: number; createdAt: number; balance: number; currency: string
+  hits: { ruleId: string; signature: string; label: string; threshold: number; currency: string; requireInteraction: boolean }[]
+  status: 'pending' | 'delivered' | 'failed' | 'cancelled'
+  attempts: number; nextAttemptAt: number; lastError?: string
+}
+export interface AlertObservationMeta { siteId: string; sequence: number; lastRecordId: string }
+
 export interface SiteConfig {
+  /** Local-only generation to reject balances collected before station pause/context changes. */
+  alertGeneration?: number
+  alerts?: BalanceAlertRule[]
   id: string
   name: string
   baseUrl: string // 用户填写
@@ -128,9 +161,9 @@ export interface SiteConfig {
     /** 当日用量明细列表适配器种类（P0：适配器隔离，禁把 hubway 约定泛化）：hubway_v1 | generic | null */
     usageListKind?: 'hubway_v1' | 'generic' | null
     usageListPath?: string | null
-    /** 统计接口（usage/dashboard/stats）已发现 pathname（不含 query）。 */
+    /** 统计接口（usage/dashboard/stats 或 fork 变体 usage/stats）已发现 pathname（不含 query）。 */
     usageStatsPath?: string | null
-    usageStatsKind?: 'hubway_dashboard_stats' | null
+    usageStatsKind?: 'hubway_dashboard_stats' | 'hubway_range_stats' | null
     /** IKunCode 类组合 provider 的已发现 pathname（不含 query）。 */
     accountSnapshotPath?: string | null
     rangeUsagePath?: string | null
@@ -231,6 +264,8 @@ export interface Snapshot {
   recent24hCost?: number | null
   /** 滚动 24 小时 Token（range_usage rolling_24h 口径；否则 null）。 */
   recent24hTokens?: number | null
+  /** 24 小时口径来源：dashboard_stats=统计接口双区间 / usage_list_2d(_partial)=明细「昨天~今天」兜底 / null=无 24h 数据。 */
+  recent24hSource?: 'dashboard_stats' | 'usage_list_2d' | 'usage_list_2d_partial' | null
   /** 当前指标的时间窗口口径：calendar_day=自然日 / rolling_24h=近24h / range=自定义。用于 UI 标签区分。 */
   usageWindow?: 'calendar_day' | 'rolling_24h' | 'range' | null
   /** 今日使用金额来源：dashboard_stats(仪表盘统计接口)=权威 / logs(用量日志)=降级。 */

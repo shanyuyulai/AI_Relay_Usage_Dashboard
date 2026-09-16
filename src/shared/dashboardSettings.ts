@@ -17,21 +17,24 @@ import { normalizeCostWindow } from './costWindow'
 const CALC_REAL_COST_KEY = 'aihub.calcRealCost'
 const SHOW_TODAY_COST_KEY = 'aihub.showTodayCostInPopup'
 const COST_WINDOW_KEY = 'aihub.costWindow'
+const BALANCE_RMB_KEY = 'aihub.balanceRmbMode'
 
 /** 广播消息类型（popup / sidepanel 监听后重载）。 */
 export const AIHUB_SETTINGS_CHANGED = 'AIHUB_SETTINGS_CHANGED'
 
 /** 从 db.settings 读取两个开关与花费周期（缺失/非法 → 默认值）。 */
 export async function readDashboardSettings(): Promise<DashboardSettings> {
-  const [a, b, c] = await Promise.all([
+  const [a, b, c, d] = await Promise.all([
     settingsRepo.get<boolean>(CALC_REAL_COST_KEY),
     settingsRepo.get<boolean>(SHOW_TODAY_COST_KEY),
     settingsRepo.get<string>(COST_WINDOW_KEY),
+    settingsRepo.get<boolean>(BALANCE_RMB_KEY),
   ])
   return {
     calcRealCost: a === true,
     showTodayCostInPopup: b === true,
     costWindow: normalizeCostWindow(c),
+    balanceRmbMode: d === true,
   }
 }
 
@@ -40,6 +43,7 @@ export const dashboardSettings = reactive<DashboardSettings>({
   calcRealCost: false,
   showTodayCostInPopup: false,
   costWindow: 'today',
+  balanceRmbMode: false,
 })
 
 /** options 页面挂载时载入一次，同步响应式 store。 */
@@ -48,6 +52,7 @@ export async function loadDashboardSettings(): Promise<DashboardSettings> {
   dashboardSettings.calcRealCost = s.calcRealCost
   dashboardSettings.showTodayCostInPopup = s.showTodayCostInPopup
   dashboardSettings.costWindow = s.costWindow
+  dashboardSettings.balanceRmbMode = s.balanceRmbMode
   return s
 }
 
@@ -65,6 +70,14 @@ async function broadcastSettingsChanged(): Promise<void> {
   } catch {
     /* 跨页广播失败静默忽略（目标页面可能未打开） */
   }
+}
+
+/** 写入「余额显示真实人民币」并广播（全局开关，popup / sidepanel / options 三处同步）。 */
+export async function setBalanceRmbMode(v: boolean): Promise<void> {
+  const on = v === true
+  await settingsRepo.set(BALANCE_RMB_KEY, on)
+  dashboardSettings.balanceRmbMode = on
+  await broadcastSettingsChanged()
 }
 
 /** 写入花费统计周期并广播（popup / sidepanel / options 三处同步）。 */

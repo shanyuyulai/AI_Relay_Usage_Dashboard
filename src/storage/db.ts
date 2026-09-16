@@ -1,5 +1,6 @@
 import Dexie, { type Table } from 'dexie'
 import type {
+  AlertBaseline, AlertDelivery, AlertObservationMeta,
   SiteConfig,
   Snapshot,
   DailyStat,
@@ -12,6 +13,9 @@ import type {
 } from '../shared/types'
 
 export class AIHubDB extends Dexie {
+  alertBaselines!: Table<AlertBaseline, string>
+  alertDeliveries!: Table<AlertDelivery, string>
+  alertObservations!: Table<AlertObservationMeta, string>
   sites!: Table<SiteConfig, string>
   snapshots!: Table<Snapshot, number>
   dailyStats!: Table<DailyStat, string>
@@ -151,6 +155,13 @@ export class AIHubDB extends Dexie {
             if (!d.recordId) d.recordId = crypto.randomUUID()
           })
       })
+    // Runtime-only tables: never exported, never evaluated during historical import.
+    // Dexie carries forward all v5 stores; old data needs no destructive rewrite.
+    this.version(6).stores({
+      alertBaselines: 'key, siteId',
+      alertDeliveries: 'eventId, siteId, status, createdAt, nextAttemptAt',
+      alertObservations: 'siteId',
+    })
   }
 }
 

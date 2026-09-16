@@ -100,6 +100,7 @@ export interface ImportResult {
 
 // 入参载荷类型
 export interface AddSitePayload {
+  alerts?: SiteConfig['alerts']
   type: string
   name: string
   baseUrl: string
@@ -369,6 +370,11 @@ export interface DashboardSettings {
   showTodayCostInPopup: boolean
   /** 花费统计周期：'today' 取 todayCost、'h24' 取 recent24hCost；极简面板与侧边栏同步生效。 */
   costWindow: CostWindow
+  /**
+   * 余额显示真实人民币：开启后极简面板/侧边栏的站点余额按各站充值比例换算为人民币显示。
+   * 全局开关（点击任一站点余额即整体切换）；比例无效/缺失的站点仍显示原币种（方案 036）。
+   */
+  balanceRmbMode: boolean
 }
 
 export interface DashboardSummaryItem {
@@ -397,6 +403,14 @@ export interface SetCostWindowPayload {
 }
 export interface SetCostWindowResponse {
   window: CostWindow
+}
+
+// ── 余额显示真实人民币（全局开关，方案 036）──
+export interface SetBalanceRmbModePayload {
+  enabled: boolean
+}
+export interface SetBalanceRmbModeResponse {
+  enabled: boolean
 }
 export interface GetDashboardSummaryResponse {
   items: DashboardSummaryItem[]

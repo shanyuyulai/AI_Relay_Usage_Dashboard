@@ -23,6 +23,7 @@ import {
   setCalcRealCost,
   setShowTodayCostInPopup,
   setCostWindow,
+  setBalanceRmbMode,
 } from '../../shared/dashboardSettings'
 
 const props = defineProps<{ sites: SiteConfig[] }>()
@@ -87,6 +88,13 @@ const showTodayCostInPopup = computed({
   get: () => dashboardSettings.showTodayCostInPopup,
   set: (v: boolean) => {
     void setShowTodayCostInPopup(v)
+  },
+})
+// 余额显示真实人民币（全局开关，方案 036）
+const balanceRmbMode = computed({
+  get: () => dashboardSettings.balanceRmbMode === true,
+  set: (v: boolean) => {
+    void setBalanceRmbMode(v)
   },
 })
 // 花费统计周期（24 小时 / 今日）：决定总花费与所有「使用金额」取哪个口径
@@ -678,10 +686,14 @@ onMounted(() => {
         <input type="checkbox" v-model="showTodayCostInPopup" />
         <span>极简面板显示今日花费（在余额正下方显示花费行）</span>
       </label>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="balanceRmbMode" />
+        <span>站点余额显示真实人民币（极简面板/侧边栏点击余额可随时切换，按各站充值比例换算）</span>
+      </label>
       <div class="radio-group">
         <label class="radio-item">
           <input type="radio" value="h24" v-model="costWindow" />
-          <span><b>24 小时</b><br /><small>花费统计周期为滚动近 24 小时：极简面板顶栏「真实总花费」与所有「使用金额」取近 24h 数据（需站点支持该口径，不支持者显「—」）</small></span>
+          <span><b>24 小时</b><br /><small>花费统计周期为「昨天 ~ 今天」（与站点用量页的近 24 小时一致）：极简面板顶栏「真实总花费」与所有「使用金额」取该区间数据（需站点支持该口径，不支持者显「24h 无数据」）</small></span>
         </label>
         <label class="radio-item">
           <input type="radio" value="today" v-model="costWindow" />
@@ -691,6 +703,12 @@ onMounted(() => {
       <p class="lab-warn">
         充值比例含义：充值 <b>1 人民币</b> 到账多少站点计价货币。写法 <code>10</code>（=10）或
         <code>1:1.1</code>（冒号左 RMB、右站点货币 =1.1）。关闭「计算真实花费」不会清除已保存的比例，重新开启后仍生效。
+        余额换算同样使用该比例：<code>人民币余额 = 站点余额 ÷ 比例</code>；未填比例的站点仍显示原币种，不会臆造数值。
+      </p>
+      <p class="lab-warn">
+        <b>若「24 小时」显示「24h 无数据」</b>：说明当前快照里没有该口径数据。请到上方站点列表对该站点执行
+        <b>「探测」</b>后再<b>「立即同步」</b>——统计接口路径（<code>/api/v1/usage/stats</code> 等）需探测才会写入站点配置。
+        切换周期<b>不会</b>重新采集，读的是最近一次快照（顶栏提示会显示数据时间）。
       </p>
     </details>
 

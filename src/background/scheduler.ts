@@ -1,3 +1,4 @@
+import { runPluginTask, getPluginState, reconcilePluginRuntime } from './pluginGate'
 import { collectAllInTabs } from './pageCollect'
 import { purgeOlderThan, getRetentionDays, getCollectInterval } from '../storage'
 
@@ -13,7 +14,7 @@ async function runCollectAndNotify(): Promise<void> {
   } finally {
     // 采集完成（无论成功与否）广播，触发侧边栏/设置页自动刷新最新数据（无盲轮询）
     try {
-      await chrome.runtime.sendMessage({ type: 'COLLECT_DONE' })
+      if (getPluginState().effectiveState === 'enabled') await chrome.runtime.sendMessage({ type: 'COLLECT_DONE' })
     } catch {
       /* 无接收方时忽略 */
     }
@@ -37,9 +38,9 @@ export function setupScheduler(): void {
   if (!chrome.alarms?.onAlarm) return
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === ALARM_NAME) {
-      void runCollectAndNotify()
+      void runPluginTask(runCollectAndNotify).catch(() => {})
     } else if (alarm.name === PRUNE_ALARM) {
-      void runPrune()
+      void runPluginTask(runPrune).catch(() => {})
     }
   })
 }
@@ -54,20 +55,29 @@ async function reconcileCollectAlarm(): Promise<void> {
   }
   if (!existing || existing.periodInMinutes !== interval) {
     if (existing) await chrome.alarms.clear(ALARM_NAME)
-    chrome.alarms.create(ALARM_NAME, { periodInMinutes: interval })
+    await chrome.alarms.create(ALARM_NAME, { periodInMinutes: interval })
   }
 }
 
 /** 确保采集 + 清理 alarm 存在且周期正确（SW 启动时调用）。 */
-export async function ensureSchedulers(): Promise<void> {
+/** Raw writer: only the plugin coordinator may call this. */
+export async function reconcileSchedulerResources(enabled: boolean): Promise<void> {
+  if (!chrome.alarms) return
+  if (!enabled) {
+    await Promise.all(['aihub-collect', 'aihub-prune', 'aihub-alert-retry'].map((name) => chrome.alarms.clear(name)))
+    return
+  }
   await reconcileCollectAlarm()
   const existingPrune = await chrome.alarms.get(PRUNE_ALARM)
   if (!existingPrune) {
-    chrome.alarms.create(PRUNE_ALARM, { periodInMinutes: PRUNE_PERIOD_MIN })
+    await chrome.alarms.create(PRUNE_ALARM, { periodInMinutes: PRUNE_PERIOD_MIN })
   }
 }
 
 /** 用户改设置后即时重建采集 alarm（免重启扩展）。 */
+export async function ensureSchedulers(): Promise<void> {
+  await reconcilePluginRuntime()
+}
 export async function applyInterval(): Promise<void> {
-  await reconcileCollectAlarm()
+  await reconcilePluginRuntime()
 }

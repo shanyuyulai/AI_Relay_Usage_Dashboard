@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import SiteAvatar from '../../shared/SiteAvatar.vue'
 import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import Chart from 'chart.js/auto'
 import { send, MessagingError } from '../../core/messaging/client'
@@ -590,9 +591,7 @@ function openOrigin(url: string) {
       <!-- 站点头卡 -->
       <div class="site-card-head">
         <div class="sc-top">
-          <div class="avatar" :style="{ background: site.color }">
-            {{ site.name.charAt(0).toUpperCase() }}
-          </div>
+          <SiteAvatar :name="site.name" :origin="site.origin" :color="site.color" :size="34" />
           <div class="sc-info">
             <div class="sc-name">
               {{ site.name }}

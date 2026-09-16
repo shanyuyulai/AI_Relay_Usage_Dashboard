@@ -1,3 +1,6 @@
+import { acquireSiteLock } from './limits'
+import { assertPluginEnabled, getPluginState } from './pluginGate'
+import { commitBalanceSnapshot } from './balanceCommit'
 /**
  * 实验室：Service Worker 零标签后台采集。
  *
@@ -289,7 +292,16 @@ function quotaToCurrency(value: number | null, currency: string): number | null 
  * 实验室零标签采集（SW 内）。不调用 refresh 等有副作用 POST。
  * 统计接口即使余额端点不可用，也会尽量保存可验证的部分快照。
  */
-export async function collectViaSw(site: SiteConfig): Promise<CollectResult> {
+export function collectViaSw(site: SiteConfig): Promise<CollectResult> {
+  return acquireSiteLock(site.id, async () => {
+    await assertPluginEnabled()
+    const current = await siteRepo.get(site.id)
+    if (!current?.enabled) return { siteId: site.id, ok: false, message: '站点已停用或删除' }
+    return collectViaSwUnlocked(current)
+  })
+}
+async function collectViaSwUnlocked(site: SiteConfig): Promise<CollectResult> {
+  const alertRevision = getPluginState().revision
   const cookie = await readCookieHeader(site.origin)
   if (!cookie) {
     // 方案 029 §5.6 / §D：读不到 Cookie 不等于登录失效；标记为实验室会话不可用，
@@ -429,13 +441,16 @@ export async function collectViaSw(site: SiteConfig): Promise<CollectResult> {
     cumulativeInputTokens: stats?.cumulativeInputTokens ?? null,
     cumulativeOutputTokens: stats?.cumulativeOutputTokens ?? null,
     totalConsumedCost: norm.totalConsumedCost,
+    // 已知限制（方案 035 R5）：本实验室通道不发「昨天~今天」的第二次请求，故不提供 24 小时口径；
+    // 保持 null → UI 显示「24h 无数据」，绝不用今日值冒充。
     recent24hCost: null,
     recent24hTokens: null,
+    recent24hSource: null,
     usageWindow: stats?.todayCost != null ? 'calendar_day' : null,
     todayCostSource: stats?.todayCost != null ? 'dashboard_stats' : usage.todayCost != null ? 'logs' : null,
     usageStatsSource: stats != null ? 'dashboard_stats' : effectiveAccount != null ? 'account_snapshot' : null,
   }
-  await snapshotRepo.append(snapshot)
+  await commitBalanceSnapshot(site, snapshot, alertRevision)
   if (snapshot.todayTokens != null) await dailyStatRepo.upsertForDay(snapshot)
   await authStateRepo.apply(site.id, {
     state: 'authenticated',

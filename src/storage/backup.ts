@@ -1,3 +1,5 @@
+import { normalizeAlertRules, exportAlertRules } from '../shared/alertRules'
+import { invalidateSiteAlertState } from './alerts'
 /**
  * 全量数据备份 / 还原（GPT terra High 评审通过后实现）。
  *
@@ -40,7 +42,7 @@ const SNAPSHOT_KEYS: (keyof Snapshot)[] = [
   'cumulativeTokensSource', 'apiRoundTripMs', 'avgResponseTimeMs', 'metricsPartial',
   // 统计接口 + IKunCode provider 采集字段（方案 §2/§7）
   'cumulativeInputTokens', 'cumulativeOutputTokens', 'totalConsumedCost', 'recent24hCost',
-  'recent24hTokens', 'usageWindow', 'todayCostSource', 'usageStatsSource',
+  'recent24hTokens', 'recent24hSource', 'usageWindow', 'todayCostSource', 'usageStatsSource',
 ]
 const DAILY_KEYS: (keyof DailyStat)[] = [
   'siteId', 'date', 'tokens', 'requests', 'cost', 'currency', 'byModel', 'source',
@@ -64,7 +66,7 @@ const DIAGNOSTIC_DROP_KEYS = ['id']
 const SITE_KEYS: (keyof SiteConfig)[] = [
   'id', 'name', 'baseUrl', 'origin', 'adapter', 'color', 'enabled', 'order',
   'createdAt', 'currency', 'discovered', 'customRequests',
-  'rechargeRate',
+  'rechargeRate', 'alerts',
 ]
 // 递归扫描禁止的敏感字段名（仅查字段名，不查值，避免 URL 等正常内容误报）
 const FORBIDDEN_KEY = /^(cookie|token|authorization|session|password|secret|apikey|api_key|accesstoken|refreshtoken)$/i
@@ -111,6 +113,7 @@ const PORTABLE_SETTING_KEYS = new Set<string>([
   'aihub.calcRealCost',
   'aihub.showTodayCostInPopup',
   'aihub.costWindow',
+  'aihub.balanceRmbMode',
   // 实验室开关（均为用户偏好布尔，无敏感值）
   'aihub.lab.zeroTab',
   'aihub.lab.corsUnblock',
@@ -215,6 +218,7 @@ export async function exportAll(): Promise<ExportConfig> {
       .sort((a, b) => orderKey(a) - orderKey(b))
       .map((s) => {
         const picked = pick(s, SITE_KEYS) as SiteConfig
+        if (s.alerts !== undefined) picked.alerts = exportAlertRules(s)
         assertNoForbiddenKeys(picked)
         return picked
       }),
@@ -298,6 +302,12 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
       const found = byOrigin.get(origin)
       // 导入侧：仅按 SITE_KEYS 投影（P0-1 双向白名单），非白名单字段一律丢弃；rechargeRate 复用严格校验
       const pickSite = pick(s, SITE_KEYS) as Partial<SiteConfig>
+      if (Object.prototype.hasOwnProperty.call(s, 'alerts')) {
+        pickSite.alerts = normalizeAlertRules(s.alerts, s.currency || found?.currency || 'USD', found?.alerts)
+      } else if (found?.alerts && s.currency && s.currency !== found.currency) {
+        // An old backup changing currency cannot silently reinterpret enabled old thresholds.
+        pickSite.alerts = normalizeAlertRules(found.alerts.map((r) => ({ ...r, enabled: false })), s.currency, found.alerts)
+      }
       if (pickSite.rechargeRate != null && parseRechargeRate(pickSite.rechargeRate) == null) {
         pickSite.rechargeRate = undefined
       }
@@ -353,10 +363,11 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
   const tables = config.tables
   await db.transaction(
       'rw',
-      [db.sites, db.credentials, db.snapshots, db.dailyStats, db.captures, db.diagnostics, db.usageRecords, db.settings],
+      [db.sites, db.credentials, db.snapshots, db.dailyStats, db.captures, db.diagnostics, db.usageRecords, db.settings, db.alertBaselines, db.alertDeliveries],
       async () => {
         const credentialUpdatedAt = Date.now()
         for (const site of siteWrites) {
+          await invalidateSiteAlertState(await db.sites.get(site.id), site)
           await db.sites.put(site)
           await db.credentials.put({
             siteId: site.id,

@@ -6,10 +6,10 @@ import type {
   DashboardSummaryItem,
   DashboardSettings,
   SetCostWindowResponse,
+  SetBalanceRmbModeResponse,
 } from '../core/messaging/protocol'
-import { fmtBalance } from '../shared/format'
 import { isValidSiteUrl } from '../shared/util'
-import { fmtTodayCost } from '../shared/recharge'
+import { fmtTodayCost, fmtBalanceRmb } from '../shared/recharge'
 import { AIHUB_SETTINGS_CHANGED } from '../shared/dashboardSettings'
 import {
   normalizeCostWindow,
@@ -17,6 +17,7 @@ import {
   pickCost,
   sumCostTotal,
   fmtCostTotal,
+  fmtAsOf,
   type CostWindow,
 } from '../shared/costWindow'
 
@@ -25,9 +26,12 @@ const settings = ref<DashboardSettings>({
   calcRealCost: false,
   showTodayCostInPopup: false,
   costWindow: 'today',
+  balanceRmbMode: false,
 })
 const loading = ref(true)
 const error = ref('')
+/** 轻提示（如设置写入失败）：不弹窗、不打断操作，顶部一行小字（方案 035 R4）。 */
+const notice = ref('')
 
 // 花费统计周期（今日 / 24 小时）+ 真实总花费（跨币种不直接相加，先换算人民币再求和）
 const costWindow = computed<CostWindow>(() => normalizeCostWindow(settings.value.costWindow))
@@ -35,20 +39,67 @@ const calcRealCost = computed(() => settings.value.calcRealCost === true)
 const costTotal = computed(() => sumCostTotal(items.value, costWindow.value, calcRealCost.value))
 const costText = computed(() => fmtCostTotal(costTotal.value, calcRealCost.value, costWindow.value))
 
-/** 切换花费统计周期：本地乐观更新（两个周期字段已随摘要下发），并持久化 + 广播给侧边栏。 */
+/** 切换花费统计周期：本地立即生效（两个周期字段已随摘要下发），再持久化 + 广播给侧边栏。
+ *  写入失败**不静默回退**（方案 035 R4）：保留用户本次选择并给出提示，避免出现「点了没反应」。 */
 async function toggleCostWindow() {
   const next: CostWindow = costWindow.value === 'h24' ? 'today' : 'h24'
   settings.value = { ...settings.value, costWindow: next }
+  notice.value = ''
   try {
     await send<SetCostWindowResponse>('SET_COST_WINDOW', { window: next })
   } catch {
-    void load() // 写入失败：回退为服务端实际值
+    notice.value = '周期切换未保存，请重试'
+  }
+}
+
+// ── 余额显示真实人民币（全局开关，方案 036）────────────────
+const balanceRmbMode = computed(() => settings.value.balanceRmbMode === true)
+
+/** 最新快照时间（用于「数据截至」提示，明确切换周期不会重新采集）。 */
+const latestUpdatedAt = computed<number | null>(() => {
+  let max: number | null = null
+  for (const it of items.value) {
+    if (it.updatedAt && (max == null || it.updatedAt > max)) max = it.updatedAt
+  }
+  return max
+})
+const costTitleWithAsOf = computed(() => `${costText.value.title}${fmtAsOf(latestUpdatedAt.value)}`)
+
+/** 站点余额文本：人民币模式下按充值比例换算，比例无效则显示原币种。 */
+function balText(it: DashboardSummaryItem): string {
+  return fmtBalanceRmb(it.balance ?? null, it.currency, it.rechargeRate ?? null, balanceRmbMode.value).text
+}
+function balTitle(it: DashboardSummaryItem): string {
+  return fmtBalanceRmb(it.balance ?? null, it.currency, it.rechargeRate ?? null, balanceRmbMode.value).title
+}
+function balIsRmb(it: DashboardSummaryItem): boolean {
+  return fmtBalanceRmb(it.balance ?? null, it.currency, it.rechargeRate ?? null, balanceRmbMode.value).isRmb
+}
+
+/** 点击任一站点余额 → 全局切换（所有站点一起变），持久化 + 广播。 */
+async function toggleBalanceRmbMode() {
+  const next = !balanceRmbMode.value
+  settings.value = { ...settings.value, balanceRmbMode: next }
+  notice.value = ''
+  try {
+    await send<SetBalanceRmbModeResponse>('SET_BALANCE_RMB_MODE', { enabled: next })
+  } catch {
+    notice.value = '余额显示切换未保存，请重试'
   }
 }
 
 /** 站点行花费：按当前周期取 todayCost / recent24hCost，无数据显示「—」。 */
 function rowCost(it: DashboardSummaryItem): string {
   return fmtTodayCost(pickCost(it, costWindow.value), it.currency, it.rechargeRate ?? null, calcRealCost.value)
+}
+
+/** 站点行花费 title：无 24h 数据时说明原因与处置（方案 035 R2/R4）。 */
+function rowCostTitle(it: DashboardSummaryItem): string {
+  const base = costWindowShortLabel(costWindow.value) + '花费'
+  if (costWindow.value === 'h24' && it.recent24hCost == null) {
+    return base + '｜该站点暂无 24 小时口径数据：请在设置页执行「探测」后重新同步'
+  }
+  return base
 }
 
 function balClass(it: DashboardSummaryItem): string {
@@ -124,13 +175,15 @@ onUnmounted(() => {
   <div class="pop">
     <header class="pop-head">
       <span class="pop-title">极简面板</span>
-      <button class="pop-total" :title="costText.title" @click="toggleCostWindow">
+      <button class="pop-total" :title="costTitleWithAsOf" @click="toggleCostWindow">
         <span class="pt-label">真实总花费</span>
         <span class="pt-val">{{ costText.text }}</span>
         <span class="pt-win">{{ costWindowShortLabel(costWindow) }}</span>
       </button>
       <button class="pop-refresh" title="刷新" @click="load">↻</button>
     </header>
+
+    <div v-if="notice" class="pop-notice">{{ notice }}</div>
 
     <div v-if="loading" class="pop-state">加载中…</div>
     <div v-else-if="error" class="pop-state pop-err">{{ error }}</div>
@@ -144,14 +197,17 @@ onUnmounted(() => {
             <span class="dot" :class="'st-' + it.status"></span>
             <a class="pop-link" :href="safeHref(it)" target="_blank" rel="noopener noreferrer" :title="`打开 ${it.name}`">{{ it.name }}</a>
           </div>
-          <div class="pop-bal" :class="balClass(it)">
-            {{ it.balance == null ? '—' : fmtBalance(it.balance, it.currency) }}
-          </div>
+          <div
+            class="pop-bal"
+            :class="[balClass(it), { 'is-rmb': balIsRmb(it) }]"
+            :title="balTitle(it)"
+            @click="toggleBalanceRmbMode"
+          >{{ balText(it) }}</div>
         </div>
         <!-- 第二行：左侧更新时间，右侧今日花费（设置开启才显示） -->
         <div v-if="it.updatedAt || settings.showTodayCostInPopup" class="pop-row-sub">
           <div class="pop-sub">{{ relTime(it.updatedAt) }}</div>
-          <div v-if="settings.showTodayCostInPopup" class="pop-today" :title="`${costWindowShortLabel(costWindow)}花费`">
+          <div v-if="settings.showTodayCostInPopup" class="pop-today" :title="rowCostTitle(it)">
             {{ rowCost(it) }}
           </div>
         </div>
@@ -309,6 +365,11 @@ onUnmounted(() => {
   font-variant-numeric: tabular-nums;
   text-align: right;
   flex-shrink: 0;
+  /* 可点击：切换「站点货币 ⇄ 真实人民币」（全局，方案 036） */
+  cursor: pointer;
+  user-select: none;
+  border-radius: 5px;
+  padding: 0 3px;
 }
 .pop-bal.bal-high {
   color: var(--ok);
@@ -322,6 +383,18 @@ onUnmounted(() => {
 .pop-bal.is-null {
   color: var(--sub);
   font-weight: 400;
+}
+.pop-bal:hover {
+  outline: 1px solid var(--brand);
+}
+.pop-bal.is-rmb {
+  background: var(--panel-soft);
+  outline: 1px dashed var(--line);
+}
+.pop-notice {
+  font-size: 10px;
+  color: var(--warn);
+  margin-bottom: 6px;
 }
 .pop-sub {
   font-size: 11px;

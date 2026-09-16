@@ -1,6 +1,6 @@
 {
   "name": "ai-hub",
-  "version": "0.3.15",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "AI 中转站用量看板 — Chrome MV3 侧边栏插件",
@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "vue-tsc --noEmit",
+    "test": "node --test src/background/*.test.cjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -17,6 +18,7 @@
     "pinia": "^2.1.7"
   },
   "devDependencies": {
+    "fake-indexeddb": "^6.2.4",
     "@vitejs/plugin-vue": "^5.0.4",
     "@crxjs/vite-plugin": "^2.0.0-beta.0",
     "@types/chrome": "^0.0.268",

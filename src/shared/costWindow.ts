@@ -108,8 +108,19 @@ export function sumCostTotal(
   }
 }
 
+/**
+ * 数据时效说明（用于 title，方案 035 R3）：切换周期**不会**重新采集，读的是上次快照。
+ * 把快照时间显式告诉用户，避免误以为切换后没生效。
+ */
+export function fmtAsOf(ts: number | null | undefined): string {
+  if (!ts || !Number.isFinite(ts)) return ''
+  const d = new Date(ts)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `｜数据截至 ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 export interface CostTotalText {
-  /** 紧凑展示文本（如 "¥12.345" / "$12.35" / "多币种" / "—"）。 */
+  /** 紧凑展示文本（如 "¥12.345" / "$12.35" / "多币种" / "24h 无数据"）。 */
   text: string
   /** 完整说明（用于 title 提示）。 */
   title: string
@@ -125,13 +136,20 @@ export function fmtCostTotal(t: CostTotal, calcRealCost: boolean, w: CostWindow)
   const win = costWindowLabel(w)
   const suffix = `｜点击切换为${w === 'h24' ? '今日' : '24 小时'}`
 
+  // 「无数据」与「金额为 0 / 金额相同」必须在视觉上可区分，否则会被误读为「切换没生效」（方案 035 R4）
+  const noDataText = `${costWindowShortLabel(w)}无数据`
+  const noDataHint =
+    w === 'h24'
+      ? '站点未返回 24 小时口径数据：请在设置页对该站点执行「探测」后重新同步'
+      : '站点未返回今日花费数据'
+
   if (calcRealCost) {
     if (t.rmb == null) {
       const why =
         t.counted === 0
-          ? `当前无站点返回${win}花费数据`
+          ? `当前无站点返回${win}花费数据（${noDataHint}）`
           : `${t.counted} 个站点有${win}花费，但均未填写有效充值比例，无法换算人民币`
-      return { text: '—', title: `真实总花费（${win}）：${why}。${suffix}` }
+      return { text: t.counted === 0 ? noDataText : '—', title: `真实总花费（${win}）：${why}。${suffix}` }
     }
     const extra = t.unconverted > 0 ? `；${t.unconverted} 个站点缺充值比例未计入` : ''
     return {
@@ -142,7 +160,10 @@ export function fmtCostTotal(t: CostTotal, calcRealCost: boolean, w: CostWindow)
 
   const keys = Object.keys(t.byCurrency)
   if (keys.length === 0) {
-    return { text: '—', title: `总花费（${win}）：暂无站点花费数据。开启「计算真实花费」后可显示人民币真实总花费。${suffix}` }
+    return {
+      text: noDataText,
+      title: `总花费（${win}）：暂无站点花费数据（${noDataHint}）。开启「计算真实花费」后可显示人民币真实总花费。${suffix}`,
+    }
   }
   if (keys.length === 1) {
     const cur = keys[0]

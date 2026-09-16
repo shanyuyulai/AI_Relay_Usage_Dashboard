@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import SiteAvatar from '../shared/SiteAvatar.vue'
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
 import type { DashboardData, CollectResultMsg, CurrencyTotal } from '../core/messaging/protocol'
@@ -10,7 +11,7 @@ import { ensureOriginPermission, ensureOriginPermissions } from '../shared/permi
 import { isValidSiteUrl } from '../shared/util'
 import { shouldShowReauthorize } from '../core/authState'
 import { getLabShowDashboard, LAB_SHOWDASHBOARD_CHANGED } from '../storage/labConfig'
-import { fmtTodayCostParts } from '../shared/recharge'
+import { fmtTodayCostParts, fmtBalanceRmb } from '../shared/recharge'
 import { AIHUB_SETTINGS_CHANGED } from '../shared/dashboardSettings'
 import {
   normalizeCostWindow,
@@ -18,6 +19,7 @@ import {
   pickCost,
   sumCostTotal,
   fmtCostTotal,
+  fmtAsOf,
   type CostWindow,
 } from '../shared/costWindow'
 import SiteDetail from './components/SiteDetail.vue'
@@ -106,15 +108,47 @@ const costTotal = computed(() =>
 )
 const costText = computed(() => fmtCostTotal(costTotal.value, calcRealCost.value, costWindow.value))
 
-/** 切换花费统计周期：持久化 + 广播后重载，侧边栏与极简面板保持一致。 */
+/** 切换花费统计周期：持久化 + 广播后重载，侧边栏与极简面板保持一致。
+ *  写入失败不再静默无反应（方案 035 R4）：显式提示，便于区分「没保存」与「数据相同」。 */
 async function toggleCostWindow() {
   const next: CostWindow = costWindow.value === 'h24' ? 'today' : 'h24'
+  notice.value = ''
   try {
     await send<{ window: CostWindow }>('SET_COST_WINDOW', { window: next })
-  } finally {
     await loadDashboard()
+  } catch {
+    notice.value = '周期切换未保存，请重试'
   }
 }
+
+// ── 余额显示真实人民币（全局开关，方案 036；与极简面板同一设置）──
+const balanceRmbMode = computed(() => dashboard.value?.settings?.balanceRmbMode === true)
+
+function balParts(site: SiteConfig, latest: Snapshot | undefined) {
+  return fmtBalanceRmb(latest?.balance ?? null, latest?.currency ?? null, site.rechargeRate ?? null, balanceRmbMode.value)
+}
+
+async function toggleBalanceRmbMode() {
+  const next = !balanceRmbMode.value
+  notice.value = ''
+  try {
+    await send<{ enabled: boolean }>('SET_BALANCE_RMB_MODE', { enabled: next })
+    await loadDashboard()
+  } catch {
+    notice.value = '余额显示切换未保存，请重试'
+  }
+}
+
+/** 最新快照时间：说明「切换周期不会重新采集」（方案 035 R3）。 */
+const latestTakenAt = computed<number | null>(() => {
+  let max: number | null = null
+  for (const s of sites.value) {
+    const t = s.latest?.takenAt
+    if (t && (max == null || t > max)) max = t
+  }
+  return max
+})
+const costTitleWithAsOf = computed(() => `${costText.value.title}${fmtAsOf(latestTakenAt.value)}`)
 
 async function loadDashboard() {
   loading.value = true
@@ -246,6 +280,15 @@ function usageWindowLabel(w: string | null | undefined): string {
   return ''
 }
 
+/** 使用金额列的 title：无 24h 数据时明确告诉用户原因与处置（方案 035 R2/R4）。 */
+function costMetricTitle(latest: Snapshot | null | undefined): string {
+  const base = costWindowShortLabel(costWindow.value) + '使用金额（站点未返回则显 —）'
+  if (costWindow.value === 'h24' && latest?.recent24hCost == null) {
+    return base + '｜该站点暂无 24 小时口径数据：请在设置页对该站点执行「探测」后重新同步'
+  }
+  return base
+}
+
 const theme = ref<ThemeMode>('light')
 const themeIcon = computed(() => (theme.value === 'dark' ? '🌙' : theme.value === 'auto' ? '🔄' : '☀️'))
 
@@ -351,13 +394,14 @@ onUnmounted(() => {
         <!-- 仪表盘内容 -->
         <template v-else>
           <div v-if="errorMsg" class="toast-err">{{ errorMsg }}</div>
+          <div v-if="notice" class="toast-notice">{{ notice }}</div>
 
           <!-- 总览 4 卡 -->
           <div class="ov-grid">
             <div class="ov-card">
               <div class="ov-label ov-label-row">
                 <span class="ov-label-txt">总余额（按币种）</span>
-                <button class="ov-cost" :title="costText.title" @click="toggleCostWindow">{{ costText.text }}</button>
+                <button class="ov-cost" :title="costTitleWithAsOf" @click="toggleCostWindow">{{ costText.text }}</button>
               </div>
               <div class="ov-value">
                 {{ primaryTotal ? fmtBalance(primaryTotal.totalBalance, primaryTotal.currency) : '—' }}
@@ -408,9 +452,7 @@ onUnmounted(() => {
             @click="openDetail(s.site.id)"
           >
             <div class="sc-top">
-              <div class="avatar" :style="{ background: s.site.color }">
-                {{ s.site.name.charAt(0).toUpperCase() }}
-              </div>
+              <SiteAvatar :name="s.site.name" :origin="s.site.origin" :color="s.site.color" :size="34" />
               <div class="sc-info">
                 <div class="sc-name">
                   <a class="sc-link" :href="isValidSiteUrl(s.site.baseUrl) ? s.site.baseUrl : undefined" target="_blank" rel="noopener noreferrer" @click.stop>{{ s.site.name }}</a>
@@ -427,10 +469,15 @@ onUnmounted(() => {
             <div class="sc-metrics" :class="{ dimmed: !s.latest }">
               <div class="m">
                 <div class="k">余额</div>
-                <div class="v" :class="balanceClass(s.latest?.balance)">{{ fmtBalance(s.latest?.balance ?? null, s.latest?.currency ?? null) }}</div>
+                <div
+                  class="v v-bal"
+                  :class="[balanceClass(s.latest?.balance), { 'is-rmb': balParts(s.site, s.latest).isRmb }]"
+                  :title="balParts(s.site, s.latest).title"
+                  @click="toggleBalanceRmbMode"
+                >{{ balParts(s.site, s.latest).text }}</div>
               </div>
               <div class="m">
-                <div class="k" :title="`${costWindowShortLabel(costWindow)}使用金额（站点未返回则显 —）`">
+                <div class="k" :title="costMetricTitle(s.latest)">
                   {{ costWindowShortLabel(costWindow) }}使用
                   <span v-if="costWindow === 'today' && s.latest?.todayCostSource" class="src" :title="todayCostSrcTitle(s.latest.todayCostSource)">{{ todayCostSrcLabel(s.latest.todayCostSource) }}</span>
                 </div>
@@ -611,6 +658,26 @@ body {
   padding: 8px 12px;
   font-size: 11px;
   margin-bottom: 12px;
+}
+.toast-notice {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 11px;
+  margin-bottom: 12px;
+}
+/* 站点卡余额：可点击切换「站点货币 ⇄ 真实人民币」（全局，方案 036） */
+.v-bal {
+  cursor: pointer;
+  user-select: none;
+  border-radius: 5px;
+}
+.v-bal:hover {
+  outline: 1px solid var(--brand);
+}
+.v-bal.is-rmb {
+  background: var(--panel-soft);
 }
 
 /* 空状态 */

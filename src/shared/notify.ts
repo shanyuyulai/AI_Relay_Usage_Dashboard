@@ -1,3 +1,4 @@
+import { isPluginConfiguredEnabled } from '../storage/enableConfig'
 /**
  * 系统通知（带权限保护）。
  *
@@ -38,6 +39,7 @@ export async function maybeNotify(
   message: string,
   opts: NotifyOptions = {},
 ): Promise<boolean> {
+  if (!(await isPluginConfiguredEnabled())) return false
   let mode: NotifyMode
   try {
     mode = await resolveNotifyMode()
@@ -82,6 +84,7 @@ function getIconUrl(): string {
 }
 
 export interface NotifyOptions {
+  id?: string
   /** 是否要求用户手动关闭（更醒目，适合关键提醒）。 */
   requireInteraction?: boolean
   /** 优先级：-2~2，默认 1。 */
@@ -95,9 +98,10 @@ export async function notify(
   opts: NotifyOptions = {},
 ): Promise<boolean> {
   try {
-    if (!chrome.notifications) return false
+    if (!(await isPluginConfiguredEnabled()) || !chrome.notifications) return false
     const granted = await chrome.permissions.contains({ permissions: ['notifications'] })
     if (!granted) return false
+    if (!(await isPluginConfiguredEnabled())) return false
     await chrome.notifications.create({
       type: 'basic',
       iconUrl: getIconUrl(),
@@ -110,4 +114,51 @@ export async function notify(
   } catch {
     return false
   }
+}
+
+/** Structured result for alerts; browser acceptance is not proof the user saw a popup. */
+export type NotificationResult = 'accepted' | 'no_permission' | 'unavailable' | 'disabled' | 'failed'
+export async function sendSystemNotification(
+  title: string, message: string, opts: NotifyOptions,
+  stillAllowed: () => Promise<boolean> = isPluginConfiguredEnabled,
+): Promise<NotificationResult> {
+  try {
+    if (!(await isPluginConfiguredEnabled()) || !(await stillAllowed())) return 'disabled'
+    if (!chrome.notifications) return 'unavailable'
+    if (!(await chrome.permissions.contains({ permissions: ['notifications'] }))) return 'no_permission'
+    if (await getNotificationPermission() !== 'granted') return 'no_permission'
+    if (!(await stillAllowed()) || !(await isPluginConfiguredEnabled())) return 'disabled'
+    await chrome.notifications.create(opts.id ?? '', {
+      type: 'basic', iconUrl: getIconUrl(), title, message,
+      priority: opts.priority ?? 2, requireInteraction: opts.requireInteraction ?? true,
+    })
+    // A close that raced the browser API must remove the just-created alert.
+    if (!(await stillAllowed())) {
+      if (opts.id) await chrome.notifications.clear(opts.id)
+      return 'disabled'
+    }
+    return 'accepted'
+  } catch { return 'failed' }
+}
+
+/** Callback wrappers support the project's Chrome type baseline as well as modern MV3. */
+export function getNotificationPermission(): Promise<string> {
+  if (!chrome.notifications) return Promise.resolve('unavailable')
+  return new Promise((resolve, reject) => {
+    chrome.notifications.getPermissionLevel((level) => {
+      const error = chrome.runtime.lastError
+      if (error) reject(new Error(error.message))
+      else resolve(level)
+    })
+  })
+}
+export function getSystemNotifications(): Promise<Record<string, boolean>> {
+  if (!chrome.notifications) return Promise.resolve({})
+  return new Promise((resolve, reject) => {
+    chrome.notifications.getAll((items) => {
+      const error = chrome.runtime.lastError
+      if (error) reject(new Error(error.message))
+      else resolve(items as Record<string, boolean>)
+    })
+  })
 }

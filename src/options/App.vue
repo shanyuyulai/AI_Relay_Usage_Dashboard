@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import SiteAvatar from '../shared/SiteAvatar.vue'
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
 import type { ExportConfig, ImportResult, ReorderSitesResponse } from '../core/messaging/protocol'
@@ -581,13 +582,18 @@ const expandedSiteId = ref<string | null>(null)
 const drafts = ref<Record<string, string>>({})
 const capturingIds = ref<Record<string, boolean>>({})
 
-// —— 站点启用/禁用切换 ——
+// —— 站点启用/禁用切换：逐站点防重，成功后按持久化状态刷新 ——
+const togglingSiteIds = ref<Record<string, boolean>>({})
 async function toggleEnabled(site: SiteConfig) {
+  if (togglingSiteIds.value[site.id]) return
+  togglingSiteIds.value[site.id] = true
   try {
     await send('UPDATE_SITE', { id: site.id, patch: { enabled: !site.enabled } })
     await loadSites()
   } catch (e) {
     showToast(safeUiError(e))
+  } finally {
+    delete togglingSiteIds.value[site.id]
   }
 }
 
@@ -596,31 +602,41 @@ const diagSiteId = ref<string | null>(null)
 const diags = ref<DiagnosticEntry[]>([])
 const diagsLoading = ref(false)
 
+let diagRequestVersion = 0
+function closeDiag() {
+  diagRequestVersion++
+  diagSiteId.value = null
+  diags.value = []
+  diagsLoading.value = false
+}
 async function toggleDiag(site: SiteConfig) {
-  if (diagSiteId.value === site.id) {
-    diagSiteId.value = null
-    diags.value = []
-    return
-  }
+  if (diagSiteId.value === site.id) { closeDiag(); return }
+  const request = ++diagRequestVersion
   diagSiteId.value = site.id
+  diags.value = []
   diagsLoading.value = true
   try {
-    diags.value = await send<DiagnosticEntry[]>('GET_DIAGNOSTICS', { id: site.id })
+    const result = await send<DiagnosticEntry[]>('GET_DIAGNOSTICS', { id: site.id })
+    if (request === diagRequestVersion && diagSiteId.value === site.id) diags.value = result
   } catch (e) {
-    showToast(safeUiError(e))
-    diags.value = []
+    if (request === diagRequestVersion && diagSiteId.value === site.id) {
+      showToast(safeUiError(e))
+      diags.value = []
+    }
   } finally {
-    diagsLoading.value = false
+    if (request === diagRequestVersion && diagSiteId.value === site.id) diagsLoading.value = false
   }
 }
 
 async function clearDiags(site: SiteConfig) {
   if (!confirm(`确定清空站点「${site.name}」的全部诊断日志？`)) return
+  const request = ++diagRequestVersion
   try {
     await send<{ ok: boolean }>('CLEAR_DIAGNOSTICS', { id: site.id })
-    diags.value = []
+    if (request === diagRequestVersion && diagSiteId.value === site.id) { diags.value = []; diagsLoading.value = false }
     showToast('诊断日志已清空')
   } catch (e) {
+    if (request === diagRequestVersion && diagSiteId.value === site.id) diagsLoading.value = false
     showToast(safeUiError(e))
   }
 }
@@ -653,11 +669,12 @@ function diagExtractedIcon(v: boolean): string {
   return v ? '✅' : '❌'
 }
 
+function closeCustom() { expandedSiteId.value = null }
 function toggleCustom(site: SiteConfig) {
   if (expandedSiteId.value === site.id) {
     expandedSiteId.value = null
   } else {
-    drafts.value[site.id] = site.customRequests ?? ''
+    drafts.value[site.id] ??= site.customRequests ?? ''
     expandedSiteId.value = site.id
   }
 }
@@ -763,6 +780,7 @@ onUnmounted(() => {
     <header class="topbar">
       <div class="logo">AI</div>
       <span class="title">AI 中转站用量看板 · 设置</span>
+      <slot name="plugin-control" />
       <nav class="tabs" v-if="labShowDashboard">
         <button
           class="tab-toggle"
@@ -861,9 +879,7 @@ onUnmounted(() => {
             @dragstart="onDragStart($event, site)"
             @dragend="onDragEnd"
           >⠿</div>
-          <div class="avatar" :style="{ background: site.color }">
-            {{ site.name.charAt(0).toUpperCase() }}
-          </div>
+          <SiteAvatar :name="site.name" :origin="site.origin" :color="site.color" :size="36" />
           <div class="info">
             <div class="nm">
               {{ site.name }}
@@ -911,16 +927,23 @@ onUnmounted(() => {
                 :disabled="!canMoveDown(site)"
               >▼</button>
             </template>
-            <!-- 启用/禁用：动作动词文案，明确可点击（GPT 需求③） -->
-            <button
-              class="mini"
-              :class="site.enabled ? '' : 'accent'"
-              :title="site.enabled ? '点击禁用该站点（不采集、不在侧边栏展示）' : '点击启用该站点'"
-              @click="toggleEnabled(site)"
-            >
-              {{ site.enabled ? '禁用' : '启用' }}
-            </button>
+            <!-- 站点开关显示当前状态；原生button支持Space/Enter，保存期间防重。 -->
+            <div class="site-switch" :class="{ on: site.enabled }">
+              <button
+                type="button"
+                class="switch"
+                role="switch"
+                :aria-checked="site.enabled"
+                :aria-label="'启用站点 ' + site.name"
+                :aria-busy="!!togglingSiteIds[site.id]"
+                :disabled="!!togglingSiteIds[site.id]"
+                :title="site.enabled ? '点击禁用该站点（不采集、不在侧边栏展示）' : '点击启用该站点'"
+                @click="toggleEnabled(site)"
+              ><span class="knob" aria-hidden="true"></span></button>
+              <span class="site-switch-state" aria-live="polite">{{ togglingSiteIds[site.id] ? '保存中' : site.enabled ? '已启用' : '已禁用' }}</span>
+            </div>
             <button class="mini" @click="openEdit(site)">编辑</button>
+            <button class="mini" title="配置余额临界值与系统警报" @click="openEdit(site)">🔔 余额警报<span v-if="site.alerts?.length">（{{ site.alerts.filter(r => r.enabled).length }}）</span></button>
             <button
               class="mini"
               :class="site.lastStatus !== 'ok' ? 'accent' : ''"
@@ -981,8 +1004,9 @@ onUnmounted(() => {
 
           <!-- 自定义采集面板 -->
           <div v-if="expandedSiteId === site.id" class="custom-panel">
-            <div class="cp-title">
-              自定义采集请求（英文分号分隔，仅本站同源 GET，用于扩展采集任意可读接口供后续分析）
+            <div class="panel-heading">
+              <div class="cp-title">自定义采集请求（英文分号分隔，仅本站同源 GET，用于扩展采集任意可读接口供后续分析）</div>
+              <button type="button" class="mini panel-close" :aria-label="'关闭自定义采集：' + site.name" title="仅关闭面板，未保存草稿保留至页面关闭" @click="closeCustom">× 关闭</button>
             </div>
             <textarea
               v-model="drafts[site.id]"
@@ -1006,9 +1030,12 @@ onUnmounted(() => {
 
           <!-- 诊断日志面板 -->
           <div v-if="diagSiteId === site.id" class="diag-panel">
-            <div class="cp-title">
-              采集诊断日志（脱敏指纹：端点/状态码/字段类型/耗时，不含任何私密值）
-              <span class="diag-count">{{ diags.length }} 条</span>
+            <div class="panel-heading">
+              <div class="cp-title">
+                采集诊断日志（脱敏指纹：端点/状态码/字段类型/耗时，不含任何私密值）
+                <span class="diag-count">{{ diags.length }} 条</span>
+              </div>
+              <button type="button" class="mini panel-close" :aria-label="'关闭诊断日志：' + site.name" title="仅关闭面板，不清空日志" @click="closeDiag">× 关闭</button>
             </div>
             <div v-if="diagsLoading" class="state-msg">加载中…</div>
             <div v-else-if="diags.length === 0" class="diag-empty">暂无诊断日志。执行一次「立即同步」后将自动记录。</div>
@@ -1279,7 +1306,8 @@ body {
   transition: background 0.15s, border-color 0.15s;
   flex-shrink: 0;
 }
-.sort-switch.on .switch {
+.sort-switch.on .switch,
+.site-switch.on .switch {
   background: var(--brand);
   border-color: var(--brand);
 }
@@ -1294,12 +1322,25 @@ body {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   transition: transform 0.15s;
 }
-.sort-switch.on .knob {
+.sort-switch.on .knob,
+.site-switch.on .knob {
   transform: translateX(18px);
 }
 .switch:focus-visible {
   outline: 2px solid var(--brand);
   outline-offset: 2px;
+}
+.site-switch { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.site-switch-state { min-width: 36px; font-size: 11px; color: var(--sub); white-space: nowrap; }
+.site-switch.on .site-switch-state { color: var(--brand-text); }
+.site-switch .switch:disabled { opacity: .6; cursor: wait; }
+@media (prefers-reduced-motion: reduce) {
+  .site-switch .switch, .site-switch .knob { transition: none; }
+}
+@media (forced-colors: active) {
+  .site-switch .switch { border-color: ButtonText; }
+  .site-switch.on .switch { background: Highlight; }
+  .site-switch .knob { background: ButtonText; }
 }
 .sort-hint {
   font-size: 12px;
@@ -1906,4 +1947,8 @@ body {
   opacity: 0;
   transform: translateX(-50%) translateY(10px);
 }
+.panel-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:10px; }
+.panel-heading .cp-title { margin:0; min-width:0; overflow-wrap:anywhere; }
+.panel-close { flex-shrink:0; font-weight:600; border-color:var(--brand); color:var(--brand-text); }
+.panel-close:focus-visible { outline:2px solid var(--brand); outline-offset:2px; }
 </style>

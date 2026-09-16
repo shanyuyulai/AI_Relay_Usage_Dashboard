@@ -1,9 +1,10 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" class="app-scrollbars">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>AI 中转站用量看板 · 介绍文档</title>
+<link rel="stylesheet" href="./scrollbars.css" />
 <style>
   :root{
     --brand:#4f46e5; --brand2:#7c3aed; --accent:#10b981;
@@ -449,8 +450,18 @@
       <thead><tr><th>版本</th><th>状态</th><th>主要变动</th></tr></thead>
       <tbody>
         <tr>
-          <td><b>0.3.15</b></td>
+          <td><b>0.3.17</b></td>
           <td>当前</td>
+          <td>修复「今日 / 24 小时切换后金额相同」的真正根因：统计端点路径被硬编码为 <code>/api/v1/usage/dashboard/stats</code>，fork 变体站点（真实接口 <code>/api/v1/usage/stats</code>，需 start_date/end_date 才区分区间）的采集一直打到不支持日期参数的老端点，两次区间请求返回同一份数据。现改为：① 探测识别兼容 fork 路径并优先区间版字段（<code>total_actual_cost</code>）；② 探测候选顺序 fork 优先；③ 采集端自愈——两区间响应同值时自动改试 fork 路径重取（存量站点无需重新探测即可修复）。</td>
+        </tr>
+        <tr>
+          <td>0.3.16</td>
+          <td></td>
+          <td>① 修复「花费统计周期切换后金额不变」：24 小时口径此前与今日取自同一次响应（缺少 <code>start_date/end_date</code>），现改为两次显式区间请求——今日 = 今天~今天，24 小时 = 昨天~今天（与站点用量页一致）；无统计端点的站点自动用「昨天~今天」用量明细兜底。② 无数据时不再是「—」，改为显「24h 无数据」并在提示中说明需「探测 + 立即同步」，避免与「金额相同」混淆。③ 顶栏/侧边栏提示新增「数据截至 …」，明确切换周期不会重新采集；设置写入失败不再静默回退。④ 新增「站点余额显示真实人民币」全局开关：点击任意站点余额即在「站点货币 ⇄ 人民币余额（余额 ÷ 充值比例）」间切换，全部站点同步，未填比例的站点保持原币种。</td>
+        </tr>
+        <tr>
+          <td>0.3.15</td>
+          <td></td>
           <td>① 新增「真实总花费」：极简面板顶栏（标题与刷新按钮之间）常驻显示真实总花费，侧边栏「总余额（按币种）」标签右侧同步显示该数字；按各站充值比例换算为人民币后求和，缺比例或无数据的站点不计入、也不编造。② 新增「花费统计周期」设置（24 小时 / 今日）：切换后极简面板顶栏总花费、侧边栏总花费数字，以及两侧所有「今日使用 / 24h 使用」金额同步切换为对应口径（取 <code>recent24hCost</code> 或 <code>todayCost</code>）；站点不支持该口径时显「—」。③ 点击极简面板顶栏总花费或侧边栏该数字可直接切换周期；设置随全局备份一并导出恢复。</td>
         </tr>
         <tr>

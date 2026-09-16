@@ -1,3 +1,5 @@
+import { initializePlugin, getPluginState, setPluginEnabled, runPluginTask } from './pluginGate'
+import { acquireKeepAlive } from '../shared/keepAlive'
 import type { Req, Res } from '../core/messaging/protocol'
 import { handlers } from './handlers'
 
@@ -76,22 +78,6 @@ function isTrustedSender(sender: chrome.runtime.MessageSender): boolean {
   return false
 }
 
-/** MV3 SW 保活：异步 handler（IndexedDB 写入等）执行期间，SW 可能被休眠，
- *  导致 sendResponse 永不送达、客户端超时。用一个低频定时器维持 SW 活跃，回包后清除。 */
-let keepAliveTimer: ReturnType<typeof setInterval> | null = null
-function startKeepAlive(): void {
-  if (keepAliveTimer) return
-  keepAliveTimer = setInterval(() => {
-    void chrome.runtime.getPlatformInfo().catch(() => {})
-  }, 5000)
-}
-function stopKeepAlive(): void {
-  if (keepAliveTimer) {
-    clearInterval(keepAliveTimer)
-    keepAliveTimer = null
-  }
-}
-
 /** 注册后台消息路由：type → handler，统一回包结构并异步透传 requestId。 */
 export function registerMessageRouter(): void {
   if (!chrome.runtime?.onMessage) return
@@ -112,16 +98,23 @@ export function registerMessageRouter(): void {
       sendResponse({ requestId: req.requestId, ok: false, error: { kind: 'FORBIDDEN', message: '拒绝非扩展页面来源的消息' } } as Res)
       return false
     }
-    const handler = handlers[req.type]
+    const handler = req.type === 'GET_PLUGIN_ENABLED'
+      ? () => initializePlugin().then(() => getPluginState())
+      : req.type === 'SET_PLUGIN_ENABLED'
+        ? (payload: any) => setPluginEnabled(payload?.enabled)
+        : handlers[req.type]
     if (!handler) {
       console.warn('[AI Relay] 路由：未知消息类型', req.type)
       sendResponse({ requestId: req.requestId, ok: false, error: { kind: 'UNKNOWN_TYPE', message: req.type } } as Res)
       return false
     }
     console.info('[AI Relay] 路由：调用 handler', req.type, 'requestId=', req.requestId)
-    startKeepAlive()
+    const release = acquireKeepAlive()
     Promise.resolve()
-      .then(() => handler(req.payload, req))
+      .then(() => {
+        const control = ['GET_PLUGIN_ENABLED', 'SET_PLUGIN_ENABLED', 'EXPORT_CONFIG'].includes(req.type)
+        return control ? handler(req.payload, req) : runPluginTask(() => handler(req.payload, req))
+      })
       .then((data) => {
         console.info('[AI Relay] 路由：handler 成功', req.type, 'requestId=', req.requestId)
         sendResponse({ requestId: req.requestId, ok: true, data } as Res)
@@ -134,7 +127,7 @@ export function registerMessageRouter(): void {
           error: { kind: (e as { kind?: string })?.kind ?? 'ERROR', message: e instanceof Error ? e.message : String(e) },
         } as Res)
       })
-      .finally(() => stopKeepAlive())
+      .finally(release)
     return true // 异步 sendResponse：保持消息通道开放
   })
 }

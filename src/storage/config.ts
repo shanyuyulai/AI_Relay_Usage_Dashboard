@@ -1,3 +1,4 @@
+import { invalidateSiteAlertState } from './alerts'
 import { db } from './db'
 import type { SiteConfig, SettingsRow } from '../shared/types'
 
@@ -17,18 +18,31 @@ export const siteRepo = {
   },
 
   async update(id: string, patch: Partial<SiteConfig>): Promise<void> {
-    await db.sites.update(id, patch)
+    if (['alerts', 'currency', 'enabled', 'origin'].some((key) => Object.prototype.hasOwnProperty.call(patch, key))) {
+      await db.transaction('rw', db.sites, db.alertBaselines, db.alertDeliveries, async () => {
+        const previous = await db.sites.get(id)
+        if (!previous) return
+        const next = { ...previous, ...patch }
+        await invalidateSiteAlertState(previous, next)
+        await db.sites.update(id, { ...patch, alertGeneration: next.alertGeneration })
+      })
+    } else {
+      await db.sites.update(id, patch)
+    }
   },
 
   /** 删除站点时级联清理其凭证与历史（P0-2 凭证隔离：整站移除即无残留） */
   async remove(id: string): Promise<void> {
     await db.transaction(
       'rw',
-      db.sites,
+      [db.sites,
       db.credentials,
       db.snapshots,
-      db.dailyStats,
+      db.dailyStats, db.alertBaselines, db.alertDeliveries, db.alertObservations],
       async () => {
+        await db.alertBaselines.where('siteId').equals(id).delete()
+        await db.alertDeliveries.where('siteId').equals(id).delete()
+        await db.alertObservations.delete(id)
         await db.sites.delete(id)
         await db.credentials.delete(id)
         await db.snapshots.where('siteId').equals(id).delete()

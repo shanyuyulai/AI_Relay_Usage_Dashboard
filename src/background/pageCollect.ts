@@ -1,3 +1,6 @@
+import { acquireSiteLock } from './limits'
+import { assertPluginEnabled, getPluginState } from './pluginGate'
+import { commitBalanceSnapshot } from './balanceCommit'
 /**
  * 页面主世界采集编排（MV3 可靠路径）。
  *
@@ -100,7 +103,16 @@ async function persistPageDiagnostics(siteId: string, res: PageCollectResult, at
  * 单站采集（标签已解析）：在页面主世界注入 collectInPage 并落库（不存凭证，P0-2）。
  * 仅负责「注入 + 落库」；标签的查找/创建/关闭由编排函数 collectOrchestrate 统一处理。
  */
-export async function collectSiteInTab(site: SiteConfig, tabId: number, manual = false): Promise<CollectResult> {
+export function collectSiteInTab(site: SiteConfig, tabId: number, manual = false): Promise<CollectResult> {
+  return acquireSiteLock(site.id, async () => {
+    await assertPluginEnabled()
+    const current = await siteRepo.get(site.id)
+    if (!current?.enabled) return { siteId: site.id, ok: false, message: '站点已停用或删除' }
+    return collectSiteInTabUnlocked(current, tabId, manual)
+  })
+}
+async function collectSiteInTabUnlocked(site: SiteConfig, tabId: number, manual = false): Promise<CollectResult> {
+  const alertRevision = getPluginState().revision
   const collectRunId = crypto.randomUUID()
   await siteRepo.update(site.id, { lastCollectRunId: collectRunId })
   // 仅做 contains 检查（不主动 request，避免 SW 中弹授权窗）；缺权限则报错
@@ -228,11 +240,12 @@ export async function collectSiteInTab(site: SiteConfig, tabId: number, manual =
     totalConsumedCost: res.totalConsumedCost,
     recent24hCost: res.recent24hCost,
     recent24hTokens: res.recent24hTokens,
+    recent24hSource: res.recent24hSource ?? null,
     usageWindow: res.usageWindow,
     todayCostSource: res.todayCostSource,
     usageStatsSource: res.usageStatsSource,
   }
-  await snapshotRepo.append(snap)
+  await commitBalanceSnapshot(site, snap, alertRevision, res.balanceUnits)
   if (snap.todayTokens != null) await dailyStatRepo.upsertForDay(snap)
   const successfulRunAuthState = res.authEvidence?.state === 'unauthorized' ? 'unauthorized' : 'authenticated'
   const successfulRunEvidence: AuthEvidence = res.authEvidence?.state === 'authenticated' || res.authEvidence?.state === 'unauthorized'

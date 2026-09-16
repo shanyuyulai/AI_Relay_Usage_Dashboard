@@ -1,3 +1,6 @@
+import { getNotificationPermission } from '../shared/notify'
+import { normalizeAlertRules } from '../shared/alertRules'
+import { reconcilePluginRuntime } from './pluginGate'
 import {
   siteRepo,
   credentialRepo,
@@ -32,7 +35,7 @@ import { applyInterval } from './scheduler'
 import { registry } from '../adapters'
 import { normalizeOrigin, isValidSiteUrl, todayKey, dateKey, dateKeyInTz, HUBWAY_TZ, HUBWAY_TZ_OFFSET_MIN, isValidDateKey } from '../shared/util'
 import { parseRechargeRate } from '../shared/recharge'
-import { readDashboardSettings, setCostWindow } from '../shared/dashboardSettings'
+import { readDashboardSettings, setCostWindow, setBalanceRmbMode } from '../shared/dashboardSettings'
 import { normalizeCostWindow } from '../shared/costWindow'
 import type {
   CollectResultMsg,
@@ -58,6 +61,8 @@ import type {
   CollectIntervalResponse,
   SetCostWindowPayload,
   SetCostWindowResponse,
+  SetBalanceRmbModePayload,
+  SetBalanceRmbModeResponse,
   LabZeroTabPayload,
   LabZeroTabResponse,
   LabCorsPayload,
@@ -95,7 +100,7 @@ import type { Req } from '../core/messaging/protocol'
 import type { SiteConfig, SiteCollectionProfile, AccountSemantics } from '../shared/types'
 import { buildSiteCollectionProfile } from '../core/collectionProfile'
 import { authReasonToFailure } from '../core/authState'
-import { probeSiteEndpoints, type ProbeResult } from '../content/probe'
+import { probeSiteEndpoints, type ProbeResult, type ProbeAttempt } from '../content/probe'
 import { classifySite, type SiteFingerprint, type EndpointSignal } from '../core/classifySite'
 import { discoverNetworkRequests, type NetDiscoveryRequest } from './netDiscovery'
 
@@ -352,6 +357,7 @@ export const handlers: Record<string, Handler> = {
       lastCollectAt: null,
       lastStatus: 'unknown',
       currency: payload.currency || 'USD',
+      alerts: normalizeAlertRules(payload.alerts === undefined ? [] : payload.alerts, payload.currency || 'USD'),
       ...(rrRaw ? { rechargeRate: rrRaw } : {}),
     }
     await siteRepo.add(site)
@@ -359,6 +365,21 @@ export const handlers: Record<string, Handler> = {
     void refreshCorsRules() // 若 CORS 放行开启，同步新增规则
     broadcastSitesChanged() // 通知侧边栏实时刷新
     return { siteId: id }
+  },
+
+  async GET_BALANCE_ALERT_STATUS(payload: { id: string }) {
+    const site = await siteRepo.get(payload.id)
+    if (!site) throw new Error('站点不存在')
+    const rows = await db.alertDeliveries.where('siteId').equals(site.id).sortBy('createdAt')
+    let notificationPermission = 'unavailable'
+    try {
+      if (chrome.notifications && await chrome.permissions.contains({ permissions: ['notifications'] })) {
+        notificationPermission = await getNotificationPermission()
+      }
+    } catch { /* unavailable */ }
+    const latest = rows[rows.length - 1]
+    return { notificationPermission, pending: rows.filter((r) => r.status === 'pending').length,
+      latest: latest ? { status: latest.status, lastError: latest.lastError } : undefined }
   },
 
   async UPDATE_SITE(payload: UpdateSitePayload) {
@@ -393,6 +414,11 @@ export const handlers: Record<string, Handler> = {
         }
         patch.rechargeRate = rr
       }
+    }
+    if (Object.prototype.hasOwnProperty.call(payload.patch, 'alerts')) {
+      patch.alerts = normalizeAlertRules(payload.patch.alerts, patch.currency ?? existing.currency ?? 'USD', existing.alerts)
+    } else if (patch.currency && patch.currency !== existing.currency && existing.alerts) {
+      patch.alerts = normalizeAlertRules(existing.alerts.map((r) => ({ ...r, enabled: false })), patch.currency, existing.alerts)
     }
     await siteRepo.update(payload.id, patch)
     void refreshCorsRules() // 若 CORS 放行开启，同步启用/禁用规则
@@ -505,6 +531,13 @@ export const handlers: Record<string, Handler> = {
         else pathKey = new URL(a.url).pathname.replace(/\//g, '_').replace(/^_/, '')
         return {
           pathKey,
+          pathname: (() => {
+            try {
+              return new URL(a.url).pathname
+            } catch {
+              return undefined
+            }
+          })(),
           status: a.status,
           contentType: a.contentType,
           isJson: a.contentType.includes('json'),
@@ -541,26 +574,57 @@ export const handlers: Record<string, Handler> = {
       })
       const usageListPath = usageListAttempt ? new URL(usageListAttempt.url).pathname : null
 
-      // 统计接口（Hubway 类 usage/dashboard/stats）实际 pathname（去 query）：命中才持久化（方案 §3.1/§6）
+      // 统计接口实际 pathname（去 query）：命中才持久化（方案 §3.1/§6；037 修复）。
+      // 两类变体：
+      //   标准版   /usage/dashboard/stats —— today_actual_cost
+      //   fork 版  /usage/stats（需 start_date/end_date 才区分区间）—— total_actual_cost
+      // 选择规则：**优先 fork 版**（total_actual_cost 是区间统计的独有字段，且 fork 端点才真正
+      // 支持日期过滤）；否则退回标准版。此前只认 dashboard/stats，导致 fork 站点（如
+      // yt.19851117.xyz）采集打到不支持日期参数的端点，今日/24h 永远同值（037 根因）。
       const statsFields = new Set([
         'today_actual_cost',
+        'total_actual_cost',
         'total_tokens',
         'total_input_tokens',
         'total_output_tokens',
         'average_duration_ms',
       ])
-      const statsAttempt = result.attempts.find((a) => {
-        try {
-          return new URL(a.url).pathname.includes('/usage/dashboard/stats') &&
-            a.status >= 200 &&
-            a.status < 300 &&
-            a.contentType.includes('json') &&
-            a.successValue !== false &&
-            (a.dataFieldNames ?? []).some((name) => statsFields.has(name))
-        } catch {
-          return false
-        }
-      })
+      const isStatsAttempt = (a: ProbeAttempt, pathname: string): boolean =>
+        a.status >= 200 &&
+        a.status < 300 &&
+        a.contentType.includes('json') &&
+        a.successValue !== false &&
+        (a.dataFieldNames ?? []).some((name) => statsFields.has(name))
+      const isForkStatsPath = (pathname: string): boolean =>
+        pathname.endsWith('/usage/stats') && !pathname.includes('/usage/dashboard/stats')
+      const statsAttempt =
+        // 第一优先：fork 区间版（路径 + total_actual_cost 字段）
+        result.attempts.find((a) => {
+          try {
+            const p = new URL(a.url).pathname
+            return isForkStatsPath(p) && (a.dataFieldNames ?? []).includes('total_actual_cost') && isStatsAttempt(a, p)
+          } catch {
+            return false
+          }
+        }) ??
+        // 第二优先：fork 路径但字段指纹不完整（字段列表可能随站点版本变化）
+        result.attempts.find((a) => {
+          try {
+            const p = new URL(a.url).pathname
+            return isForkStatsPath(p) && isStatsAttempt(a, p)
+          } catch {
+            return false
+          }
+        }) ??
+        // 兜底：标准版 dashboard/stats
+        result.attempts.find((a) => {
+          try {
+            const p = new URL(a.url).pathname
+            return p.includes('/usage/dashboard/stats') && isStatsAttempt(a, p)
+          } catch {
+            return false
+          }
+        })
       // IKunCode 类区间用量端点（/api/data/self）实际 pathname
       const dataSelfAttempt = result.attempts.find((a) => {
         try {
@@ -612,9 +676,14 @@ export const handlers: Record<string, Handler> = {
           // 探测不一定覆盖用量列表；失败时保留上一次已经验证的路径/类型。
           usageListKind: classification.usageListKind ?? site.discovered?.usageListKind ?? null,
           usageListPath: usageListPath ?? site.discovered?.usageListPath ?? null,
-          // 统计接口：仅命中才写入；账户快照复用 userSelfPath（buildStrategy 兜底），此处留 null
+          // 统计接口：仅命中才写入；账户快照复用 userSelfPath（buildStrategy 兜底），此处留 null。
+          // kind 按 fork 独有字段 total_actual_cost 判定（037 修复）。
           usageStatsPath: statsAttempt ? new URL(statsAttempt.url).pathname : (site.discovered?.usageStatsPath ?? null),
-          usageStatsKind: statsAttempt ? 'hubway_dashboard_stats' : (site.discovered?.usageStatsKind ?? null),
+          usageStatsKind: statsAttempt
+            ? (statsAttempt.dataFieldNames ?? []).includes('total_actual_cost') && isForkStatsPath(new URL(statsAttempt.url).pathname)
+              ? 'hubway_range_stats'
+              : 'hubway_dashboard_stats'
+            : (site.discovered?.usageStatsKind ?? null),
           accountSnapshotPath: site.discovered?.accountSnapshotPath ?? null,
           rangeUsagePath: dataSelfAttempt ? new URL(dataSelfAttempt.url).pathname : (site.discovered?.rangeUsagePath ?? null),
           billingConfigPath: billingAttempt ? new URL(billingAttempt.url).pathname : (site.discovered?.billingConfigPath ?? null),
@@ -817,6 +886,12 @@ export const handlers: Record<string, Handler> = {
     return { window: (await readDashboardSettings()).costWindow }
   },
 
+  // ── 余额显示真实人民币（全局开关，方案 036）──
+  async SET_BALANCE_RMB_MODE(payload: SetBalanceRmbModePayload): Promise<SetBalanceRmbModeResponse> {
+    await setBalanceRmbMode(payload?.enabled === true)
+    return { enabled: (await readDashboardSettings()).balanceRmbMode }
+  },
+
   // ── 实验室：SW 零标签后台采集开关（默认关闭，需用户显式知情同意）──
   async GET_LAB_ZEROTAB(): Promise<LabZeroTabResponse> {
     return { enabled: await getLabZeroTab() }
@@ -1013,7 +1088,9 @@ export const handlers: Record<string, Handler> = {
   // 跨安装 siteId 映射 + recordId 幂等 + 单事务原子（删除 10s 看门狗，杜绝超时误判/并发竞态）。
   async IMPORT_CONFIG(payload: { config: ExportConfig }): Promise<ImportResult> {
     try {
-      return await importAll(payload.config)
+      const result = await importAll(payload.config)
+      await reconcilePluginRuntime()
+      return result
     } catch (e) {
       console.error('[AI Relay] IMPORT_CONFIG 致命错误', e)
       return {

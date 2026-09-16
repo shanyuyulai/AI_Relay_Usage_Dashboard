@@ -23,13 +23,14 @@ export type Capability =
   | 'usageDashboardStats'
 export type Confidence = 'high' | 'medium' | 'low'
 export type UsageSource = 'hourly_aggregate' | 'raw_logs' | 'unavailable'
-/** 统计接口适配器种类（Hubway 类 /api/v1/usage/dashboard/stats）。 */
-export type UsageStatsKind = 'hubway_dashboard_stats'
+/** 统计接口适配器种类：标准版 dashboard/stats；fork 区间版 usage/stats（需 start_date/end_date，037）。 */
+export type UsageStatsKind = 'hubway_dashboard_stats' | 'hubway_range_stats'
 /** 当日用量明细列表适配器种类（P0：适配器隔离，禁把 hubway 约定泛化到所有站点） */
 export type UsageListKind = 'hubway_v1' | 'generic'
 /** 指标 Provider 标识（按响应结构指纹/路径绑定，而非按域名绑定）。 */
 export type ProviderId =
   | 'hubway_dashboard_stats'
+  | 'hubway_range_stats'
   | 'ikuncode_account_snapshot'
   | 'ikuncode_range_usage'
   | 'ikuncode_billing_config'
@@ -103,6 +104,8 @@ export interface CollectStrategy {
 export interface EndpointSignal {
   /** 候选路径的逻辑标识（如 'userSelf'、'userSelfV1'），非真实 URL */
   pathKey: string
+  /** 命中 attempt 的真实 pathname（不含 query；037 修复：用于保留 fork 变体真实路径） */
+  pathname?: string
   status: number
   contentType: string
   isJson: boolean
@@ -217,22 +220,31 @@ export function classifySite(fp: SiteFingerprint): SiteClassification {
     capabilities.push('tokenSource')
   }
 
-  // 统计接口（Hubway 类 usage/dashboard/stats）识别：路径别名 + 结构指纹（方案 §3.1/§6.4）
-  // 仅靠 pathname + 字段结构识别，不按域名硬编码。
-  const statsSignal = fp.signals.find((s) => s.pathKey === 'usageDashboardStats')
+  // 统计接口识别：路径别名 + 结构指纹（方案 §3.1/§6.4；037 修复：区分标准/fork 两变体）
+  // 仅靠 pathname + 字段结构识别，不按域名硬编码。多个命中信号时优先 fork 版
+  // （total_actual_cost 是区间统计独有字段，fork 端点才真正支持日期过滤）。
+  const statsSignals = fp.signals.filter((s) => s.pathKey === 'usageDashboardStats')
+  const statsSignal =
+    statsSignals.find((s) => (s.dataFieldNames || []).includes('total_actual_cost')) ?? statsSignals[0]
   let usageStatsPath: string | null = null
   let usageStatsKind: UsageStatsKind | null = null
   if (statsSignal) {
     const names = statsSignal.dataFieldNames || []
-    // total_actual_cost：带 start_date/end_date 的区间统计接口（fork 变体）返回的是该字段，而非 today_actual_cost
     const hitStatsField = ['today_actual_cost', 'total_actual_cost', 'total_tokens', 'total_input_tokens', 'total_output_tokens', 'average_duration_ms'].some(
       (n) => names.includes(n),
     )
     if (hitStatsField) {
       if (!capabilities.includes('usageDashboardStats')) capabilities.push('usageDashboardStats')
-      // 标准候选路径（探针使用的即该规范路径）；真实 fork 变体的 pathname 由 DISCOVER_ENDPOINTS 从 attempt 实际 URL 持久化
-      usageStatsPath = '/api/v1/usage/dashboard/stats'
-      usageStatsKind = 'hubway_dashboard_stats'
+      // 优先用探测命中信号的真实 pathname（fork 变体 usage/stats 的 pathname 据此保留）；
+      // 信号未带 pathname 时回退标准规范路径。
+      const p = (statsSignal as EndpointSignal & { pathname?: string }).pathname
+      if (p && p.endsWith('/usage/stats') && !p.includes('/usage/dashboard/stats')) {
+        usageStatsPath = p
+        usageStatsKind = 'hubway_range_stats'
+      } else {
+        usageStatsPath = '/api/v1/usage/dashboard/stats'
+        usageStatsKind = 'hubway_dashboard_stats'
+      }
     }
   }
 
@@ -352,7 +364,7 @@ export function buildStrategy(
       method: 'GET',
       queryTemplate: { timezone: 'Asia/Shanghai' },
       usageStatsKind: discoveredPaths?.usageStatsKind ?? 'hubway_dashboard_stats',
-      providerId: 'hubway_dashboard_stats',
+      providerId: discoveredPaths?.usageStatsKind ?? 'hubway_dashboard_stats',
       sideEffect: 'none',
       safeToAutoPoll: true,
     })

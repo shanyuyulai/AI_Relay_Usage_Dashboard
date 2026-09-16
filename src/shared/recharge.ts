@@ -45,6 +45,70 @@ export function realRmb(todayCost: number | null, rate: number | null): number |
   return todayCost / rate
 }
 
+/**
+ * 真实人民币余额（方案 036）：站点余额 ÷ 充值比例。
+ * 与 realRmb 同公式，独立命名仅为语义清晰（余额 vs 花费），并便于单测与后续差异化。
+ * 与 realRmb 的关键差异：**余额允许为负**（欠费站点是真实状态，须显示并参与换算，用户 2026-09-11 明确要求），
+ * 仅拒 null / 非有限值 / 比例非正 → null（UI 显示原币种，绝不编造）。
+ */
+export function realRmbBalance(balance: number | null, rate: number | null): number | null {
+  if (balance == null || rate == null || !Number.isFinite(balance) || !Number.isFinite(rate) || rate <= 0) {
+    return null
+  }
+  return balance / rate
+}
+
+/** 余额展示结果（极简面板 / 侧边栏共用）。 */
+export interface BalanceText {
+  /** 展示文本（人民币模式且比例有效 → "¥1.87"；否则原币种文本或 "—"）。 */
+  text: string
+  /** title 提示（说明换算依据或为何没换算）。 */
+  title: string
+  /** 是否成功显示为人民币。 */
+  isRmb: boolean
+}
+
+/**
+ * 余额展示统一口径（方案 036；负余额修正 2026-09-11）：
+ * - balance 为 null / 非有限值 → "—"；
+ * - **负余额正常显示**（欠费是真实状态）：原币种模式 "$-1.23"，人民币模式 "-¥1.23"；
+ * - 人民币模式关 → 原币种（现状行为不变）；
+ * - 人民币模式开且比例有效 → "¥x.xx"（2 位小数；余额量级通常远大于单日花费，3 位无意义）；
+ * - 人民币模式开但比例无效 → 原币种 + 提示「未填写有效充值比例」，绝不臆造人民币值。
+ */
+export function fmtBalanceRmb(
+  balance: number | null,
+  currency: string | null,
+  rechargeRate: string | null,
+  rmbMode: boolean,
+): BalanceText {
+  // 运行时防护：仅拒 null / 非有限值；负余额是欠费站点的真实数据，必须显示（不可当脏数据丢）
+  if (balance == null || !Number.isFinite(balance)) {
+    return { text: '—', title: '暂无余额数据', isRmb: false }
+  }
+  const native = fmtBalance(balance, currency)
+  const negNote = balance < 0 ? '（负余额：站点欠费状态）' : ''
+  if (!rmbMode) {
+    return { text: native, title: `点击切换为真实人民币余额${negNote}`, isRmb: false }
+  }
+  const rate = parseRechargeRate(rechargeRate)
+  const rmb = realRmbBalance(balance, rate)
+  if (rmb == null) {
+    return {
+      text: native,
+      title: `未填写有效充值比例，无法换算人民币（当前 ${native}）。点击切回站点货币`,
+      isRmb: false,
+    }
+  }
+  // 负号放在 ¥ 前：-¥1.23（比 ¥-1.23 更符合阅读习惯）
+  const text = rmb < 0 ? `-¥${Math.abs(rmb).toFixed(2)}` : `¥${rmb.toFixed(2)}`
+  return {
+    text,
+    title: `真实人民币余额 = ${native} ÷ 比例 ${rate} = ¥${rmb.toFixed(3)}${negNote}。点击切回站点货币`,
+    isRmb: true,
+  }
+}
+
 /** 朴素十进制正则：拒科学计数法、前导零(01)、尾随零(0.950)、负号、空串。小数部分必须以非 0 数字结尾。 */
 const DEC_RE = /^(0|[1-9]\d*)(\.(?:[0-9]*[1-9]))?$/
 
