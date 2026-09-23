@@ -4,7 +4,8 @@ import { send } from '../core/messaging/client'
 import type { ExportConfig } from '../core/messaging/protocol'
 import { PLUGIN_ENABLED_CHANGED, type PluginState } from './pluginState'
 
-defineProps<{ content: Component; allowExport?: boolean }>()
+/** compact：popup 专用（方案 041）——确认状态期间只显示一行占位，卡片改用紧凑间距。options / sidepanel 不传。 */
+defineProps<{ content: Component; allowExport?: boolean; compact?: boolean }>()
 const state = ref<PluginState>({ desiredEnabled: null, effectiveState: 'initializing', revision: -1 })
 const busy = ref(false)
 const error = ref('')
@@ -56,7 +57,7 @@ onUnmounted(() => { alive = false; chrome.runtime.onMessage.removeListener(liste
 </script>
 
 <template>
-  <div class="plugin-shell">
+  <div class="plugin-shell" :class="{ compact }">
     <!-- Only settings owns the switch. Normal popup/sidepanel render no extra toolbar. -->
     <component :is="content" v-if="enabled">
       <template v-if="allowExport" #plugin-control>
@@ -77,7 +78,9 @@ onUnmounted(() => { alive = false; chrome.runtime.onMessage.removeListener(liste
           <span aria-hidden="true"></span>
         </button>
       </header>
-      <section class="plugin-disabled">
+      <!-- 方案 041：popup（compact）确认状态期间只放一行占位，不闪现整块控制卡片；出错时仍回落到卡片以提供重试按钮。 -->
+      <section v-if="compact && state.effectiveState === 'initializing' && !error" class="plugin-boot" role="status" aria-live="polite">正在确认插件状态…</section>
+      <section v-else class="plugin-disabled">
         <h2>{{ state.effectiveState === 'disabled' ? '插件已停用' : '插件运行控制' }}</h2>
         <p v-if="state.effectiveState === 'disabled'">已停止插件采集与提醒，配置和历史数据完好保留。</p>
         <p v-else-if="state.effectiveState === 'disabling'">正在停止，请等待已开始的任务结束。</p>
@@ -96,7 +99,8 @@ onUnmounted(() => { alive = false; chrome.runtime.onMessage.removeListener(liste
 </template>
 
 <style scoped>
-.plugin-shell{color:var(--text-primary,inherit)}
+/* 方案 042：只用 theme.css 里真实存在的令牌（--text/--sub/--err/--line），壳的配色不依赖宿主 body */
+.plugin-shell{color:var(--text,inherit)}
 .plugin-settings-heading{display:flex;align-items:center;gap:10px;margin:32px auto 0;padding:0 0 16px;max-width:1160px;border-bottom:1px solid var(--line,#8b97a533)}
 .plugin-title{font-weight:700;font-size:18px}
 .plugin-logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--brand,#31846f),var(--brand2,#46a090));color:white;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px}
@@ -105,7 +109,12 @@ onUnmounted(() => { alive = false; chrome.runtime.onMessage.removeListener(liste
 .plugin-switch.on{background:#31846f}.plugin-switch.on span{transform:translateX(18px)}
 .plugin-switch:disabled{cursor:wait;opacity:.6}.plugin-switch:focus-visible{outline:2px solid #31846f;outline-offset:3px}
 .plugin-disabled{padding:28px 20px;max-width:680px;margin:auto}.plugin-disabled h2{font-size:20px;margin-bottom:12px}
-.plugin-disabled p{line-height:1.7}.plugin-note{opacity:.65;font-size:12px}.plugin-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}
-.plugin-actions button{padding:9px 14px;border:1px solid #82928f70;border-radius:8px;background:transparent;color:inherit;cursor:pointer}
-.plugin-error{color:#c34848;padding:10px 18px;font-size:13px}
+.plugin-disabled p{line-height:1.7}.plugin-note{color:var(--sub,inherit);font-size:12px}.plugin-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}
+.plugin-actions button{padding:9px 14px;border:1px solid var(--line,#82928f70);border-radius:8px;background:var(--panel-soft,transparent);color:inherit;cursor:pointer}
+.plugin-actions button:hover{border-color:var(--brand,#5b6cff);color:var(--brand,#5b6cff)}
+.plugin-error{color:var(--err,#c34848);padding:10px 18px;font-size:13px;overflow-wrap:anywhere}
+/* 方案 041：popup（compact）确认状态占位 + 260px 宽度下的紧凑卡片 */
+.plugin-boot{box-sizing:border-box;min-height:120px;display:flex;align-items:center;justify-content:center;padding:14px 12px;font-size:12px;color:var(--sub,#7a7f90)}
+.compact .plugin-disabled{padding:18px 16px 16px}.compact .plugin-disabled h2{font-size:16px;margin:0 0 8px}
+.compact .plugin-disabled p{margin:6px 0;font-size:13px}.compact .plugin-disabled .plugin-note{font-size:12px}.compact .plugin-actions{margin-top:14px}
 </style>

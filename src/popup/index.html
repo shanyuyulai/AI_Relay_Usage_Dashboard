@@ -5,15 +5,45 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>用量看板</title>
     <style>
-      html, body {
+      /* 方案 041：Chromium/Edge 以文档 min-content 宽度决定 popup 尺寸（25×25 ～ 800×600）。
+         宽度必须在首帧、任何脚本与异步状态之前由根元素静态给定，否则 PluginShell 的
+         initializing / disabled 视图（纯中文文案、无固定宽元素）会塌成单字一行、
+         高度撑到 600px 上限并出现滚动条，直到 Popup.vue 挂载才"闪"回正常宽度。
+         这里是 popup 宽度的唯一权威来源；Popup.vue 的 .pop 只写 width: 100%。 */
+      :root {
+        --popup-width: 260px;
+      }
+      html,
+      body {
         margin: 0;
         padding: 0;
+        width: var(--popup-width);
+        min-width: var(--popup-width);
+        max-width: var(--popup-width);
+        /* 方案 042：与 options / sidepanel 的全局 body 规则对齐，PluginShell 卡片在 popup 里同样跟随主题 */
+        color: var(--text);
+        font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
         background: var(--panel);
+      }
+      html {
+        overflow-x: hidden;
+      }
+      /* 首帧骨架：Vue mount 前占位（mount('#app') 会清空它），避免 25×25 空白帧与二次跳变。
+         颜色跟随主题 --sub；theme.css 未就绪时回退中性灰 #8a90a0（在浅色 #fff 与深色 #313338 面板上均可读）。 */
+      .boot {
+        box-sizing: border-box;
+        min-height: 120px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 14px 12px;
+        font: 12px system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        color: var(--sub, #8a90a0);
       }
     </style>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app"><div class="boot" role="status" aria-live="polite">正在加载…</div></div>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

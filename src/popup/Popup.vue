@@ -222,8 +222,8 @@ onUnmounted(() => {
 
 <style scoped>
 .pop {
-  width: 260px;
-  min-width: 260px;
+  /* 宽度权威来源在 src/popup/index.html（--popup-width，方案 041）；这里只铺满 body，避免两处数值漂移 */
+  width: 100%;
   min-height: 120px;
   padding: 10px 12px 8px;
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
