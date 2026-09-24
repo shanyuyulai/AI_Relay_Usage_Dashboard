@@ -63,6 +63,18 @@ test('site switch follows adapter chip in name row, not the action toolbar', () 
   assert.ok(!find(find(descriptor.template.ast, 'ops'), 'site-switch'))
   assert.equal((source.match(/class="site-switch"/g) ?? []).length, 1)
 })
+// 046：使用说明弹窗（同源 iframe）跟随父页主题，且内容区底色不再写死
+test('help iframe syncs parent theme and no hardcoded white canvas', () => {
+  assert.ok(source.includes('@load="syncHelpTheme"'), 'iframe 需在 load 时同步主题')
+  assert.ok(source.includes("classList.toggle('theme-dark'"), '需把明暗写入 iframe 文档')
+  assert.ok(source.includes('watch(helpDark'), '弹窗开着切主题需实时跟随')
+  const i = source.indexOf('.help-iframe {') // 注意：需定位 CSS 规则，而非模板里的 class="help-iframe"
+  assert.ok(i > 0, '应存在 .help-iframe 样式规则')
+  const rule = source.slice(i, source.indexOf('}', i))
+  assert.ok(rule.includes('var(--panel)'), 'iframe 底色应随主题变量')
+  // 断言「底色声明」而非整段文本：注释里提到色值属正常，只有 background 写死才是问题
+  assert.ok(!/background\s*:\s*#/.test(rule), 'iframe 底色不应写死为字面色值')
+})
 test('embedded help changelog lists current manifest version and latest UI changes', () => {
   const html = fs.readFileSync(path.resolve(__dirname, '../../public/README.html'), 'utf8')
   const version = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../package.json'), 'utf8')).version

@@ -1,6 +1,6 @@
 import { runPluginTask, getPluginState, reconcilePluginRuntime } from './pluginGate'
 import { collectAllInTabs } from './pageCollect'
-import { purgeOlderThan, getRetentionDays, getCollectInterval } from '../storage'
+import { purgeOlderThan, getRetentionDays, getCollectInterval, getCollectSilent } from '../storage'
 
 const ALARM_NAME = 'aihub-collect'
 const PRUNE_ALARM = 'aihub-prune'
@@ -8,7 +8,10 @@ const PRUNE_PERIOD_MIN = 1440 // 每日兜底清理一次过期采集数据
 
 async function runCollectAndNotify(): Promise<void> {
   try {
-    await collectAllInTabs(true, true)
+    const silent = await getCollectSilent().catch(() => true)
+    // 语义（方案 046）：无论静默开关都采集全部启用站点。
+    // 静默开 = 最小化后台窗口不抢焦点（unfocused）；静默关 = 老模式正常开窗（会短暂获取焦点，focused）。
+    await collectAllInTabs(silent ? 'unfocused' : 'focused', true)
   } catch (e) {
     console.warn('[AI Relay] 定时采集失败', e)
   } finally {
@@ -31,7 +34,8 @@ async function runPrune(): Promise<void> {
 
 /**
  * 注册 alarm 监听：定时唤醒 SW 跑全量启用站点采集，结束后自然休眠（MV3 无长驻）。
- * 走页面主世界采集；autoOpen=false：仅当站点标签页已打开时才采集，避免定时任务擅自弹标签页。
+ * 静默开时 openMode='unfocused'（最小化后台窗口，不抢焦点）；静默关时 openMode='focused'（老模式正常开窗，会短暂获取焦点）。
+ * 两种模式均采集全部启用站点（无论标签是否已打开）。
  * 另监听每日 prune alarm，作为采集后清理的兜底（即便长期不采集也会按时清理过期数据）。
  */
 export function setupScheduler(): void {

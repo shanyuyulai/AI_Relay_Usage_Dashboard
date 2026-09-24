@@ -9,7 +9,8 @@
 
 export type ThemeMode = 'light' | 'dark' | 'auto'
 
-const STORAGE_KEY = 'aihub.theme'
+/** 主题设置键（导出供 App.vue 监听跨页主题变更，如「使用说明」iframe 同步，方案 046）。 */
+export const THEME_STORAGE_KEY = 'aihub.theme'
 const DARK_CLASS = 'theme-dark'
 
 let currentMode: ThemeMode = 'light'
@@ -32,8 +33,8 @@ function applyClass(dark: boolean) {
 
 export async function getThemeMode(): Promise<ThemeMode> {
   try {
-    const res = await chrome.storage.local.get(STORAGE_KEY)
-    const m = res[STORAGE_KEY] as ThemeMode | undefined
+    const res = await chrome.storage.local.get(THEME_STORAGE_KEY)
+    const m = res[THEME_STORAGE_KEY] as ThemeMode | undefined
     return m === 'dark' || m === 'auto' ? m : 'light'
   } catch {
     return 'light'
@@ -45,7 +46,7 @@ export async function setThemeMode(mode: ThemeMode): Promise<void> {
   currentMode = mode
   applyClass(effectiveDark(mode))
   try {
-    await chrome.storage.local.set({ [STORAGE_KEY]: mode })
+    await chrome.storage.local.set({ [THEME_STORAGE_KEY]: mode })
   } catch {
     /* 存储失败时仍保证本页已应用 */
   }
@@ -73,8 +74,8 @@ export async function initTheme(): Promise<void> {
   // 跨页面同步：Options/Sidebar 任一改主题，另一处自动跟随
   if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
     chrome.storage.onChanged.addListener((changes, area) => {
-      if (area !== 'local' || !changes[STORAGE_KEY]) return
-      const m = changes[STORAGE_KEY].newValue as ThemeMode | undefined
+      if (area !== 'local' || !changes[THEME_STORAGE_KEY]) return
+      const m = changes[THEME_STORAGE_KEY].newValue as ThemeMode | undefined
       if (m && m !== currentMode) {
         currentMode = m
         applyClass(effectiveDark(m))

@@ -193,6 +193,7 @@ export type CollectErrorKind =
   | 'PARSE'
   | 'FORBIDDEN'
   | 'NOT_FOUND'
+  | 'SKIPPED_SILENT'
 
 export type Channel = 'sw' | 'content_script' | 'alarm' | 'sw_lab'
 

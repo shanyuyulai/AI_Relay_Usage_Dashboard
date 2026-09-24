@@ -326,6 +326,14 @@ export interface CollectIntervalResponse {
   interval: number | 'off'
 }
 
+// ── 静默模式（方案 044：后台采集不自动打开网页） ──────────
+export interface CollectSilentPayload {
+  enabled: boolean
+}
+export interface CollectSilentResponse {
+  enabled: boolean
+}
+
 // ── 实验室：SW 零标签后台采集（实验性，默认关闭） ──────────
 export interface LabZeroTabPayload {
   enabled: boolean

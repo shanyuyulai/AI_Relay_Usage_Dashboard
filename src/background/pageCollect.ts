@@ -345,28 +345,39 @@ async function collectSiteInTabUnlocked(site: SiteConfig, tabId: number, manual 
   return { siteId: site.id, ok: true, snapshot: snap, usageApiOk }
 }
 
-/** 采集全部启用站点。定时 alarm 传 autoOpen=true + notify=true；手动传 notify=false。 */
-export async function collectAllInTabs(autoOpen: boolean, notify = false, manual = false): Promise<CollectResult[]> {
+/**
+ * 开窗模式（方案 046）：
+ * - 'unfocused'：缺失站点在「最小化后台窗口」采集，不抢焦点（静默开 / 手动立即同步）。
+ * - 'focused'：老模式，正常弹窗采集（窗口会短暂获取焦点）（静默关）。
+ * - 'reuseOnly'：不开窗，仅采集已有标签，缺失站点跳过（SKIPPED_SILENT）。
+ * 三种模式对「已有标签」的站点行为一致：直接复用后台标签注入采集，不碰焦点。
+ */
+export type CollectOpenMode = 'unfocused' | 'focused' | 'reuseOnly'
+
+/** 采集全部启用站点。定时 alarm 传 openMode 按静默开关决定 + notify=true；手动传 notify=false。 */
+export async function collectAllInTabs(openMode: CollectOpenMode, notify = false, manual = false): Promise<CollectResult[]> {
   const sites = (await siteRepo.list()).filter((s) => s.enabled)
-  return collectOrchestrate(sites, autoOpen, notify, manual)
+  return collectOrchestrate(sites, openMode, notify, manual)
 }
 
 /** 采集指定站点（侧边栏选择性同步）。 */
-export async function collectSpecificInTabs(siteIds: string[], autoOpen: boolean, notify = false, manual = false): Promise<CollectResult[]> {
+export async function collectSpecificInTabs(siteIds: string[], openMode: CollectOpenMode, notify = false, manual = false): Promise<CollectResult[]> {
   const sites = (await siteRepo.list()).filter((s) => siteIds.includes(s.id) && s.enabled)
-  return collectOrchestrate(sites, autoOpen, notify, manual)
+  return collectOrchestrate(sites, openMode, notify, manual)
 }
 
 /**
- * 采集编排：
- * - 已有标签（任意窗口）的站点直接复用，不另行开窗口。
+ * 采集编排（方案 046）：
+ * - 已有标签（任意窗口）的站点直接复用后台标签注入采集，不需要标签激活，不碰焦点。
  * - 没有标签的站点分流：实验室开关开启 → 走 SW 零标签采集（collectViaSw，无任何可见窗口）；
- *   否则 autoOpen=true 时在一个「最小化后台窗口（不聚焦、处于底层）」里统一开标签采集、采完关闭（主窗口不留标签）；
- *   autoOpen=false 时跳过并标错。
- * - notify=true 且本轮确实要开临时窗口时，先发一条「醒目 + 需手动关闭」的系统通知与侧边栏横幅（提前提醒），再开窗口；
+ *   否则按 openMode 开一个临时窗口统一采集、采完关闭（主窗口不留标签）：
+ *   'unfocused' = 最小化后台窗口（不聚焦、处于底层，不抢焦点）；
+ *   'focused' = 正常弹窗（老模式，会短暂获取焦点）；
+ *   'reuseOnly' = 不开窗，缺失站点跳过（SKIPPED_SILENT，保留上次快照）。
+ * - notify=true 且本轮确实要开临时窗口时，先发一条提示通知与侧边栏横幅（文案按模式区分），再开窗口；
  *   会话过期、实验室失败也分别通知。
  */
-async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notifyFlag: boolean, manual = false): Promise<CollectResult[]> {
+async function collectOrchestrate(sites: SiteConfig[], openMode: CollectOpenMode, notifyFlag: boolean, manual = false): Promise<CollectResult[]> {
   const labEnabled = await getLabZeroTab()
   const notifyMode = await resolveNotifyMode()
 
@@ -396,40 +407,41 @@ async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notify
     }
   }
 
-  // 3) 为缺失且非实验室的站点开一个临时「最小化后台窗口」（不聚焦、处于底层，采完关闭）
+  // 3) 为缺失且非实验室的站点开一个临时窗口（unfocused=最小化后台 / focused=正常弹窗，采完关闭）
   let tempWinId: number | null = null
   const tempBySite = new Map<string, number>()
-  if (missingByWindow.length && autoOpen) {
-    // 提前醒目提醒：在开窗口之前发出（仅自动采集 notifyFlag=true 时），让用户有心理准备且不被打断
+  if (missingByWindow.length && openMode !== 'reuseOnly') {
+    // 提前提醒：在开窗口之前发出（仅自动采集 notifyFlag=true 时），普通优先级、可自动消失，不打断
     if (notifyFlag) {
-      await maybeNotify(
-        'AI 中转站用量看板 即将后台采集',
-        `将在「最小化后台窗口」中静默采集 ${missingByWindow.length} 个未打开的站点，不抢焦点、不打断你的操作，采完自动关闭。`,
-        { requireInteraction: true, priority: 2 },
-      )
+      const notice =
+        openMode === 'focused'
+          ? `将打开窗口采集 ${missingByWindow.length} 个未打开的站点（老模式，窗口会短暂获取焦点），采完自动关闭。`
+          : `将在「最小化后台窗口」中静默采集 ${missingByWindow.length} 个未打开的站点，不抢焦点、不打断你的操作，采完自动关闭。`
+      await maybeNotify('AI 中转站用量看板 即将采集', notice, { priority: 0 })
       if (notifyMode === 'system' || notifyMode === 'dailyFirst') {
         try {
           chrome.runtime.sendMessage({
             type: 'COLLECT_NOTICE',
-            detail: `后台采集即将在最小化窗口静默进行（不抢焦点、不打断你的操作），采完自动关闭`,
+            detail:
+              openMode === 'focused'
+                ? '即将打开窗口采集未打开的站点（老模式，会短暂获取焦点），采完自动关闭'
+                : '后台采集即将在最小化窗口静默进行（不抢焦点、不打断你的操作），采完自动关闭',
           })
         } catch {
           /* 侧边栏未打开时忽略（无接收端） */
         }
       }
     }
-    // 记录用户当前聚焦的窗口，开完临时窗口后把焦点还回去，确保绝不打断
-    const prevWin = await chrome.windows.getLastFocused().catch(() => null)
     try {
-      const win = await chrome.windows.create({
-        url: missingByWindow[0].baseUrl,
-        focused: false,
-        state: 'minimized', // 真正处于底层（最小化到任务栏），不弹到前台、不打断用户
-      })
-      // 重新聚焦用户原本的窗口（双重保险，防止个别平台新建窗口瞬间抢焦点）
-      if (prevWin?.id != null && win?.id != null && prevWin.id !== win.id) {
-        await chrome.windows.update(prevWin.id, { focused: true }).catch(() => {})
-      }
+      const win = await chrome.windows.create(
+        openMode === 'focused'
+          ? { url: missingByWindow[0].baseUrl } // 老模式：正常弹窗（默认聚焦，会短暂获取焦点）
+          : {
+              url: missingByWindow[0].baseUrl,
+              focused: false,
+              state: 'minimized', // 处于最小化，不抢焦点（已移除原有的 windows.update 还焦点逻辑，避免把 Chrome 带到前台）
+            },
+      )
       if (win?.id != null) {
         tempWinId = win.id
         const firstTab = win.tabs?.[0]?.id
@@ -447,7 +459,7 @@ async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notify
       const tabId = tempBySite.get(site.id)
       if (tabId != null) tasks.push(collectSiteInTab(site, tabId, manual))
       else {
-        const msg = '站点标签页未打开，且未开启自动开窗口采集'
+        const msg = '站点标签页未打开，且临时采集窗口创建失败'
         tasks.push(
           (async () => {
             await siteRepo.update(site.id, { lastStatus: 'error', lastCollectAt: Date.now(), lastError: msg })
@@ -457,15 +469,10 @@ async function collectOrchestrate(sites: SiteConfig[], autoOpen: boolean, notify
       }
     }
   } else if (missingByWindow.length) {
-    // 不开窗口、也不走实验室 → 全部标错
+    // 不开窗模式（reuseOnly）：不标错、不写库，直接跳过，保留上次快照
     for (const site of missingByWindow) {
-      const msg = '站点标签页未打开，且未开启自动开窗口/实验室采集'
-      tasks.push(
-        (async () => {
-          await siteRepo.update(site.id, { lastStatus: 'error', lastCollectAt: Date.now(), lastError: msg })
-          return { siteId: site.id, ok: false, errorKind: 'NETWORK' as const, message: msg }
-        })(),
-      )
+      const msg = '站点标签页未打开，本轮未开窗采集，已跳过（保留上次数据，手动同步或保持标签打开可更新）'
+      tasks.push(Promise.resolve({ siteId: site.id, ok: false, errorKind: 'SKIPPED_SILENT' as const, message: msg }))
     }
   }
 

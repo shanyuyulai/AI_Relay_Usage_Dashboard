@@ -331,8 +331,10 @@ async function doRefresh(siteId: string): Promise<RefreshResult> {
   try {
     // 动态 import：storage → background 若用静态 import 会与 pageCollect → usageCache 形成循环依赖。
     const { collectSpecificInTabs } = await import('../background/pageCollect')
-    // autoOpen=true（无可见标签时开一个不聚焦的后台窗口，采完自动关）；notify=false（不弹通知）
-    const results = await collectSpecificInTabs([siteId], true, false)
+    const { getCollectSilent } = await import('./schedulerConfig')
+    const silent = await getCollectSilent().catch(() => true)
+    // 语义（方案 046）：静默开 = 最小化后台窗口不抢焦点（unfocused）；静默关 = 老模式正常开窗（会短暂获取焦点，focused）；均采集该站点
+    const results = await collectSpecificInTabs([siteId], silent ? 'unfocused' : 'focused', false)
     const r = results[0]
     if (r?.ok && r.usageApiOk) return { ok: true }
     if (r?.ok) return { ok: false, reason: 'usage API unavailable or not persisted' }

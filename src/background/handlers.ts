@@ -13,6 +13,8 @@ import {
   setRetentionDays,
   getCollectInterval,
   setCollectInterval,
+  getCollectSilent,
+  setCollectSilent,
   getLabZeroTab,
   setLabZeroTab,
   getLabCorsUnblock,
@@ -59,6 +61,8 @@ import type {
   RetentionResponse,
   CollectIntervalPayload,
   CollectIntervalResponse,
+  CollectSilentPayload,
+  CollectSilentResponse,
   SetCostWindowPayload,
   SetCostWindowResponse,
   SetBalanceRmbModePayload,
@@ -248,8 +252,8 @@ export const handlers: Record<string, Handler> = {
   async COLLECT_NOW(payload: CollectNowPayload) {
     const results: CollectResultMsg[] = (
       payload?.siteIds?.length
-        ? await collectSpecificInTabs(payload.siteIds, true, false, true)
-        : await collectAllInTabs(true, false, true)
+        ? await collectSpecificInTabs(payload.siteIds, 'unfocused', false, true)
+        : await collectAllInTabs('unfocused', false, true)
     ).map((r) => ({
       siteId: r.siteId,
       ok: r.ok,
@@ -877,6 +881,16 @@ export const handlers: Record<string, Handler> = {
     await setCollectInterval(payload.interval)
     await applyInterval() // 即时重建采集 alarm，免重启扩展
     return { interval: await getCollectInterval() }
+  },
+
+  // ── 静默模式：后台采集不自动打开网页（方案 044，默认关闭）──
+  async GET_COLLECT_SILENT(): Promise<CollectSilentResponse> {
+    return { enabled: await getCollectSilent() }
+  },
+
+  async SET_COLLECT_SILENT(payload: CollectSilentPayload): Promise<CollectSilentResponse> {
+    const enabled = await setCollectSilent(payload.enabled === true)
+    return { enabled }
   },
 
   // ── 花费统计周期（今日 / 24 小时）：极简面板与侧边栏同步生效 ──

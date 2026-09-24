@@ -11,10 +11,41 @@
     --ink:#1e2233; --sub:#5b6178; --line:#e6e8f0; --panel:#ffffff;
     --soft:#f5f6fb; --warn:#f59e0b; --err:#ef4444; --ok:#10b981;
     --shadow:0 10px 30px rgba(31,35,69,.08);
+    /* 046：文档表面与语义色（亮色 = 改造前原值） */
+    --doc-bg:#fafbff; --code-ink:#b3209a;
+    --card-ico:linear-gradient(135deg,#eef0ff,#f3e9ff);
+    --info-bg:#eef6ff; --info-line:#cfe2ff; --info-ink:#1f4f8b;
+    --warn2-bg:#fff7e8; --warn2-line:#ffe1ab; --warn2-ink:#8a5a00;
+    --ok-bg:#ecfdf5; --ok-line:#bbf0d4; --ok-ink:#0b6e43;
+    --footer-bg:#10122a; --footer-ink:#aeb4d6;
+    /* 046：内嵌插图（SVG）主题色，由属性选择器映射 */
+    --fig-ink:#1e2233; --fig-sub:#5b6178; --fig-line:#e6e8f0; --fig-line-soft:#eef0f5;
+    --fig-bg:#fafbff; --fig-card:#ffffff; --fig-muted:#9aa0b8; --fig-brand:#4f46e5;
+    --fig-chip:#eef0ff; --fig-ok-soft:#ecfdf5; --fig-ok-ink:#0b6e43;
+    --fig-err:#ef4444; --fig-err-soft:#fff0f0; --fig-err-line:#ffd0d0;
+    --fig-warn:#f59e0b; --fig-accent:#7c8cff;
+    color-scheme:light;
+  }
+  /* 046：深色主题。class 由 options 设置页同步（弹窗 iframe）；独立打开时由脚本跟随系统。 */
+  html.theme-dark{
+    --ink:#f2f3f5; --sub:#949ba4; --line:#3f4147; --panel:#313338;
+    --soft:#383a40; --shadow:0 10px 30px rgba(0,0,0,.35);
+    --doc-bg:#2b2d31; --code-ink:#e879d2;
+    --card-ico:linear-gradient(135deg,#3b3d52,#463a5e);
+    --info-bg:rgba(88,101,242,.12); --info-line:rgba(88,101,242,.35); --info-ink:#a6b0ff;
+    --warn2-bg:rgba(240,178,50,.12); --warn2-line:rgba(240,178,50,.34); --warn2-ink:#f0b232;
+    --ok-bg:rgba(45,199,113,.12); --ok-line:rgba(45,199,113,.32); --ok-ink:#2dc771;
+    --footer-bg:#1e1f22; --footer-ink:#a3a8bd;
+    --fig-ink:#f2f3f5; --fig-sub:#949ba4; --fig-line:#3f4147; --fig-line-soft:#383a40;
+    --fig-bg:#2b2d31; --fig-card:#313338; --fig-muted:#8b93a3; --fig-brand:#a6b0ff;
+    --fig-chip:rgba(88,101,242,.18); --fig-ok-soft:rgba(45,199,113,.14); --fig-ok-ink:#2dc771;
+    --fig-err:#f23f43; --fig-err-soft:rgba(242,63,67,.14); --fig-err-line:rgba(242,63,67,.35);
+    --fig-warn:#f0b232; --fig-accent:#9aa4ff;
+    color-scheme:dark;
   }
   *{box-sizing:border-box}
   body{margin:0;font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-    color:var(--ink);background:#fafbff;line-height:1.7;-webkit-font-smoothing:antialiased}
+    color:var(--ink);background:var(--doc-bg);line-height:1.7;-webkit-font-smoothing:antialiased}
   a{color:var(--brand);text-decoration:none}
   .wrap{max-width:980px;margin:0 auto;padding:0 22px}
   /* Hero */
@@ -41,7 +72,7 @@
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(232px,1fr));gap:16px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:var(--shadow)}
   .card .ico{width:42px;height:42px;border-radius:11px;display:flex;align-items:center;justify-content:center;
-    font-size:21px;background:linear-gradient(135deg,#eef0ff,#f3e9ff);margin-bottom:12px}
+    font-size:21px;background:var(--card-ico);margin-bottom:12px}
   .card h3{margin:0 0 6px;font-size:15.5px}
   .card p{margin:0;font-size:13px;color:var(--sub)}
   /* Illustration frame */
@@ -64,12 +95,12 @@
   .step h4{margin:2px 0 4px;font-size:15px}
   .step p{margin:0;font-size:13.5px;color:var(--sub)}
   code{background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:1px 7px;font-size:12.5px;
-    font-family:"SFMono-Regular",Consolas,monospace;color:#b3209a}
+    font-family:"SFMono-Regular",Consolas,monospace;color:var(--code-ink)}
   /* Callout */
   .callout{border-radius:14px;padding:16px 18px;margin:16px 0;font-size:14px;border:1px solid}
-  .callout.info{background:#eef6ff;border-color:#cfe2ff;color:#1f4f8b}
-  .callout.warn{background:#fff7e8;border-color:#ffe1ab;color:#8a5a00}
-  .callout.ok{background:#ecfdf5;border-color:#bbf0d4;color:#0b6e43}
+  .callout.info{background:var(--info-bg);border-color:var(--info-line);color:var(--info-ink)}
+  .callout.warn{background:var(--warn2-bg);border-color:var(--warn2-line);color:var(--warn2-ink)}
+  .callout.ok{background:var(--ok-bg);border-color:var(--ok-line);color:var(--ok-ink)}
   .callout b{display:block;margin-bottom:3px}
   ul.clean{margin:8px 0 8px;padding-left:20px}
   ul.clean li{margin:7px 0}
@@ -86,10 +117,46 @@
   th,td{text-align:left;padding:10px 13px;border-bottom:1px solid var(--line)}
   th{background:var(--soft);font-weight:600;color:var(--sub);font-size:12.5px}
   tr:last-child td{border-bottom:none}
-  .footer{background:#10122a;color:#aeb4d6;text-align:center;padding:30px 0;font-size:13px}
+  .footer{background:var(--footer-bg);color:var(--footer-ink);text-align:center;padding:30px 0;font-size:13px;border-top:1px solid var(--line)}
   .footer b{color:#fff}
   .img-inline{max-width:160px;border-radius:12px;box-shadow:var(--shadow);vertical-align:middle}
+  /* 046：内嵌插图（SVG）主题化 —— 用属性选择器覆盖 presentation attribute（CSS 声明优先于属性，兼容性最稳）。
+     未列出的取值（#fff 白字、#10b981 状态绿、url(#g*) 品牌渐变、stop-color）双主题通用，保持不变。 */
+  .fig svg [fill="#1e2233"]{fill:var(--fig-ink)}
+  .fig svg [fill="#5b6178"]{fill:var(--fig-sub)}
+  .fig svg [fill="#9aa0b8"]{fill:var(--fig-muted)}
+  .fig svg [fill="#4f46e5"]{fill:var(--fig-brand)}
+  .fig svg [stroke="#e6e8f0"]{stroke:var(--fig-line)}
+  .fig svg [stroke="#eef0f5"]{stroke:var(--fig-line-soft)}
+  .fig svg [fill="#fafbff"]{fill:var(--fig-bg)}
+  .fig svg [fill="#ffffff"]{fill:var(--fig-card)}
+  .fig svg [fill="#eef0ff"]{fill:var(--fig-chip)}
+  .fig svg [fill="#e9e7ff"]{fill:var(--fig-chip)}
+  .fig svg [fill="#ecfdf5"]{fill:var(--fig-ok-soft)}
+  .fig svg [fill="#0b6e43"]{fill:var(--fig-ok-ink)}
+  .fig svg [fill="#ef4444"]{fill:var(--fig-err)}
+  .fig svg [fill="#fff0f0"]{fill:var(--fig-err-soft)}
+  .fig svg [stroke="#ffd0d0"]{stroke:var(--fig-err-line)}
+  .fig svg [fill="#f59e0b"]{fill:var(--fig-warn)}
+  .fig svg [fill="#7c8cff"]{fill:var(--fig-accent)}
+  .fig svg [stroke="#7c8cff"]{stroke:var(--fig-accent)}
 </style>
+<script>
+  /* 046：仅「独立打开」时跟随系统配色。
+     被 options 设置页以 iframe 嵌入时（window.self !== window.top）不介入，由父页同步 html.theme-dark，
+     避免双写竞争。放在 head 内联执行，防止首帧闪白。 */
+  (function () {
+    if (window.self !== window.top) return;
+    var mq = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
+    if (!mq) return;
+    var apply = function () {
+      document.documentElement.classList.toggle('theme-dark', mq.matches);
+    };
+    apply();
+    if (mq.addEventListener) mq.addEventListener('change', apply);
+    else if (mq.addListener) mq.addListener(apply);
+  })();
+</script>
 </head>
 <body>
 
@@ -450,8 +517,22 @@
       <thead><tr><th>版本</th><th>状态</th><th>主要变动</th></tr></thead>
       <tbody>
         <tr>
-          <td><b>0.4.0</b></td>
+          <td><b>0.4.1</b></td>
           <td>当前构建<br />待发布</td>
+          <td>
+            <ul style="margin:0;padding-left:18px;line-height:1.8">
+              <li><strong>静默模式语义修正（重要）：</strong>无论静默开关开启或关闭，定时与看板后台刷新均会采集<strong>所有已启用的中转站</strong>（无论该站点标签页是否已打开），区别仅在开窗方式。</li>
+              <li><strong>静默开（默认）：</strong>未打开标签的站点在「最小化后台窗口」中采集，不抢焦点、不弹前台、采完自动关闭；已打开标签的站点直接复用后台标签注入采集，同样不碰焦点。</li>
+              <li><strong>静默关（老模式）：</strong>未打开标签的站点按老模式正常开窗采集（窗口会短暂获取焦点），采完自动关闭。</li>
+              <li><strong>手动「立即同步」：</strong>固定走最小化后台窗口路径，手动触发同样不抢焦点。</li>
+              <li><strong>设置页文案：</strong>静默模式勾选框、开启提示条与保存提示同步更新为新语义说明。</li>
+              <li><strong>使用说明深色适配：</strong>设置页「使用说明」弹窗的内容区（内嵌说明页）现随插件明暗主题自动切换，深色模式下不再出现刺眼白底；亮色外观与原版保持一致。弹窗打开期间切换主题会实时跟随；单独在浏览器中打开该说明页时也跟随系统配色。</li>
+            </ul>
+          </td>
+        </tr>
+        <tr>
+          <td><b>0.4.0</b></td>
+          <td>历史构建</td>
           <td>
             <ul style="margin:0;padding-left:18px;line-height:1.8">
               <li><strong>站点开关：</strong>启用/禁用改为 Switch，放在第一行站点名称后的「New API」等适配器标记右侧，显示当前状态；保存期间防止重复点击，失败时提示。</li>

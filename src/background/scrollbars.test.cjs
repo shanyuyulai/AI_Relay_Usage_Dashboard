@@ -121,3 +121,15 @@ test('README iframe document explicitly opts into the same local CSS', () => {
   assert.match(html, /<html[^>]*class="app-scrollbars"/)
   assert.match(html, /<link rel="stylesheet" href="\.\/scrollbars\.css"/)
 })
+// 046：使用说明弹窗深色模式适配
+test('README.html offers a dark theme block, color-scheme and standalone system fallback', () => {
+  const html = fs.readFileSync(path.join(root, 'public/README.html'), 'utf8')
+  assert.match(html, /html\.theme-dark\{[\s\S]*?--doc-bg:#2b2d31/)
+  assert.match(html, /color-scheme:\s*light/)
+  assert.match(html, /color-scheme:\s*dark/)
+  // 内嵌插图改由属性选择器映射到主题变量（不再依赖写死的 presentation attribute 生效）
+  assert.match(html, /\.fig svg \[fill="#1e2233"\]\{fill:var\(--fig-ink\)\}/)
+  assert.match(html, /\.fig svg \[fill="#ffffff"\]\{fill:var\(--fig-card\)\}/)
+  // 独立打开（非 iframe）时才自行跟随系统，避免与父页同步竞争
+  assert.ok(html.includes('window.self !== window.top'))
+})

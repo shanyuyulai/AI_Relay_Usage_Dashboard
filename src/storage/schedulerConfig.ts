@@ -22,3 +22,20 @@ export async function setCollectInterval(v: CollectInterval): Promise<void> {
     v === 'off' ? 'off' : Math.min(MAX_INTERVAL, Math.max(MIN_INTERVAL, Math.round(v)))
   await settingsRepo.set(COLLECT_INTERVAL_KEY, safe)
 }
+
+// 静默模式：后台静默采集（后台开标签但不抢焦点，方案 044 修正）
+export const COLLECT_SILENT_KEY = 'aihub.collectSilent'
+export const DEFAULT_COLLECT_SILENT = true // 默认开启：定时/看板自动在最小化后台窗口中采集，不抢焦点
+
+export async function getCollectSilent(): Promise<boolean> {
+  const raw = await settingsRepo.get<boolean>(COLLECT_SILENT_KEY)
+  if (raw === true) return true
+  if (raw === false) return false
+  return DEFAULT_COLLECT_SILENT
+}
+
+export async function setCollectSilent(v: boolean): Promise<boolean> {
+  const safe = v === true
+  await settingsRepo.set(COLLECT_SILENT_KEY, safe)
+  return safe
+}

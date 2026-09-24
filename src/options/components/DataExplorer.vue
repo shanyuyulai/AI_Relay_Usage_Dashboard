@@ -5,6 +5,7 @@ import type {
   GetSiteDataResponse,
   RetentionResponse,
   CollectIntervalResponse,
+  CollectSilentResponse,
   LabZeroTabResponse,
   LabCorsResponse,
   LabShowDashboardResponse,
@@ -52,6 +53,8 @@ const interval = ref<number | 'off'>(30)
 // 下拉视图值：预设/关闭直接显示，非预设显示“自定义”
 const intervalSel = ref<number | 'off' | 'custom'>(30)
 const customValue = ref<number>(30)
+// 静默模式：后台最小化窗口采集不抢焦点（方案 046，默认开启；关闭=老模式正常开窗会获取焦点）
+const silentMode = ref<boolean>(true)
 // 实验室：SW 零标签后台采集开关（默认关闭）
 const labEnabled = ref<boolean>(false)
 // 实验室：动态 CORS 放行开关（默认关闭）
@@ -307,6 +310,29 @@ async function loadInterval() {
     syncInterval(res.interval)
   } catch {
     /* 忽略，使用默认 30 */
+  }
+}
+
+async function loadSilent() {
+  try {
+    const res = await send<CollectSilentResponse>('GET_COLLECT_SILENT')
+    silentMode.value = res.enabled
+  } catch {
+    /* 忽略，默认关闭 */
+  }
+}
+
+async function saveSilent() {
+  try {
+    const res = await send<CollectSilentResponse>('SET_COLLECT_SILENT', { enabled: silentMode.value })
+    silentMode.value = res.enabled
+    showMsg(
+      res.enabled
+        ? '已开启静默模式：后台将在最小化窗口中静默采集所有启用站点（不抢焦点）'
+        : '已关闭静默模式：后台将正常开窗采集所有启用站点（窗口会短暂获取焦点）',
+    )
+  } catch (e) {
+    showMsg(e instanceof MessagingError ? e.message : String(e))
   }
 }
 
@@ -569,6 +595,7 @@ watch(
 onMounted(() => {
   loadRetention()
   loadInterval()
+  loadSilent()
   loadLab()
   loadLabCors()
   loadLabShowDashboard()
@@ -622,6 +649,10 @@ onMounted(() => {
           </label>
           <button class="btn" @click="applyCustom">应用</button>
         </template>
+        <label class="lab-toggle" style="margin-left:12px; align-items:center" title="两种模式都采集所有已启用的站点；区别仅在开窗方式：开启=最小化后台窗口不抢焦点，关闭=老模式正常开窗（会短暂获取焦点）">
+          <input type="checkbox" v-model="silentMode" @change="saveSilent" />
+          <span>静默模式（后台最小化窗口采集，不抢焦点）</span>
+        </label>
       </div>
 
       <div class="dex-bar-right">
@@ -631,6 +662,10 @@ onMounted(() => {
         <button class="btn danger" :disabled="!selectedSite" @click="resetSite">🗑 清空该站</button>
         <button class="btn danger ghost" :disabled="!data" @click="resetAll">🗑 清空全部</button>
       </div>
+    </div>
+
+    <div v-if="silentMode" class="settings-card" style="border:1px solid var(--line); background: var(--panel-soft); padding:10px 12px; margin-bottom:14px; border-radius:8px">
+      <b>静默模式已开启：</b>定时与看板的后台刷新将在<b>最小化后台窗口</b>中静默采集所有已启用的站点（无论标签是否打开；不抢焦点、不弹前台，采完自动关闭）。关闭则按老模式<b>正常开窗</b>采集（窗口会短暂获取焦点），同样覆盖所有已启用站点。
     </div>
 
     <details class="settings-card">

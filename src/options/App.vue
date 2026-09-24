@@ -8,7 +8,7 @@ import type { ProbeResult } from '../content/probe'
 import type { NetDiscoveryRequest } from '../background/netDiscovery'
 import { normalizeOrigin, isValidSiteUrl } from '../shared/util'
 import { ensureOriginPermission } from '../shared/permissions'
-import { getThemeMode, setThemeMode, type ThemeMode } from '../shared/theme'
+import { getThemeMode, setThemeMode, THEME_STORAGE_KEY, type ThemeMode } from '../shared/theme'
 import { getLabShowDashboard, LAB_SHOWDASHBOARD_CHANGED } from '../storage'
 import { registry } from '../adapters'
 import { statusBadge } from '../shared/format'
@@ -84,6 +84,19 @@ const formVisible = ref(false)
 const editingSite = ref<SiteConfig | null>(null)
 const helpVisible = ref(false)
 const helpUrl = chrome.runtime.getURL('README.html')
+// 046：使用说明弹窗（iframe）主题同步 —— 同源 iframe 可直接读写其 document，
+// 由父页把当前明暗同步为 iframe 的 html.theme-dark，无需 postMessage。
+// 注：依赖明暗判定的 computed/同步函数定义在下方 theme 声明之后（避免 TDZ）。
+const helpFrame = ref<HTMLIFrameElement | null>(null)
+const helpMediaQuery =
+  typeof window !== 'undefined' && window.matchMedia
+    ? window.matchMedia('(prefers-color-scheme: dark)')
+    : null
+// 系统是否为暗色（仅 theme === 'auto' 时参与判断）
+const systemDark = ref(helpMediaQuery ? helpMediaQuery.matches : false)
+const onSystemThemeChange = (e: MediaQueryListEvent) => {
+  systemDark.value = e.matches
+}
 const groupQrVisible = ref(false)
 const groupQrUrl = chrome.runtime.getURL('qrcode_1102575547.png')
 
@@ -749,12 +762,32 @@ function cycleTheme() {
   setThemeMode(next)
 }
 
+// 046：使用说明弹窗主题同步（定义在 theme 之后，避免 TDZ）
+// 当前弹窗应使用的明暗，与 theme.ts 的 effectiveDark 判定保持一致
+const helpDark = computed(() => theme.value === 'dark' || (theme.value === 'auto' && systemDark.value))
+function syncHelpTheme() {
+  const root = helpFrame.value?.contentDocument?.documentElement
+  root?.classList.toggle('theme-dark', helpDark.value)
+}
+// 弹窗开着时切主题（含 auto 模式下系统配色变化）→ 实时同步 iframe 内容
+watch(helpDark, () => syncHelpTheme())
+// 046：其他页面（侧边栏/极简面板）改主题时，本页 theme 值也需跟随，
+// 否则弹窗内嵌文档会停在旧配色（theme.ts 只负责切换本页 class，不回写响应式状态）
+const onThemeStorageChange = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
+  if (area !== 'local' || !changes[THEME_STORAGE_KEY]) return
+  const m = changes[THEME_STORAGE_KEY].newValue as ThemeMode | undefined
+  if (m === 'light' || m === 'dark' || m === 'auto') theme.value = m
+}
+
 onMounted(async () => {
   await loadSites()
   theme.value = await getThemeMode()
   labShowDashboard.value = await getLabShowDashboard()
   chrome.runtime.onMessage.addListener(onOptionsNotify)
   document.addEventListener('click', onDocClick)
+  // 046：注册系统配色与跨页主题监听（弹窗内嵌文档跟随）
+  helpMediaQuery?.addEventListener?.('change', onSystemThemeChange)
+  chrome.storage?.onChanged?.addListener(onThemeStorageChange)
   // Phase C：尊重 sidebar「📊 用量看板」按钮写入的 session storage 提示
   try {
     const sess = await chrome.storage.session?.get?.('aihub.optsTab')
@@ -772,6 +805,8 @@ onMounted(async () => {
 onUnmounted(() => {
   chrome.runtime.onMessage.removeListener(onOptionsNotify)
   document.removeEventListener('click', onDocClick)
+  helpMediaQuery?.removeEventListener?.('change', onSystemThemeChange)
+  chrome.storage?.onChanged?.removeListener(onThemeStorageChange)
 })
 </script>
 
@@ -1139,7 +1174,8 @@ onUnmounted(() => {
           <h3>使用说明</h3>
           <button class="btn" @click="helpVisible = false">关闭</button>
         </div>
-        <iframe :src="helpUrl" class="help-iframe" title="使用说明"></iframe>
+        <!-- 046：@load 时把当前明暗同步进 iframe 文档（切换主题由 watch(helpDark) 兜底） -->
+        <iframe ref="helpFrame" :src="helpUrl" class="help-iframe" title="使用说明" @load="syncHelpTheme"></iframe>
       </div>
     </div>
 
@@ -1895,7 +1931,8 @@ body {
   border: none;
   width: 100%;
   min-height: 0;
-  background: #fff;
+  /* 046：随主题取值（亮色 #ffffff 与原先一致，暗色 #313338），避免加载瞬间闪白 */
+  background: var(--panel);
 }
 /* 交流群按钮 hover 弹层 */
 .group-wrap {
