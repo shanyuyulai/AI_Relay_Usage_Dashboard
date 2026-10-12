@@ -1,4 +1,4 @@
-import type { Snapshot, SiteConfig, SiteStatus, DailyStat, CustomCaptureRecord, DiagnosticEntry, UsageRecordBatch, SettingsRow, SiteCollectionProfile } from '../../shared/types'
+import type { Snapshot, SiteConfig, SiteStatus, DailyStat, CustomCaptureRecord, DiagnosticEntry, UsageRecordBatch, SettingsRow, SiteCollectionProfile, ModelAvgPrice, ModelAvgHistory } from '../../shared/types'
 
 /** 消息信封：所有跨上下文通信统一结构，requestId 全链路透传。 */
 export interface Req<P = unknown> {
@@ -28,6 +28,8 @@ export interface SiteSummary {
   site: SiteConfig
   latest?: Snapshot
   lastStatus: SiteStatus
+  // 模型均价最小摘要（方案 048；开关关闭/未计算时缺省 undefined）
+  modelAvg?: ModelAvgSummary
 }
 
 /** 单币种总览（P1-3：总余额/用量按币种分组，绝不跨币种相加）。 */
@@ -58,6 +60,7 @@ export interface SiteDetailData {
  * 导出配置（备份文件格式）。
  * - version=1：仅站点配置（旧格式，零凭证）。
  * - version=2：全量备份（站点 + 采集数据 + 设置），见 `tables`。
+ * - version=3：v2 + 模型均价档案与历史（方案 050）。
  * 红线：绝不导出 credentials（无 secret）/ usageCache（派生）。
  */
 export interface ExportConfig {
@@ -72,7 +75,7 @@ export interface ExportConfig {
   theme?: string
 }
 
-/** v2 全量备份的 7 类业务表（credentials/usageCache 故意缺失）。 */
+/** v2 全量备份的 7 类业务表（credentials/usageCache 故意缺失）；v3 追加模型均价两张表（可选，旧备份缺失）。 */
 export interface ExportTables {
   snapshots: Snapshot[]
   dailyStats: DailyStat[]
@@ -80,6 +83,10 @@ export interface ExportTables {
   diagnostics: DiagnosticEntry[]
   usageRecords: UsageRecordBatch[]
   settings: SettingsRow[]
+  /** v3 新增（方案 050）：模型均价档案（merge 语义，每站每模型一行）。 */
+  modelAvgPrices?: ModelAvgPrice[]
+  /** v3 新增（方案 050）：模型均价历史（价格变动追加写）。 */
+  modelAvgHistory?: ModelAvgHistory[]
 }
 
 /** 导入结果：按原因拆分的摘要（GPT P0-导入摘要）。 */
@@ -350,6 +357,22 @@ export interface LabCorsResponse {
   enabled: boolean
 }
 
+// ── 自动检测更新（方案 051） ───────────────
+export interface UpdateCheckStatusResponse {
+  enabled: boolean
+  currentVersion: string
+  latestVersion: string | null
+  latestUrl: string | null
+  latestPublishedAt: number | null
+  hasUpdate: boolean
+  dismissed: boolean
+  lastCheckedAt: number | null
+  releasesUrl: string
+}
+export interface UpdateCheckEnabledPayload {
+  enabled: boolean
+}
+
 // ── 实验室：图标点击弹极简用量看板（实验性，默认关闭） ──────
 export interface LabShowDashboardPayload {
   enabled: boolean
@@ -383,6 +406,72 @@ export interface DashboardSettings {
    * 全局开关（点击任一站点余额即整体切换）；比例无效/缺失的站点仍显示原币种（方案 036）。
    */
   balanceRmbMode: boolean
+  /**
+   * 计算并显示模型均价（方案 048 可配置项①）：开启后极简面板/侧边栏显示
+   * 当日用量最大模型的 ¥/百万 tokens 真实均价（hover 浮窗查看全部模型）。
+   */
+  showModelAvgPrice: boolean
+  /** 模型均价计算条目（方案 048 可配置项②）：取当日明细最近 N 条；默认 200。 */
+  modelAvgMaxRecords: number
+}
+
+/**
+ * 模型均价最小摘要（方案 048）：随 GET_DASHBOARD_SUMMARY / GET_DASHBOARD 下发，
+ * 仅含默认展示所需的数字，全量模型列表走 GET_SITE_MODEL_PRICES 懒加载。
+ * 类型单一权威定义在 core/modelPricing.ts，此处 re-export 供消息通道与 UI 使用。
+ */
+import type { ModelAvgSummary, ModelPriceRow, ModelAvgRawRecord } from '../modelPricing'
+export type { ModelAvgSummary, ModelPriceRow, ModelAvgRawRecord }
+export interface GetSiteModelPricesPayload {
+  siteId: string
+}
+export interface GetSiteModelPricesResponse {
+  siteId: string
+  rows: ModelPriceRow[]
+  partial: boolean
+  hasDetail: boolean
+  /** 站点未填有效充值比例（rows 的 pricePerM 全 null）。 */
+  missingRate: boolean
+  /** 实际参与计算的记录条数。 */
+  usedCount: number
+  /** 参与计算记录的时间范围（浮窗顶部小字展示用），毫秒 ts。 */
+  rangeStart: number | null
+  rangeEnd: number | null
+  /** 当前批次全量原始记录投影（ts 降序；整站「数据时间范围」弹窗用，口径=现算最近 N 条）。 */
+  records: ModelAvgRawRecord[]
+  /** 因缺金额/币种不匹配被跳过的记录数。 */
+  skippedCount: number
+  /** 站点充值比例原始写法（计算方式展示用）。 */
+  rechargeRate: string | null
+  /** 站点计价币种（P1-3 展示用）。 */
+  siteCurrency: string | null
+}
+
+// ── 模型均价档案（方案 050）──
+export interface GetModelAvgSourcePayload {
+  siteId: string
+  model: string
+}
+/** 单模型均价档案（含来源原始记录投影）；无档案时 null。 */
+export interface GetModelAvgSourceResponse {
+  price: ModelAvgPrice | null
+}
+export interface GetSiteModelAvgHistoryPayload {
+  siteId: string
+  /** 可选：仅某模型；缺省=全站。 */
+  model?: string
+}
+export interface GetSiteModelAvgHistoryResponse {
+  rows: ModelAvgHistory[]
+}
+
+export interface SetModelAvgSettingsPayload {
+  showModelAvgPrice?: boolean
+  modelAvgMaxRecords?: number
+}
+export interface SetModelAvgSettingsResponse {
+  showModelAvgPrice: boolean
+  modelAvgMaxRecords: number
 }
 
 export interface DashboardSummaryItem {
@@ -399,6 +488,8 @@ export interface DashboardSummaryItem {
   todayCost?: number | null // 取自最新快照 snap.todayCost（站点本币，自然日口径）
   recent24hCost?: number | null // 取自最新快照 snap.recent24hCost（站点本币，滚动近 24h 口径）
   rechargeRate?: string | null // 取自 site.rechargeRate（原始写法）
+  // 模型均价最小摘要（方案 048；开关关闭/未计算时缺省 undefined）
+  modelAvg?: ModelAvgSummary
 }
 export interface GetDashboardSummaryPayload {
   // 留空，便于未来扩展（如仅某站）

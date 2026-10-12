@@ -2,7 +2,7 @@
 import SiteAvatar from '../shared/SiteAvatar.vue'
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
-import type { DashboardData, CollectResultMsg, CurrencyTotal } from '../core/messaging/protocol'
+import type { DashboardData, CollectResultMsg, CurrencyTotal, UpdateCheckStatusResponse } from '../core/messaging/protocol'
 import type { SiteConfig, Snapshot } from '../shared/types'
 import { getThemeMode, setThemeMode, type ThemeMode } from '../shared/theme'
 import { fmtBalance, fmtTokens, fmtCompactTokens, fmtNum, fmtTime, fmtMs, fmtMsClass, statusBadge } from '../shared/format'
@@ -23,6 +23,8 @@ import {
   type CostWindow,
 } from '../shared/costWindow'
 import SiteDetail from './components/SiteDetail.vue'
+import ModelAvgPrice from '../shared/ModelAvgPrice.vue'
+import { openAvgDetailWindow } from '../shared/avgDetailWindow'
 
 const loading = ref(false)
 const syncing = ref(false)
@@ -61,6 +63,9 @@ const totalList = computed<CurrencyTotal[]>(() =>
 )
 const siteCount = computed(() => sites.value.length)
 const okCount = computed(() => sites.value.filter((s) => s.lastStatus === 'ok').length)
+
+// ── 模型均价详情（方案 049r1）：双击均价数字 → 打开独立详情窗口。
+// @click.stop：均价数字在 .site-card（@click=openDetail）内，不阻断冒泡会因单击进入站点详情导致双击失效。
 
 const totalTodayTokens = computed(() => {
   let sum = 0
@@ -330,11 +335,36 @@ function onRuntimeMessage(msg: { type?: string; detail?: string; enabled?: boole
   }
 }
 
+// ── 自动检测更新横幅（方案 051）：有新版本且未被忽略时显示在 header 下方 ──
+const upd = ref<UpdateCheckStatusResponse | null>(null)
+
+async function loadUpdStatus(): Promise<void> {
+  try {
+    upd.value = await send<UpdateCheckStatusResponse>('GET_UPDATE_CHECK_STATUS')
+  } catch {
+    /* 后台未就绪时静默 */
+  }
+}
+
+function openReleasesPage(): void {
+  const url = upd.value?.latestUrl || upd.value?.releasesUrl
+  if (url) void chrome.tabs.create({ url })
+}
+
+async function dismissUpd(): Promise<void> {
+  try {
+    upd.value = await send<UpdateCheckStatusResponse>('DISMISS_UPDATE_VERSION')
+  } catch {
+    if (upd.value) upd.value.dismissed = true
+  }
+}
+
 onMounted(async () => {
   await loadDashboard()
   theme.value = await getThemeMode()
   labShowDashboard.value = await getLabShowDashboard()
   chrome.runtime.onMessage.addListener(onRuntimeMessage)
+  void loadUpdStatus()
 })
 
 onUnmounted(() => {
@@ -362,6 +392,14 @@ onUnmounted(() => {
         <button class="ibtn" title="设置" @click="openOptions">⚙</button>
       </div>
     </header>
+
+    <!-- 自动检测更新横幅（方案 051）：点击打开发布页，✕ 忽略此版本 -->
+    <div v-if="upd?.hasUpdate && !upd.dismissed" class="sp-upd">
+      <button class="u-link" title="前往 GitHub Releases 下载更新" @click="openReleasesPage">
+        🆕 新版本 v{{ upd.latestVersion }} 可用，点击更新
+      </button>
+      <button class="u-x" title="忽略此版本" @click="dismissUpd">✕</button>
+    </div>
 
     <main class="sp-body">
       <!-- 醒目横幅：自动后台采集即将开窗口（提前提醒，不打断操作） -->
@@ -498,6 +536,17 @@ onUnmounted(() => {
             <div class="sc-foot">
               <span>更新于 {{ fmtTime(s.latest?.takenAt) }}</span>
               <span v-if="s.latest?.quality" class="q-tag">{{ s.latest.quality }}</span>
+              <!-- 模型均价（方案 048/049r1）：刷新按钮左侧，hover 查看全部模型，双击打开独立详情窗口；
+                   @click.stop 阻断向 .site-card 的冒泡（否则单击直接进入站点详情，双击失效） -->
+              <ModelAvgPrice
+                v-if="s.modelAvg"
+                :site-id="s.site.id"
+                :summary="s.modelAvg"
+                align="right"
+                class="sp-avg"
+                @click.stop
+                @detail="openAvgDetailWindow(s.site.id)"
+              />
               <span class="re" @click="syncSite(s.site.id, $event)">刷新 ⟳</span>
             </div>
 
@@ -547,6 +596,38 @@ body {
   padding: 14px 16px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
+}
+/* 更新横幅（方案 051） */
+.sp-upd {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  background: var(--brand-soft, rgba(9, 105, 218, 0.1));
+  border-bottom: 1px solid var(--brand, #0969da);
+}
+.u-link {
+  flex: 1;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  color: var(--brand, #0969da);
+  cursor: pointer;
+}
+.u-x {
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  font-size: 11px;
+  color: var(--sub, #6b7280);
+  cursor: pointer;
+}
+.u-x:hover {
+  color: var(--text, #1f2328);
 }
 .logo {
   width: 30px;
@@ -942,6 +1023,11 @@ body {
   font-size: 10px;
   color: var(--sub);
   gap: 8px;
+}
+/* 模型均价（方案 048）：刷新按钮左侧数字，与 sc-foot 字号协调 */
+.sp-avg {
+  font-size: 11px;
+  margin-left: auto;
 }
 .q-tag {
   background: var(--brand-soft);

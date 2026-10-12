@@ -27,6 +27,8 @@ import type {
   DiagnosticEntry,
   UsageRecordBatch,
   SettingsRow,
+  ModelAvgPrice,
+  ModelAvgHistory,
 } from '../shared/types'
 import type { ExportConfig, ExportTables, ImportResult } from '../core/messaging/protocol'
 import { parseRechargeRate } from '../shared/recharge'
@@ -58,6 +60,17 @@ const USAGE_BATCH_KEYS: (keyof UsageRecordBatch)[] = [
 ]
 // diagnostics 为脱敏指纹，无秘密字段；导出保留 recordId、剔除自增 id，其余全留
 const DIAGNOSTIC_DROP_KEYS = ['id']
+// 模型均价档案 / 历史（方案 050）：聚合值 + 脱敏原始记录投影，无凭证字段；历史为追加表，导出剔除自增 id
+const MODEL_AVG_PRICE_KEYS: (keyof ModelAvgPrice)[] = [
+  'id', 'siteId', 'model', 'pricePerM', 'tokens', 'requests', 'listPriceBased',
+  'rangeStart', 'rangeEnd', 'usedCount', 'partial', 'rechargeRate', 'missingRate',
+  'computedAt', 'records',
+]
+const MODEL_AVG_HISTORY_KEYS: (keyof ModelAvgHistory)[] = [
+  'siteId', 'model', 'pricePerM', 'tokens', 'requests', 'listPriceBased',
+  'rangeStart', 'rangeEnd', 'usedCount', 'partial', 'rechargeRate', 'missingRate', 'computedAt',
+  'records',
+]
 
 // —— 站点导出字段白名单（P0-1/P0-2：绝不整条 SiteConfig 原样导出，只导出用户配置 + 必要展示字段）——
 // 评审终审收紧：剔除纯运行时/诊断字段（lastCollectAt/lastStatus/lastError/lastFailureReason/
@@ -114,6 +127,10 @@ const PORTABLE_SETTING_KEYS = new Set<string>([
   'aihub.showTodayCostInPopup',
   'aihub.costWindow',
   'aihub.balanceRmbMode',
+  // 模型均价（方案 048：显示开关 + 计算条目，均为用户偏好）
+  'aihub.showModelAvgPrice',
+  'aihub.modelAvgMaxRecords',
+  'aihub.updateCheckEnabled',
   // 实验室开关（均为用户偏好布尔，无敏感值）
   'aihub.lab.zeroTab',
   'aihub.lab.corsUnblock',
@@ -152,14 +169,16 @@ function emptyDataStats(): Record<string, { written: number; orphanSkipped: numb
     usageRecords: { written: 0, orphanSkipped: 0, idRecomputed: 0 },
     captures: { written: 0, orphanSkipped: 0, idRecomputed: 0 },
     settings: { written: 0, orphanSkipped: 0, idRecomputed: 0 },
+    modelAvgPrices: { written: 0, orphanSkipped: 0, idRecomputed: 0 },
+    modelAvgHistory: { written: 0, orphanSkipped: 0, idRecomputed: 0 },
   }
 }
 
-/** 导出全量备份（v2）。单只读事务读取 7 类业务表 + 站点配置，绝不读 credentials/usageCache。 */
+/** 导出全量备份（v3）。单只读事务读取 9 类业务表 + 站点配置，绝不读 credentials/usageCache。 */
 export async function exportAll(): Promise<ExportConfig> {
   const data = await db.transaction(
     'r',
-    [db.sites, db.snapshots, db.dailyStats, db.captures, db.diagnostics, db.usageRecords, db.settings],
+    [db.sites, db.snapshots, db.dailyStats, db.captures, db.diagnostics, db.usageRecords, db.settings, db.modelAvgPrices, db.modelAvgHistory],
     async () => {
       const [
         sites,
@@ -169,6 +188,8 @@ export async function exportAll(): Promise<ExportConfig> {
         diagnostics,
         usageRecords,
         settings,
+        modelAvgPrices,
+        modelAvgHistory,
       ] = await Promise.all([
         db.sites.toArray(),
         db.snapshots.toArray(),
@@ -177,8 +198,10 @@ export async function exportAll(): Promise<ExportConfig> {
         db.diagnostics.toArray(),
         db.usageRecords.toArray(),
         db.settings.toArray(),
+        db.modelAvgPrices.toArray(),
+        db.modelAvgHistory.toArray(),
       ])
-      return { sites, snapshots, dailyStats, captures, diagnostics, usageRecords, settings }
+      return { sites, snapshots, dailyStats, captures, diagnostics, usageRecords, settings, modelAvgPrices, modelAvgHistory }
     },
   )
 
@@ -206,11 +229,14 @@ export async function exportAll(): Promise<ExportConfig> {
     settings: (data.settings as SettingsRow[])
       .filter((s) => isPortableSetting(s.key))
       .map((s) => ({ key: s.key, value: s.value })),
+    // v3（方案 050）：模型均价档案与历史（聚合值+脱敏投影，无凭证）
+    modelAvgPrices: (data.modelAvgPrices as ModelAvgPrice[]).map((p) => pick(p, MODEL_AVG_PRICE_KEYS) as ModelAvgPrice),
+    modelAvgHistory: (data.modelAvgHistory as ModelAvgHistory[]).map((h) => pick(h, MODEL_AVG_HISTORY_KEYS) as ModelAvgHistory),
   }
 
   const manifest = chrome.runtime.getManifest()
   const config: ExportConfig = {
-    version: 2,
+    version: 3,
     exportedAt: Date.now(),
     appVersion: manifest?.version,
     schemaVersion: db.verno,
@@ -252,7 +278,7 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
     skippedByReason[reason] = (skippedByReason[reason] ?? 0) + 1
   }
 
-  if (config.version !== 1 && config.version !== 2) {
+  if (config.version !== 1 && config.version !== 2 && config.version !== 3) {
     return {
       imported: 0,
       updated: 0,
@@ -260,7 +286,7 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
       skippedByReason,
       data: stats,
       operationId: crypto.randomUUID(),
-      fatalError: `不支持的备份版本 v${config.version}（仅支持 v1/v2）`,
+      fatalError: `不支持的备份版本 v${config.version}（仅支持 v1/v2/v3）`,
     }
   }
 
@@ -363,7 +389,7 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
   const tables = config.tables
   await db.transaction(
       'rw',
-      [db.sites, db.credentials, db.snapshots, db.dailyStats, db.captures, db.diagnostics, db.usageRecords, db.settings, db.alertBaselines, db.alertDeliveries],
+      [db.sites, db.credentials, db.snapshots, db.dailyStats, db.captures, db.diagnostics, db.usageRecords, db.settings, db.alertBaselines, db.alertDeliveries, db.modelAvgPrices, db.modelAvgHistory],
       async () => {
         const credentialUpdatedAt = Date.now()
         for (const site of siteWrites) {
@@ -376,7 +402,7 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
             updatedAt: credentialUpdatedAt,
           })
         }
-        if (!tables || config.version !== 2) return
+        if (!tables || (config.version !== 2 && config.version !== 3)) return
         // snapshots：按 recordId 幂等；siteId 重写
         for (const raw of tables.snapshots) {
           const target = idMap.get(raw.siteId)
@@ -456,6 +482,33 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
           }
           await db.settings.put({ key: setting.key, value: setting.value })
           stats.settings.written += 1
+        }
+        // 模型均价档案（v3，方案 050）：主键 `${siteId}|${model}` 按 targetSiteId 重算
+        for (const raw of tables.modelAvgPrices ?? []) {
+          const target = idMap.get(raw.siteId)
+          if (!target) {
+            stats.modelAvgPrices.orphanSkipped += 1
+            continue
+          }
+          const row = pick(raw, MODEL_AVG_PRICE_KEYS) as ModelAvgPrice
+          row.siteId = target
+          row.id = `${target}|${row.model}`
+          await db.modelAvgPrices.put(row)
+          stats.modelAvgPrices.written += 1
+          stats.modelAvgPrices.idRecomputed += 1
+        }
+        // 模型均价历史（v3，方案 050）：追加语义，剔除自增 id 后重写 siteId
+        for (const raw of tables.modelAvgHistory ?? []) {
+          const target = idMap.get(raw.siteId)
+          if (!target) {
+            stats.modelAvgHistory.orphanSkipped += 1
+            continue
+          }
+          const row = pick(raw, MODEL_AVG_HISTORY_KEYS) as ModelAvgHistory
+          row.siteId = target
+          delete row.id
+          await db.modelAvgHistory.add(row)
+          stats.modelAvgHistory.written += 1
         }
       },
     )

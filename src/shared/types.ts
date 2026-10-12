@@ -432,6 +432,76 @@ export interface UsageRecord {
 }
 
 /**
+ * 单站点单模型均价档案（方案 050）：merge 语义——当前批次有该模型数据才更新，否则保留历史。
+ * 主键 `${siteId}|${model}`；内容为聚合值 + 脱敏原始记录投影，绝不含凭证/IP 哈希（P0-2/P1-1）。
+ */
+export interface ModelAvgPrice {
+  id: string
+  siteId: string
+  model: string
+  /** ¥/百万 tokens；null → UI 显「—」（缺比例或无有效金额）。 */
+  pricePerM: number | null
+  tokens: number
+  requests: number
+  /** 该行含回退「标价口径」的记录。 */
+  listPriceBased: boolean
+  /** 来源数据时间范围（该模型参与计算的记录 ts 范围）。 */
+  rangeStart: number | null
+  rangeEnd: number | null
+  /** 该模型参与计算的记录条数。 */
+  usedCount: number
+  /** 计算时批次是否截断（isComplete=false）。 */
+  partial: boolean
+  /** 计算时的充值比例原文（比例变更后旧价口径可追溯）。 */
+  rechargeRate: string | null
+  missingRate: boolean
+  /** 计算时间（ms）。 */
+  computedAt: number
+  /** 来源原始记录投影（供「数据来源」弹窗，免回查 usageRecords）。 */
+  records: ModelAvgRawRecord[]
+}
+
+/** 均价历史（方案 050）：某模型价格变化（或首次建档）时追加一条；按站裁剪最近 500 条。 */
+export interface ModelAvgHistory {
+  /** 自增主键（导入时删除重排）。 */
+  id?: number
+  siteId: string
+  model: string
+  pricePerM: number | null
+  tokens: number
+  requests: number
+  listPriceBased: boolean
+  rangeStart: number | null
+  rangeEnd: number | null
+  usedCount: number
+  partial: boolean
+  rechargeRate: string | null
+  missingRate: boolean
+  computedAt: number
+  /** 050r1：该次计算的原始记录投影快照（与档案 records 同构）；旧条目无此字段。 */
+  records?: ModelAvgRawRecord[]
+}
+
+/**
+ * 参与均价计算的原始记录投影（方案 049r2 引入，050 移入本文件消除 core↔shared 类型循环）。
+ * 仅含展示/核算字段，绝不含凭证与 IP 哈希（P0-2 / P1-1）。
+ */
+export interface ModelAvgRawRecord {
+  /** 调用时间（ms） */
+  ts: number
+  model: string
+  promptTokens: number
+  completionTokens: number
+  /** 参与计算的金额（本币）：实扣 actualCost 优先，缺失回退标价 cost */
+  amount: number | null
+  /** true = 金额回退标价口径（actualCost 缺失） */
+  listPrice: boolean
+  currency: string | null
+  /** 逐条按充值比例换算的人民币；比例缺失时为 null（UI 显「—」） */
+  rmb: number | null
+}
+
+/**
  * 单站单日的用量明细批次（一整日的所有调用记录）。
  * 主键 `siteId:date` —— 同一天多次采集，完整批次优先于不完整批次（P1：防覆盖）。
  * 与同站采集原子提交于 Dexie 事务（putBatch + revision bump）。

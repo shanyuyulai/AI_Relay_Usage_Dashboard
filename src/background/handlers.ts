@@ -37,8 +37,15 @@ import { applyInterval } from './scheduler'
 import { registry } from '../adapters'
 import { normalizeOrigin, isValidSiteUrl, todayKey, dateKey, dateKeyInTz, HUBWAY_TZ, HUBWAY_TZ_OFFSET_MIN, isValidDateKey } from '../shared/util'
 import { parseRechargeRate } from '../shared/recharge'
-import { readDashboardSettings, setCostWindow, setBalanceRmbMode } from '../shared/dashboardSettings'
+import {
+  readDashboardSettings,
+  setCostWindow,
+  setBalanceRmbMode,
+  setShowModelAvgPrice,
+  setModelAvgMaxRecords,
+} from '../shared/dashboardSettings'
 import { normalizeCostWindow } from '../shared/costWindow'
+import { computeModelPrices, normalizeModelAvgMaxRecords, type ModelAvgSummary, type ModelPriceRow } from '../core/modelPricing'
 import type {
   CollectResultMsg,
   SiteSummary,
@@ -71,6 +78,8 @@ import type {
   LabZeroTabResponse,
   LabCorsPayload,
   LabCorsResponse,
+  UpdateCheckStatusResponse,
+  UpdateCheckEnabledPayload,
   LabShowDashboardPayload,
   LabShowDashboardResponse,
   ClickBehaviorPayload,
@@ -78,6 +87,7 @@ import type {
   GetDashboardSummaryPayload,
   GetDashboardSummaryResponse,
   DashboardSummaryItem,
+  DashboardSettings,
   GetUsageRecordsPayload,
   GetUsageRecordsResponse,
   UsageRangePayload,
@@ -99,14 +109,25 @@ import type {
   ResetDataResponse,
   GetSiteCollectionProfilesPayload,
   GetSiteCollectionProfilesResponse,
+  GetSiteModelPricesPayload,
+  GetSiteModelPricesResponse,
+  SetModelAvgSettingsPayload,
+  SetModelAvgSettingsResponse,
+  GetModelAvgSourcePayload,
+  GetModelAvgSourceResponse,
+  GetSiteModelAvgHistoryPayload,
+  GetSiteModelAvgHistoryResponse,
 } from '../core/messaging/protocol'
 import type { Req } from '../core/messaging/protocol'
-import type { SiteConfig, SiteCollectionProfile, AccountSemantics } from '../shared/types'
+import type { SiteConfig, SiteCollectionProfile, AccountSemantics, ModelAvgPrice } from '../shared/types'
+import { mergeModelAvgPrices } from '../core/modelAvgMerge'
+import { modelAvgRepo } from '../storage/modelAvgRepo'
 import { buildSiteCollectionProfile } from '../core/collectionProfile'
 import { authReasonToFailure } from '../core/authState'
 import { probeSiteEndpoints, type ProbeResult, type ProbeAttempt } from '../content/probe'
 import { classifySite, type SiteFingerprint, type EndpointSignal } from '../core/classifySite'
 import { discoverNetworkRequests, type NetDiscoveryRequest } from './netDiscovery'
+import { checkForUpdate, dismissUpdate, getUpdateStatus, reconcileUpdateCheckAlarm, setUpdateCheckEnabled } from './updateCheck'
 
 type Handler = (payload: any, req: Req) => Promise<unknown>
 
@@ -247,6 +268,70 @@ function sanitizeFilters(f: UsageDetailFilters | undefined): UsageDetailFilters 
   return out
 }
 
+/**
+ * 模型均价：现算 + 档案合并 + 持久化（方案 050）。
+ * - 现算口径不变：当日批次最近 N 条（hubway_v1 固定 Asia/Shanghai 业务日，其余本地日界）。
+ * - merge 语义：当前批次出现的模型覆盖档案，未出现的保留历史档案（防跨批次覆盖丢失）。
+ * - 内容签名未变则零写入（读路径可高频调用）；价格变化或首次建档追加历史。
+ * - 开关关闭 → null（UI 不渲染）；无明细 → hasDetail=false，且不清空既有档案。
+ */
+async function computeAndMergeForSite(
+  site: SiteConfig,
+  settings: DashboardSettings,
+): Promise<{ summary: ModelAvgSummary; rows: ModelPriceRow[] } | null> {
+  if (!settings.showModelAvgPrice) return null
+  const isHubway = site.discovered?.usageListKind === 'hubway_v1'
+  const date = isHubway ? dateKeyInTz(Date.now(), HUBWAY_TZ) : todayKey()
+  const batch = await usageRecordsRepo.getBySiteDate(site.id, date)
+  const records = batch?.records ?? []
+  const res = computeModelPrices(records, site.rechargeRate ?? null, settings.modelAvgMaxRecords, {
+    siteCurrency: site.currency ?? null,
+    batchComplete: batch?.isComplete ?? true,
+  })
+  const prev = await modelAvgRepo.listBySite(site.id)
+  const merged = mergeModelAvgPrices(prev, res, {
+    siteId: site.id,
+    rechargeRate: site.rechargeRate ?? null,
+    now: Date.now(),
+  })
+  if (merged.changed.length) {
+    await modelAvgRepo.putMany(merged.changed)
+    await modelAvgRepo.addHistory(merged.history)
+  }
+  // 站点摘要：当前批次用量最大模型的合并价（可能是历史档案价）
+  const top = res.models[0]
+  const topPrice = top ? merged.next.find((p) => p.model === top.model) : undefined
+  const summary: ModelAvgSummary = top
+    ? {
+        pricePerM: topPrice?.pricePerM ?? null,
+        topModel: top.model,
+        partial: res.summary.partial,
+        hasDetail: true,
+      }
+    : { pricePerM: null, topModel: null, partial: false, hasDetail: false }
+  // rows：合并后档案（现算模型在前），附带来源范围与历史标记
+  const seenNow = new Set(res.models.map((m) => m.model))
+  const rows: ModelPriceRow[] = merged.next.map((p) => ({
+    model: p.model,
+    tokens: p.tokens,
+    requests: p.requests,
+    pricePerM: p.pricePerM,
+    listPriceBased: p.listPriceBased,
+    rangeStart: p.rangeStart,
+    rangeEnd: p.rangeEnd,
+    usedCount: p.usedCount,
+    computedAt: p.computedAt,
+    fromHistory: !seenNow.has(p.model),
+  }))
+  return { summary, rows }
+}
+
+/** 模型均价最小摘要（方案 048→050）：现算 + 合并档案后的站点级展示值。 */
+async function computeSiteModelAvg(site: SiteConfig, settings: DashboardSettings): Promise<ModelAvgSummary | undefined> {
+  const r = await computeAndMergeForSite(site, settings)
+  return r?.summary
+}
+
 export const handlers: Record<string, Handler> = {
   // 主动同步（侧边栏「立即同步」）：走页面主世界采集（MV3 可靠路径）
   async COLLECT_NOW(payload: CollectNowPayload) {
@@ -267,11 +352,17 @@ export const handlers: Record<string, Handler> = {
   // 仪表盘总览（P1-3：按币种分组，不跨币种相加）
   async GET_DASHBOARD() {
     const sites = await siteRepo.list()
+    const settings = await readDashboardSettings()
     const summaries: SiteSummary[] = []
     const totals: TotalsByCurrency = {}
     for (const site of sites) {
       const latest = (await snapshotRepo.latest(site.id, 1))[0]
-      summaries.push({ site, latest, lastStatus: site.lastStatus })
+      summaries.push({
+        site,
+        latest,
+        lastStatus: site.lastStatus,
+        modelAvg: await computeSiteModelAvg(site, settings),
+      })
       if (latest && latest.balance != null && latest.currency) {
         const cur = latest.currency
         const t =
@@ -289,7 +380,7 @@ export const handlers: Record<string, Handler> = {
         t.sites += 1
       }
     }
-    const data: DashboardData = { sites: summaries, totals, settings: await readDashboardSettings() }
+    const data: DashboardData = { sites: summaries, totals, settings }
     return data
   },
 
@@ -437,6 +528,7 @@ export const handlers: Record<string, Handler> = {
     if (!target) throw new Error('站点不存在')
     await siteRepo.remove(payload.id)
     await credentialRepo.clear(payload.id)
+    await modelAvgRepo.clearSite(payload.id) // 级联清理均价档案与历史（方案 050）
     broadcastSitesChanged() // 通知侧边栏实时刷新
     void refreshCorsRules() // 若 CORS 放行开启，移除该站规则
     // 引用计数：以 IndexedDB 为权威数据源（防 UI 快照过时）
@@ -906,6 +998,68 @@ export const handlers: Record<string, Handler> = {
     return { enabled: (await readDashboardSettings()).balanceRmbMode }
   },
 
+  // ── 模型均价：hover 浮窗全量列表（方案 048/050，懒加载；rows=合并后档案行）──
+  async GET_SITE_MODEL_PRICES(payload: GetSiteModelPricesPayload): Promise<GetSiteModelPricesResponse> {
+    const site = await siteRepo.get(payload?.siteId)
+    if (!site) throw new Error('站点不存在')
+    const settings = await readDashboardSettings()
+    const merged = await computeAndMergeForSite(site, settings)
+    if (!merged) throw new Error('模型均价功能已关闭')
+    const isHubway = site.discovered?.usageListKind === 'hubway_v1'
+    const date = isHubway ? dateKeyInTz(Date.now(), HUBWAY_TZ) : todayKey()
+    const batch = await usageRecordsRepo.getBySiteDate(site.id, date)
+    const records = batch?.records ?? []
+    // 整站口径（顶层）：当前批次现算（时间范围行弹窗展示用）
+    const res = computeModelPrices(records, site.rechargeRate ?? null, settings.modelAvgMaxRecords, {
+      siteCurrency: site.currency ?? null,
+      batchComplete: batch?.isComplete ?? true,
+    })
+    return {
+      siteId: site.id,
+      rows: merged.rows,
+      partial: res.summary.partial,
+      hasDetail: res.summary.hasDetail,
+      missingRate: res.missingRate,
+      usedCount: res.usedCount,
+      rangeStart: res.rangeStart,
+      rangeEnd: res.rangeEnd,
+      records: res.models.flatMap((m) => m.rawRecords),
+      skippedCount: res.skippedCount,
+      rechargeRate: site.rechargeRate ?? null,
+      siteCurrency: site.currency ?? null,
+    }
+  },
+
+  // ── 模型均价：单模型档案（含来源原始记录投影；方案 050「数据来源」弹窗）──
+  async GET_MODEL_AVG_SOURCE(payload: GetModelAvgSourcePayload): Promise<GetModelAvgSourceResponse> {
+    const site = await siteRepo.get(payload?.siteId)
+    if (!site) throw new Error('站点不存在')
+    const model = String(payload?.model ?? '')
+    if (!model) return { price: null }
+    const settings = await readDashboardSettings()
+    if (!settings.showModelAvgPrice) return { price: null }
+    // 先走合并链路（保证当前批次最新数据已落档案），再读档案
+    await computeAndMergeForSite(site, settings)
+    const price = await modelAvgRepo.get(site.id, model)
+    return { price: price ?? null }
+  },
+
+  // ── 模型均价：历史均价列表（方案 050，computedAt 倒序）──
+  async GET_SITE_MODEL_AVG_HISTORY(payload: GetSiteModelAvgHistoryPayload): Promise<GetSiteModelAvgHistoryResponse> {
+    const site = await siteRepo.get(payload?.siteId)
+    if (!site) throw new Error('站点不存在')
+    const rows = await modelAvgRepo.listHistory(site.id, payload?.model || undefined)
+    return { rows }
+  },
+
+  // ── 模型均价：全局设置（方案 048 可配置项①②）──
+  async SET_MODEL_AVG_SETTINGS(payload: SetModelAvgSettingsPayload): Promise<SetModelAvgSettingsResponse> {
+    if (payload?.showModelAvgPrice !== undefined) await setShowModelAvgPrice(payload.showModelAvgPrice === true)
+    if (payload?.modelAvgMaxRecords !== undefined) await setModelAvgMaxRecords(payload.modelAvgMaxRecords)
+    const s = await readDashboardSettings()
+    return { showModelAvgPrice: s.showModelAvgPrice, modelAvgMaxRecords: s.modelAvgMaxRecords }
+  },
+
   // ── 实验室：SW 零标签后台采集开关（默认关闭，需用户显式知情同意）──
   async GET_LAB_ZEROTAB(): Promise<LabZeroTabResponse> {
     return { enabled: await getLabZeroTab() }
@@ -924,6 +1078,26 @@ export const handlers: Record<string, Handler> = {
     const enabled = await setLabCorsUnblock(payload.enabled === true)
     await applyCorsRules(enabled) // 即时添加/移除 declarativeNetRequest 规则
     return { enabled }
+  },
+
+  // ── 自动检测更新（方案 051）──
+  async GET_UPDATE_CHECK_STATUS(): Promise<UpdateCheckStatusResponse> {
+    return getUpdateStatus()
+  },
+
+  async SET_UPDATE_CHECK_ENABLED(payload: UpdateCheckEnabledPayload): Promise<UpdateCheckStatusResponse> {
+    await setUpdateCheckEnabled(payload?.enabled === true)
+    await reconcileUpdateCheckAlarm(payload?.enabled === true) // 开关切换即时重建/清除 alarm
+    return getUpdateStatus()
+  },
+
+  async CHECK_UPDATE_NOW(): Promise<UpdateCheckStatusResponse> {
+    return checkForUpdate(true) // 绕过开关与节流的真实网络检查
+  },
+
+  async DISMISS_UPDATE_VERSION(): Promise<UpdateCheckStatusResponse> {
+    await dismissUpdate()
+    return getUpdateStatus()
   },
 
   // ── 实验室：图标点击弹极简用量看板（默认关闭）──
@@ -960,36 +1134,40 @@ export const handlers: Record<string, Handler> = {
    */
   async GET_DASHBOARD_SUMMARY(_payload: GetDashboardSummaryPayload): Promise<GetDashboardSummaryResponse> {
     const [sites, snapshotsAll] = await Promise.all([siteRepo.list(), snapshotRepo.all()])
+    const settings = await readDashboardSettings()
     // 取每个站点最新一条快照（snapshotsAll 已新→旧排序）
     const latestBySite = new Map<string, (typeof snapshotsAll)[number]>()
     for (const s of snapshotsAll) {
       if (!latestBySite.has(s.siteId)) latestBySite.set(s.siteId, s)
     }
-    const items: DashboardSummaryItem[] = sites
-      .filter((site) => site.enabled !== false)
-      .map((site) => {
-        const snap = latestBySite.get(site.id)
-        return {
-          siteId: site.id,
-          name: site.name,
-          origin: site.origin,
-          // P0 修复（评审驳回项）：摘要下发的跳转链接必须经由协议白名单；baseUrl 合法→trim 值，否则回退已校验的 origin，二者皆非法→空串（UI 不渲染链接）
-          baseUrl: isValidSiteUrl(site.baseUrl)
-            ? site.baseUrl.trim()
-            : isValidSiteUrl(site.origin)
-              ? site.origin
-              : '',
-          balance: snap ? snap.balance : null,
-          currency: snap ? snap.currency : null,
-          updatedAt: snap ? snap.takenAt : null,
-          status: !snap ? 'no_data' : snap.status,
-          // 花费换算所需最小数据（极简面板本地换算，避免二次请求）；两个周期字段一并发，切换周期无需重新请求
-          todayCost: snap ? (snap.todayCost ?? null) : null,
-          recent24hCost: snap ? (snap.recent24hCost ?? null) : null,
-          rechargeRate: site.rechargeRate ?? null,
-        }
-      })
-    const settings = await readDashboardSettings()
+    const items: DashboardSummaryItem[] = await Promise.all(
+      sites
+        .filter((site) => site.enabled !== false)
+        .map(async (site) => {
+          const snap = latestBySite.get(site.id)
+          return {
+            siteId: site.id,
+            name: site.name,
+            origin: site.origin,
+            // P0 修复（评审驳回项）：摘要下发的跳转链接必须经由协议白名单；baseUrl 合法→trim 值，否则回退已校验的 origin，二者皆非法→空串（UI 不渲染链接）
+            baseUrl: isValidSiteUrl(site.baseUrl)
+              ? site.baseUrl.trim()
+              : isValidSiteUrl(site.origin)
+                ? site.origin
+                : '',
+            balance: snap ? snap.balance : null,
+            currency: snap ? snap.currency : null,
+            updatedAt: snap ? snap.takenAt : null,
+            status: !snap ? 'no_data' : snap.status,
+            // 花费换算所需最小数据（极简面板本地换算，避免二次请求）；两个周期字段一并发，切换周期无需重新请求
+            todayCost: snap ? (snap.todayCost ?? null) : null,
+            recent24hCost: snap ? (snap.recent24hCost ?? null) : null,
+            rechargeRate: site.rechargeRate ?? null,
+            // 模型均价最小摘要（方案 048；开关关闭时为 undefined，UI 不渲染）
+            modelAvg: await computeSiteModelAvg(site, settings),
+          }
+        }),
+    )
     return { items, settings }
   },
 

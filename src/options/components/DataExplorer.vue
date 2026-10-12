@@ -10,6 +10,7 @@ import type {
   LabCorsResponse,
   LabShowDashboardResponse,
   ClickBehaviorResponse,
+  UpdateCheckStatusResponse,
   ResetDataResponse,
   DeleteSnapshotsResponse,
 } from '../../core/messaging/protocol'
@@ -25,6 +26,8 @@ import {
   setShowTodayCostInPopup,
   setCostWindow,
   setBalanceRmbMode,
+  setShowModelAvgPrice,
+  setModelAvgMaxRecords,
 } from '../../shared/dashboardSettings'
 
 const props = defineProps<{ sites: SiteConfig[] }>()
@@ -100,6 +103,28 @@ const balanceRmbMode = computed({
     void setBalanceRmbMode(v)
   },
 })
+// 计算并显示模型均价（方案 048 可配置项①）
+const showModelAvgPrice = computed({
+  get: () => dashboardSettings.showModelAvgPrice !== false,
+  set: (v: boolean) => {
+    void setShowModelAvgPrice(v)
+  },
+})
+// 计算条目（方案 048 可配置项②）：本地输入态，@change 时统一归一化保存，避免逐键写库
+const modelAvgMaxInput = ref<number>(200)
+watch(
+  () => dashboardSettings.modelAvgMaxRecords,
+  (v) => {
+    modelAvgMaxInput.value = v
+  },
+  { immediate: true },
+)
+async function saveModelAvgMax() {
+  const v = Math.floor(Number(modelAvgMaxInput.value))
+  if (Number.isFinite(v)) await setModelAvgMaxRecords(v)
+  // 写回归一化后的值（越界/非法输入即时纠正为实际生效值）
+  modelAvgMaxInput.value = dashboardSettings.modelAvgMaxRecords
+}
 // 花费统计周期（24 小时 / 今日）：决定总花费与所有「使用金额」取哪个口径
 const costWindow = computed<'today' | 'h24'>({
   get: () => (dashboardSettings.costWindow === 'h24' ? 'h24' : 'today'),
@@ -424,6 +449,71 @@ async function saveClickBehavior() {
   }
 }
 
+// ── 自动检测更新（方案 051）──
+const upd = ref({
+  enabled: true,
+  currentVersion: '',
+  latestVersion: null as string | null,
+  latestUrl: null as string | null,
+  releasesUrl: 'https://github.com/shanyuyulai/AI_Relay_Usage_Dashboard/releases',
+  hasUpdate: false,
+  dismissed: false,
+  lastCheckedAt: null as number | null,
+  checking: false,
+  err: '',
+})
+
+function applyUpdStatus(r: UpdateCheckStatusResponse): void {
+  upd.value.enabled = r.enabled
+  upd.value.currentVersion = r.currentVersion
+  upd.value.latestVersion = r.latestVersion
+  upd.value.latestUrl = r.latestUrl
+  if (r.releasesUrl) upd.value.releasesUrl = r.releasesUrl
+  upd.value.hasUpdate = r.hasUpdate
+  upd.value.dismissed = r.dismissed
+  upd.value.lastCheckedAt = r.lastCheckedAt
+  upd.value.err = ''
+}
+
+async function loadUpdateStatus(): Promise<void> {
+  try {
+    applyUpdStatus(await send<UpdateCheckStatusResponse>('GET_UPDATE_CHECK_STATUS'))
+  } catch {
+    upd.value.err = '读取更新状态失败（后台未就绪？稍后重试）'
+  }
+}
+
+async function onUpdateCheckToggle(): Promise<void> {
+  try {
+    applyUpdStatus(await send<UpdateCheckStatusResponse>('SET_UPDATE_CHECK_ENABLED', { enabled: upd.value.enabled }))
+    showMsg(upd.value.enabled ? '已开启自动检测更新（每 12 小时检查一次）' : '已关闭自动检测更新')
+  } catch (e) {
+    showMsg(e instanceof MessagingError ? e.message : String(e))
+  }
+}
+
+async function checkUpdateNow(): Promise<void> {
+  upd.value.checking = true
+  try {
+    applyUpdStatus(await send<UpdateCheckStatusResponse>('CHECK_UPDATE_NOW'))
+    showMsg(upd.value.hasUpdate ? `检测到新版本 ${upd.value.latestVersion}` : '当前已是最新版本')
+  } catch (e) {
+    showMsg(e instanceof MessagingError ? e.message : String(e))
+  } finally {
+    upd.value.checking = false
+  }
+}
+
+function openReleasesPage(url?: string | null): void {
+  // latestUrl 仅在成功检查过且有 release 时存在；否则回退到固定发布页地址（始终可开）
+  const target = url || upd.value.latestUrl || upd.value.releasesUrl
+  if (target) void chrome.tabs.create({ url: target })
+}
+
+function fmtUpdTime(ts: number | null): string {
+  return ts ? fmtDateTime(ts) : '—'
+}
+
 // 把后台返回的间隔值同步到视图（处理预设 / 自定义 / 关闭三种形态）
 function syncInterval(v: number | 'off') {
   interval.value = v
@@ -602,6 +692,7 @@ onMounted(() => {
   loadClickBehavior()
   loadNotify()
   loadDashboardSettings()
+  loadUpdateStatus()
 })
 </script>
 
@@ -706,6 +797,33 @@ onMounted(() => {
       </div>
     </details>
 
+    <details class="settings-card" :open="upd.hasUpdate && !upd.dismissed">
+      <summary>⬆️ 更新检测</summary>
+      <p class="settings-desc">
+        定期访问 GitHub Releases 检查插件新版本（每 12 小时一次）。发现新版本时通过系统通知与看板横幅提醒，
+        点击即可打开发布页手动下载更新。检测只读取公开的版本信息，<b>不下载任何文件、不上传任何本地数据</b>。
+      </p>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="upd.enabled" @change="onUpdateCheckToggle" />
+        <span>自动检测更新（默认开启；关闭后不再定期检查，仍可手动「立即检查」）</span>
+      </label>
+      <div class="upd-status">
+        <small class="upd-line">
+          当前版本 <b>v{{ upd.currentVersion || '—' }}</b><template v-if="upd.latestVersion">
+          · 最新版本 <b>v{{ upd.latestVersion }}</b></template><template v-if="upd.lastCheckedAt">
+          · 上次检查 {{ fmtUpdTime(upd.lastCheckedAt) }}</template>
+        </small>
+        <div class="upd-acts">
+          <button class="btn" :disabled="upd.checking" @click="checkUpdateNow">{{ upd.checking ? '检查中…' : '立即检查' }}</button>
+          <button class="btn" @click="openReleasesPage()">打开发布页</button>
+        </div>
+        <small v-if="upd.hasUpdate && !upd.dismissed" class="upd-new">
+          🆕 有新版本 v{{ upd.latestVersion }} 可用（当前 v{{ upd.currentVersion }}），点击「打开发布页」下载更新
+        </small>
+        <small v-else-if="upd.err" class="upd-err">{{ upd.err }}</small>
+      </div>
+    </details>
+
     <details class="settings-card">
       <summary>💰 真实花费与极简面板</summary>
       <p class="settings-desc">
@@ -745,6 +863,24 @@ onMounted(() => {
         <b>「探测」</b>后再<b>「立即同步」</b>——统计接口路径（<code>/api/v1/usage/stats</code> 等）需探测才会写入站点配置。
         切换周期<b>不会</b>重新采集，读的是最近一次快照（顶栏提示会显示数据时间）。
       </p>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="showModelAvgPrice" />
+        <span>计算并显示模型价格（极简面板与侧边栏显示当日用量最大模型的 ¥/百万 tokens 真实价格，鼠标悬停可查看全部模型列表）</span>
+      </label>
+      <div v-if="showModelAvgPrice" class="avg-opts">
+        <label class="avg-count">
+          计算条目：<input
+            type="number"
+            min="20"
+            max="500"
+            step="10"
+            v-model.number="modelAvgMaxInput"
+            @change="saveModelAvgMax"
+          />
+          条（默认 200）
+        </label>
+        <small class="avg-hint">取当日用量明细中最近 N 条参与计算；采集端单日明细上限为 200 条，设置高于 200 时实际仍以已采集条数为准（允许范围 20–500）。</small>
+      </div>
     </details>
 
     <details class="lab">
@@ -1425,6 +1561,34 @@ onMounted(() => {
   margin: 10px 0;
   cursor: pointer;
 }
+/* 模型均价可配置项（方案 048）：条目输入行与说明 */
+.avg-opts {
+  margin: 4px 0 10px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.avg-count {
+  font-size: 13px;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.avg-count input {
+  width: 76px;
+  padding: 3px 6px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--panel, #fff);
+  border: 1px solid var(--line, rgba(0, 0, 0, 0.15));
+  border-radius: 6px;
+}
+.avg-hint {
+  font-size: 11.5px;
+  color: var(--sub, #6b7280);
+  line-height: 1.5;
+}
 .lab-toggle input {
   width: 16px;
   height: 16px;
@@ -1454,5 +1618,26 @@ onMounted(() => {
   border: none;
   border-top: 1px solid var(--line);
   margin: 14px 0;
+}
+/* ── 更新检测（方案 051）── */
+.upd-status {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.upd-line {
+  color: var(--sub, #6b7280);
+}
+.upd-acts {
+  display: flex;
+  gap: 8px;
+}
+.upd-new {
+  color: var(--ok, #2da44e);
+  font-weight: 600;
+}
+.upd-err {
+  color: var(--danger, #cf222e);
 }
 </style>

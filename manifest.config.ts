@@ -4,7 +4,7 @@ import { defineManifest } from '@crxjs/vite-plugin'
 export default defineManifest({
   manifest_version: 3,
   name: 'AI 中转站用量看板',
-  version: '0.4.1',
+  version: '0.5.0',
   // 固定扩展公钥，使开发模式下扩展 ID 在 reload 后保持不变，避免 options 页面与 SW 的 runtime.id 漂移。
   // 该 key 仅在本地开发/侧载使用；发布到 Chrome Web Store 时会被商店签名覆盖，不影响线上分发。
   key: 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0UdikbhtN+wZW6Hh1uD7NfE9Oq5Q1PRDNcsxjoz/czRREWl1FCB4Uhl1TynEVATioiWBi7GSQbGQnKoRNPzHE0ACI8az1mLH4J1OaRl0/lRcPmgyweBrJB9vaGp5JJ8Ka/NtB/HyfcuQpsAwue+mkvm4Gl3Y05AGVX7kRUodmk+B7nfbA246MqheZaHvCOozQYysziJjDzQQg8JZkBW1v08UDtGIROsOQX8ZfJEVdbJb0sRXbD2HQA1TJrSASfGUiC49ScZPT10cUyRCIud9Ftq3v2afiZxr7+RaUwtRNA7lJ3Wvx3xLRc7Vnc21jybZxqOt7F3MvoKmO1DMmJjO3QIDAQAB',
@@ -28,7 +28,8 @@ export default defineManifest({
     '128': 'icon-128.png',
   },
   // 站点域不在此静态声明，由 ADD_SITE 时动态 chrome.permissions.request(origin + '/*')（P0-5 逐站授权）
-  host_permissions: [],
+  // api.github.com 为自动检测更新的固定基础设施域（方案 051，公开只读 Releases API）
+  host_permissions: ['https://api.github.com/*'],
   // 运行时可申请的域白名单：<all_urls> 仅作为「可申请范围」，实际只申请用户填入的具体 origin
   optional_host_permissions: ['<all_urls>'],
   background: {

@@ -10,6 +10,8 @@ import type {
   DiagnosticEntry,
   UsageRecordBatch,
   UsageCacheEntry,
+  ModelAvgPrice,
+  ModelAvgHistory,
 } from '../shared/types'
 
 export class AIHubDB extends Dexie {
@@ -26,6 +28,10 @@ export class AIHubDB extends Dexie {
   usageRecords!: Table<UsageRecordBatch, string>
   /** v4 新增：用量聚合/分页/过滤项的本地缓存（仅缓存昂贵结果，不缓存原始记录） */
   usageCache!: Table<UsageCacheEntry, string>
+  /** v7 新增（方案 050）：模型均价档案（每站每模型一行，merge 语义） */
+  modelAvgPrices!: Table<ModelAvgPrice, string>
+  /** v7 新增（方案 050）：模型均价历史（价格变动追加写） */
+  modelAvgHistory!: Table<ModelAvgHistory, number>
 
   constructor() {
     super('aihub')
@@ -161,6 +167,24 @@ export class AIHubDB extends Dexie {
       alertBaselines: 'key, siteId',
       alertDeliveries: 'eventId, siteId, status, createdAt, nextAttemptAt',
       alertObservations: 'siteId',
+    })
+    // v7（方案 050）：模型均价档案（每站每模型一行，merge 语义）与价格历史（追加写）。
+    // 纯新增表，无存量迁移。内容为聚合值+脱敏投影，绝不落凭证（P0-2）。
+    this.version(7).stores({
+      sites: 'id, enabled, order',
+      snapshots: '++id, siteId, takenAt, &recordId',
+      dailyStats: 'id, &[siteId+date], siteId, date',
+      credentials: 'siteId',
+      settings: 'key',
+      captures: 'id, siteId, capturedAt',
+      diagnostics: '++id, siteId, at, &recordId',
+      usageRecords: 'id, siteId, date, takenAt',
+      usageCache: 'cacheKey, siteId, kind, [siteId+kind], accessedAt, fromDate, toDate',
+      alertBaselines: 'key, siteId',
+      alertDeliveries: 'eventId, siteId, status, createdAt, nextAttemptAt',
+      alertObservations: 'siteId',
+      modelAvgPrices: 'id, siteId, model',
+      modelAvgHistory: '++id, siteId, model, [siteId+model], computedAt',
     })
   }
 }

@@ -7,10 +7,13 @@ import type {
   DashboardSettings,
   SetCostWindowResponse,
   SetBalanceRmbModeResponse,
+  UpdateCheckStatusResponse,
 } from '../core/messaging/protocol'
 import { isValidSiteUrl } from '../shared/util'
 import { fmtTodayCost, fmtBalanceRmb } from '../shared/recharge'
 import { AIHUB_SETTINGS_CHANGED } from '../shared/dashboardSettings'
+import ModelAvgPrice from '../shared/ModelAvgPrice.vue'
+import { openAvgDetailWindow } from '../shared/avgDetailWindow'
 import {
   normalizeCostWindow,
   costWindowShortLabel,
@@ -27,6 +30,8 @@ const settings = ref<DashboardSettings>({
   showTodayCostInPopup: false,
   costWindow: 'today',
   balanceRmbMode: false,
+  showModelAvgPrice: true,
+  modelAvgMaxRecords: 200,
 })
 const loading = ref(true)
 const error = ref('')
@@ -92,6 +97,8 @@ async function toggleBalanceRmbMode() {
 function rowCost(it: DashboardSummaryItem): string {
   return fmtTodayCost(pickCost(it, costWindow.value), it.currency, it.rechargeRate ?? null, calcRealCost.value)
 }
+
+// ── 模型均价详情（方案 049r1）：双击任一均价数字 → 打开独立详情窗口（不受 popup 尺寸限制） ──
 
 /** 站点行花费 title：无 24h 数据时说明原因与处置（方案 035 R2/R4）。 */
 function rowCostTitle(it: DashboardSummaryItem): string {
@@ -161,8 +168,34 @@ async function openFull() {
   chrome.runtime.openOptionsPage()
 }
 
+// ── 自动检测更新横幅（方案 051）：有新版本且未被忽略时显示在 footer 上方 ──
+const upd = ref<UpdateCheckStatusResponse | null>(null)
+const updShow = computed(() => !!upd.value?.hasUpdate && !upd.value.dismissed)
+
+async function loadUpdStatus(): Promise<void> {
+  try {
+    upd.value = await send<UpdateCheckStatusResponse>('GET_UPDATE_CHECK_STATUS')
+  } catch {
+    /* 后台未就绪时静默，不影响面板主数据 */
+  }
+}
+
+function openReleasesPage(): void {
+  const url = upd.value?.latestUrl || upd.value?.releasesUrl
+  if (url) void chrome.tabs.create({ url })
+}
+
+async function dismissUpd(): Promise<void> {
+  try {
+    upd.value = await send<UpdateCheckStatusResponse>('DISMISS_UPDATE_VERSION')
+  } catch {
+    if (upd.value) upd.value.dismissed = true
+  }
+}
+
 onMounted(() => {
   load()
+  loadUpdStatus()
   chrome.runtime.onMessage.addListener(onRuntimeMessage)
 })
 
@@ -204,15 +237,33 @@ onUnmounted(() => {
             @click="toggleBalanceRmbMode"
           >{{ balText(it) }}</div>
         </div>
-        <!-- 第二行：左侧更新时间，右侧今日花费（设置开启才显示） -->
-        <div v-if="it.updatedAt || settings.showTodayCostInPopup" class="pop-row-sub">
+        <!-- 第二行：左更新时间 · 中模型均价（方案 048，可配置） · 右今日花费（设置开启才显示） -->
+        <div v-if="it.updatedAt || settings.showTodayCostInPopup || it.modelAvg" class="pop-row-sub">
           <div class="pop-sub">{{ relTime(it.updatedAt) }}</div>
+          <!-- 方案 049r1：popup 窗口会裁剪 absolute 浮窗 → 禁用 hover 浮窗，双击打开独立详情窗口 -->
+          <ModelAvgPrice
+            v-if="it.modelAvg"
+            :site-id="it.siteId"
+            :summary="it.modelAvg"
+            align="right"
+            disable-hover
+            class="pop-avg"
+            @detail="openAvgDetailWindow(it.siteId)"
+          />
           <div v-if="settings.showTodayCostInPopup" class="pop-today" :title="rowCostTitle(it)">
             {{ rowCost(it) }}
           </div>
         </div>
       </li>
     </ul>
+
+    <!-- 自动检测更新横幅（方案 051）：点击打开发布页，✕ 忽略此版本 -->
+    <div v-if="updShow" class="upd-banner">
+      <button class="upd-link" title="前往 GitHub Releases 下载更新" @click="openReleasesPage">
+        🆕 新版本 v{{ upd!.latestVersion }} 可用，点击更新
+      </button>
+      <button class="upd-x" title="忽略此版本" @click="dismissUpd">✕</button>
+    </div>
 
     <footer class="pop-foot">
       <button class="pop-full" @click="openFull">打开完整看板</button>
@@ -403,6 +454,14 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+  /* 三列布局（方案 048）：左列撑满剩余空间，使中列均价尽量居中 */
+  flex: 1 1 0;
+}
+/* 模型均价（方案 048）：中列固定宽度，字体与两侧一致 */
+.pop-avg {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text);
 }
 .pop-today {
   font-size: 11px;
@@ -410,6 +469,9 @@ onUnmounted(() => {
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
   white-space: nowrap;
+  /* 三列布局（方案 048）：右列撑满剩余空间并右对齐，使中列均价尽量居中 */
+  flex: 1 1 0;
+  text-align: right;
 }
 .dot {
   width: 7px;
@@ -429,6 +491,40 @@ onUnmounted(() => {
   margin-top: 8px;
   border-top: 1px solid var(--line);
   padding-top: 8px;
+}
+/* 更新横幅（方案 051） */
+.upd-banner {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--brand, #0969da);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--brand, #0969da) 10%, transparent);
+}
+.upd-link {
+  flex: 1;
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  text-align: left;
+  color: var(--brand, #0969da);
+  cursor: pointer;
+}
+.upd-x {
+  border: none;
+  background: none;
+  padding: 2px 4px;
+  font-size: 11px;
+  color: var(--sub, #6b7280);
+  cursor: pointer;
+}
+.upd-x:hover {
+  color: var(--text, #1f2328);
 }
 .pop-full {
   width: 100%;

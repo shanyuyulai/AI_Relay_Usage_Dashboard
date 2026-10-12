@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>模型价格详情</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        color: var(--text);
+        font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        background: var(--panel);
+      }
+      .boot {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 160px;
+        font: 12px system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+        color: var(--sub, #8a90a0);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"><div class="boot" role="status" aria-live="polite">正在加载…</div></div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

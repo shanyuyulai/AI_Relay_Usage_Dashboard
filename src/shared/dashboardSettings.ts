@@ -13,28 +13,36 @@ import { reactive } from 'vue'
 import { settingsRepo } from '../storage/config'
 import type { DashboardSettings } from '../core/messaging/protocol'
 import { normalizeCostWindow } from './costWindow'
+import { normalizeModelAvgMaxRecords } from '../core/modelPricing'
 
 const CALC_REAL_COST_KEY = 'aihub.calcRealCost'
 const SHOW_TODAY_COST_KEY = 'aihub.showTodayCostInPopup'
 const COST_WINDOW_KEY = 'aihub.costWindow'
 const BALANCE_RMB_KEY = 'aihub.balanceRmbMode'
+const SHOW_MODEL_AVG_KEY = 'aihub.showModelAvgPrice'
+const MODEL_AVG_MAX_RECORDS_KEY = 'aihub.modelAvgMaxRecords'
 
 /** 广播消息类型（popup / sidepanel 监听后重载）。 */
 export const AIHUB_SETTINGS_CHANGED = 'AIHUB_SETTINGS_CHANGED'
 
-/** 从 db.settings 读取两个开关与花费周期（缺失/非法 → 默认值）。 */
+/** 从 db.settings 读取各开关与花费周期（缺失/非法 → 默认值）。 */
 export async function readDashboardSettings(): Promise<DashboardSettings> {
-  const [a, b, c, d] = await Promise.all([
+  const [a, b, c, d, e, f] = await Promise.all([
     settingsRepo.get<boolean>(CALC_REAL_COST_KEY),
     settingsRepo.get<boolean>(SHOW_TODAY_COST_KEY),
     settingsRepo.get<string>(COST_WINDOW_KEY),
     settingsRepo.get<boolean>(BALANCE_RMB_KEY),
+    settingsRepo.get<boolean>(SHOW_MODEL_AVG_KEY),
+    settingsRepo.get<number>(MODEL_AVG_MAX_RECORDS_KEY),
   ])
   return {
     calcRealCost: a === true,
     showTodayCostInPopup: b === true,
     costWindow: normalizeCostWindow(c),
     balanceRmbMode: d === true,
+    // 方案 048：模型均价默认开启；仅显式 false 关闭（不覆盖既有用户配置）
+    showModelAvgPrice: e !== false,
+    modelAvgMaxRecords: normalizeModelAvgMaxRecords(f),
   }
 }
 
@@ -44,6 +52,8 @@ export const dashboardSettings = reactive<DashboardSettings>({
   showTodayCostInPopup: false,
   costWindow: 'today',
   balanceRmbMode: false,
+  showModelAvgPrice: true,
+  modelAvgMaxRecords: 200,
 })
 
 /** options 页面挂载时载入一次，同步响应式 store。 */
@@ -53,6 +63,8 @@ export async function loadDashboardSettings(): Promise<DashboardSettings> {
   dashboardSettings.showTodayCostInPopup = s.showTodayCostInPopup
   dashboardSettings.costWindow = s.costWindow
   dashboardSettings.balanceRmbMode = s.balanceRmbMode
+  dashboardSettings.showModelAvgPrice = s.showModelAvgPrice
+  dashboardSettings.modelAvgMaxRecords = s.modelAvgMaxRecords
   return s
 }
 
@@ -92,5 +104,21 @@ export async function setShowTodayCostInPopup(v: boolean): Promise<void> {
   await settingsRepo.set(SHOW_TODAY_COST_KEY, v)
   dashboardSettings.showTodayCostInPopup = v
   // 广播给已打开的 popup / sidepanel，触发其实时刷新
+  await broadcastSettingsChanged()
+}
+
+/** 写入「计算并显示模型均价」开关并广播（方案 048 可配置项①）。 */
+export async function setShowModelAvgPrice(v: boolean): Promise<void> {
+  const on = v === true
+  await settingsRepo.set(SHOW_MODEL_AVG_KEY, on)
+  dashboardSettings.showModelAvgPrice = on
+  await broadcastSettingsChanged()
+}
+
+/** 写入「计算条目」并广播（方案 048 可配置项②；越界/非法由 normalize 归一）。 */
+export async function setModelAvgMaxRecords(v: number): Promise<void> {
+  const n = normalizeModelAvgMaxRecords(v)
+  await settingsRepo.set(MODEL_AVG_MAX_RECORDS_KEY, n)
+  dashboardSettings.modelAvgMaxRecords = n
   await broadcastSettingsChanged()
 }

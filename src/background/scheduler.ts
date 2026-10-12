@@ -1,6 +1,7 @@
 import { runPluginTask, getPluginState, reconcilePluginRuntime } from './pluginGate'
 import { collectAllInTabs } from './pageCollect'
 import { purgeOlderThan, getRetentionDays, getCollectInterval, getCollectSilent } from '../storage'
+import { checkForUpdate, reconcileUpdateCheckAlarm, UPDATE_CHECK_ALARM } from './updateCheck'
 
 const ALARM_NAME = 'aihub-collect'
 const PRUNE_ALARM = 'aihub-prune'
@@ -45,6 +46,9 @@ export function setupScheduler(): void {
       void runPluginTask(runCollectAndNotify).catch(() => {})
     } else if (alarm.name === PRUNE_ALARM) {
       void runPluginTask(runPrune).catch(() => {})
+    } else if (alarm.name === UPDATE_CHECK_ALARM) {
+      // 方案 051：每 12h 检查 GitHub Releases 新版本（内部自带 6h 节流与开关判定）
+      void runPluginTask(() => checkForUpdate(false)).catch(() => {})
     }
   })
 }
@@ -68,10 +72,11 @@ async function reconcileCollectAlarm(): Promise<void> {
 export async function reconcileSchedulerResources(enabled: boolean): Promise<void> {
   if (!chrome.alarms) return
   if (!enabled) {
-    await Promise.all(['aihub-collect', 'aihub-prune', 'aihub-alert-retry'].map((name) => chrome.alarms.clear(name)))
+    await Promise.all(['aihub-collect', 'aihub-prune', 'aihub-alert-retry', UPDATE_CHECK_ALARM].map((name) => chrome.alarms.clear(name)))
     return
   }
   await reconcileCollectAlarm()
+  await reconcileUpdateCheckAlarm(true)
   const existingPrune = await chrome.alarms.get(PRUNE_ALARM)
   if (!existingPrune) {
     await chrome.alarms.create(PRUNE_ALARM, { periodInMinutes: PRUNE_PERIOD_MIN })

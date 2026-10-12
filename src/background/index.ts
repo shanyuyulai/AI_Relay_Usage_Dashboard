@@ -8,6 +8,7 @@ import { registerMessageRouter } from './router'
 import { getLabCorsUnblock, runAuthStateMigration } from '../storage'
 import { reconcileCorsResources } from './corsRules'
 import { applyIconBehavior } from './popupBehavior'
+import { checkForUpdate, setupUpdateCheck } from './updateCheck'
 
 console.log('[AI Relay] Service Worker started')
 
@@ -55,10 +56,11 @@ void applyIconBehavior().catch(() => {
 
 // 启动采集调度 + 消息路由（SW 唤醒即装配，休眠即释放，不依赖内存单例）
 setupScheduler()
+setupUpdateCheck() // 更新通知点击 → 打开 releases 页（方案 051）
 setupBalanceAlerts()
 registerMessageRouter()
 void initializePlugin().then(async (state) => {
-  if (state.effectiveState === 'enabled') await runPluginTask(async () => { await runAuthStateMigration(); await flushBalanceAlerts() })
+  if (state.effectiveState === 'enabled') await runPluginTask(async () => { await runAuthStateMigration(); await flushBalanceAlerts(); await checkForUpdate(false) })
 }).catch((e) => console.warn('[AI Relay] 初始化失败', e))
 
 console.log('[AI Relay] scheduler & message router registered')
