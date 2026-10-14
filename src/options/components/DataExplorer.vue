@@ -455,7 +455,7 @@ const upd = ref({
   currentVersion: '',
   latestVersion: null as string | null,
   latestUrl: null as string | null,
-  releasesUrl: 'https://github.com/shanyuyulai/AI_Relay_Usage_Dashboard/releases',
+  tagsUrl: 'https://github.com/shanyuyulai/AI_Relay_Usage_Dashboard/tags',
   hasUpdate: false,
   dismissed: false,
   lastCheckedAt: null as number | null,
@@ -468,7 +468,7 @@ function applyUpdStatus(r: UpdateCheckStatusResponse): void {
   upd.value.currentVersion = r.currentVersion
   upd.value.latestVersion = r.latestVersion
   upd.value.latestUrl = r.latestUrl
-  if (r.releasesUrl) upd.value.releasesUrl = r.releasesUrl
+  if (r.tagsUrl) upd.value.tagsUrl = r.tagsUrl
   upd.value.hasUpdate = r.hasUpdate
   upd.value.dismissed = r.dismissed
   upd.value.lastCheckedAt = r.lastCheckedAt
@@ -496,7 +496,7 @@ async function checkUpdateNow(): Promise<void> {
   upd.value.checking = true
   try {
     applyUpdStatus(await send<UpdateCheckStatusResponse>('CHECK_UPDATE_NOW'))
-    showMsg(upd.value.hasUpdate ? `检测到新版本 ${upd.value.latestVersion}` : '当前已是最新版本')
+    showMsg(upd.value.hasUpdate ? `版本不一致：远端最新 ${upd.value.latestVersion}，本地 ${upd.value.currentVersion}` : '版本一致，当前已是最新')
   } catch (e) {
     showMsg(e instanceof MessagingError ? e.message : String(e))
   } finally {
@@ -505,8 +505,8 @@ async function checkUpdateNow(): Promise<void> {
 }
 
 function openReleasesPage(url?: string | null): void {
-  // latestUrl 仅在成功检查过且有 release 时存在；否则回退到固定发布页地址（始终可开）
-  const target = url || upd.value.latestUrl || upd.value.releasesUrl
+  // latestUrl 仅在成功检查过且取到版本时存在；否则回退到固定版本页地址（始终可开）
+  const target = url || upd.value.latestUrl || upd.value.tagsUrl
   if (target) void chrome.tabs.create({ url: target })
 }
 
@@ -1079,8 +1079,9 @@ onMounted(() => {
     <details class="settings-card" :open="upd.hasUpdate && !upd.dismissed">
       <summary>⬆️ 更新检测</summary>
       <p class="settings-desc">
-        定期访问 GitHub Releases 检查插件新版本（每 12 小时一次）。发现新版本时通过系统通知与看板横幅提醒，
-        点击即可打开发布页手动下载更新。检测只读取公开的版本信息，<b>不下载任何文件、不上传任何本地数据</b>。
+        定期访问 GitHub 版本页（tags）检查插件新版本（每 12 小时一次），对比远端最新版本与本地版本是否一致，不一致即提醒。
+        发现新版本时通过系统通知与看板横幅提醒，点击即可打开版本页手动下载更新。
+        检测只读取公开的版本信息，<b>不下载任何文件、不上传任何本地数据</b>。
       </p>
       <label class="lab-toggle">
         <input type="checkbox" v-model="upd.enabled" @change="onUpdateCheckToggle" />
@@ -1094,10 +1095,10 @@ onMounted(() => {
         </small>
         <div class="upd-acts">
           <button class="btn" :disabled="upd.checking" @click="checkUpdateNow">{{ upd.checking ? '检查中…' : '立即检查' }}</button>
-          <button class="btn" @click="openReleasesPage()">打开发布页</button>
+          <button class="btn" @click="openReleasesPage()">打开版本页</button>
         </div>
         <small v-if="upd.hasUpdate && !upd.dismissed" class="upd-new">
-          🆕 有新版本 v{{ upd.latestVersion }} 可用（当前 v{{ upd.currentVersion }}），点击「打开发布页」下载更新
+          🆕 版本不一致：远端最新 v{{ upd.latestVersion }}，本地 v{{ upd.currentVersion }}，点击「打开版本页」下载更新
         </small>
         <small v-else-if="upd.err" class="upd-err">{{ upd.err }}</small>
       </div>

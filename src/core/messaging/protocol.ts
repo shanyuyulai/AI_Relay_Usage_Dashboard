@@ -367,7 +367,8 @@ export interface UpdateCheckStatusResponse {
   hasUpdate: boolean
   dismissed: boolean
   lastCheckedAt: number | null
-  releasesUrl: string
+  /** 版本页地址（tags，列出所有版本）。 */
+  tagsUrl: string
 }
 export interface UpdateCheckEnabledPayload {
   enabled: boolean

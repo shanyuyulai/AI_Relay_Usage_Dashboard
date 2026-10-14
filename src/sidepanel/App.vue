@@ -347,7 +347,7 @@ async function loadUpdStatus(): Promise<void> {
 }
 
 function openReleasesPage(): void {
-  const url = upd.value?.latestUrl || upd.value?.releasesUrl
+  const url = upd.value?.latestUrl || upd.value?.tagsUrl
   if (url) void chrome.tabs.create({ url })
 }
 
@@ -393,10 +393,10 @@ onUnmounted(() => {
       </div>
     </header>
 
-    <!-- 自动检测更新横幅（方案 051）：点击打开发布页，✕ 忽略此版本 -->
+    <!-- 自动检测更新横幅（方案 051）：点击打开版本页（tags），✕ 忽略此版本 -->
     <div v-if="upd?.hasUpdate && !upd.dismissed" class="sp-upd">
-      <button class="u-link" title="前往 GitHub Releases 下载更新" @click="openReleasesPage">
-        🆕 新版本 v{{ upd.latestVersion }} 可用，点击更新
+      <button class="u-link" title="前往 GitHub 版本页下载更新" @click="openReleasesPage">
+        🆕 最新版本 v{{ upd.latestVersion }}（本地 v{{ upd.currentVersion }}），点击前往版本页
       </button>
       <button class="u-x" title="忽略此版本" @click="dismissUpd">✕</button>
     </div>

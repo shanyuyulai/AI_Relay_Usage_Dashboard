@@ -3,16 +3,19 @@ import { settingsRepo } from '../storage/config'
 /**
  * 自动检测更新（方案 051）。
  *
- * - 数据源：GitHub Releases API `releases/latest`（公开只读，不带凭证、不上传本地数据）。
+ * - 数据源：GitHub Tags API（公开只读，不带凭证、不上传本地数据）。仓库以 tags 标记版本，
+ *   不使用 GitHub Releases，因此取标签列表中语义化版本号最大的一个作为「最新版本」。
+ * - 判定：远端最新版本与本地版本**不一致**即视为需要更新（用户指定的口径）。
  * - 节奏：12h 周期 alarm 唤醒 SW 检查；SW 启动也检查，但两次真实网络请求最小间隔 6h。
- * - 提示：系统通知（每版本仅一次，点击打开发布页）+ 极简面板/侧边栏页内横幅（可忽略）。
- * - 不自动下载/安装：点击只打开 releases 页由用户手动下载更新。
+ * - 提示：系统通知（每版本仅一次，点击打开版本页）+ 极简面板/侧边栏页内横幅（可忽略）。
+ * - 不自动下载/安装：点击只打开版本页（tags）由用户手动下载更新。
  * - 开关 `aihub.updateCheckEnabled` 默认开启；插件整体停用时不建 alarm、不检查。
  */
 
 export const REPO = 'shanyuyulai/AI_Relay_Usage_Dashboard'
-export const RELEASES_URL = `https://github.com/${REPO}/releases`
-const API_LATEST = `https://api.github.com/repos/${REPO}/releases/latest`
+/** 版本页（tags，列出所有版本）：横幅 / 通知 / 「打开版本页」统一跳这里。 */
+export const TAGS_URL = `https://github.com/${REPO}/tags`
+const API_TAGS = `https://api.github.com/repos/${REPO}/tags?per_page=100`
 export const UPDATE_CHECK_ALARM = 'aihub-update-check'
 const CHECK_PERIOD_MIN = 720 // 12 小时
 const MIN_CHECK_GAP_MS = 6 * 3600 * 1000 // 两次真实网络检查最小间隔（节流）
@@ -53,16 +56,25 @@ export function parseVersion(tag: string): number[] | null {
 
 /** a 是否比 b 新（逐段数值比较，缺段按 0）。 */
 export function isNewerVersion(a: string, b: string): boolean {
-  const pa = parseVersion(a)
-  const pb = parseVersion(b)
-  if (!pa || !pb) return false
-  const len = Math.max(pa.length, pb.length)
+  return compareVersions(parseVersion(a), parseVersion(b)) > 0
+}
+
+/** 逐段数值比较：a>b → 1，a<b → -1，相等 → 0（null 视为不可比，返回 -2）。 */
+export function compareVersions(a: number[] | null, b: number[] | null): number {
+  if (!a || !b) return -2
+  const len = Math.max(a.length, b.length)
   for (let i = 0; i < len; i++) {
-    const x = pa[i] ?? 0
-    const y = pb[i] ?? 0
-    if (x !== y) return x > y
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    if (x !== y) return x > y ? 1 : -1
   }
-  return false
+  return 0
+}
+
+/** 归一化版本串用于「一致性」比较：'v0.5.1' / '0.5.1' → '0.5.1'；无法解析返回 null。 */
+export function normalizeVersion(tag: string): string | null {
+  const p = parseVersion(tag)
+  return p ? p.join('.') : null
 }
 
 export interface UpdateCheckStatus {
@@ -75,7 +87,8 @@ export interface UpdateCheckStatus {
   /** 用户已忽略当前最新版本（横幅不显示，状态仍如实返回）。 */
   dismissed: boolean
   lastCheckedAt: number | null
-  releasesUrl: string
+  /** 版本页地址（tags，列出所有版本）。 */
+  tagsUrl: string
 }
 
 async function readStatus(): Promise<UpdateCheckStatus> {
@@ -88,7 +101,10 @@ async function readStatus(): Promise<UpdateCheckStatus> {
     settingsRepo.get<string>(DISMISSED_KEY).catch(() => null),
   ])
   const cur = currentVersion()
-  const hasUpdate = !!latest && isNewerVersion(latest, cur)
+  // 口径：远端最新版本与本地**不一致**即视为需要更新（用户指定，'v' 前缀差异归一化后忽略）
+  const curNorm = normalizeVersion(cur)
+  const latNorm = latest ? normalizeVersion(latest) : null
+  const hasUpdate = !!latNorm && !!curNorm && latNorm !== curNorm
   return {
     enabled,
     currentVersion: cur,
@@ -98,7 +114,7 @@ async function readStatus(): Promise<UpdateCheckStatus> {
     hasUpdate,
     dismissed: hasUpdate && dismissed === latest,
     lastCheckedAt: typeof last === 'number' ? last : null,
-    releasesUrl: RELEASES_URL,
+    tagsUrl: TAGS_URL,
   }
 }
 
@@ -122,7 +138,7 @@ async function notifyUpdate(latest: string, cur: string): Promise<void> {
       type: 'basic',
       iconUrl: chrome.runtime.getURL('icon-128.png'),
       title: 'AI 中转站用量看板 · 有新版本',
-      message: `最新版本 ${latest}（当前 ${cur}），点击前往发布页下载更新。`,
+      message: `最新版本 ${latest}（当前 ${cur}），点击前往版本页下载更新。`,
       priority: 2,
       requireInteraction: false,
     })
@@ -146,15 +162,24 @@ export async function checkForUpdate(force = false): Promise<UpdateCheckStatus> 
   let url: string | null = null
   let published: number | null = null
   try {
-    const res = await fetch(API_LATEST, { headers: { Accept: 'application/vnd.github+json' } })
+    const res = await fetch(API_TAGS, { headers: { Accept: 'application/vnd.github+json' } })
     if (res.ok) {
-      const j = (await res.json()) as { tag_name?: unknown; html_url?: unknown; published_at?: unknown }
-      if (typeof j.tag_name === 'string' && j.tag_name.trim()) latest = j.tag_name.trim()
-      if (typeof j.html_url === 'string' && /^https:\/\/github\.com\//.test(j.html_url)) url = j.html_url
-      if (typeof j.published_at === 'string') {
-        const t = Date.parse(j.published_at)
-        if (!Number.isNaN(t)) published = t
+      // Tags API 返回数组（不含日期/发布说明），取语义化版本号最大的标签为「最新版本」
+      const arr = (await res.json()) as unknown
+      if (Array.isArray(arr)) {
+        let bestVer: number[] | null = null
+        for (const item of arr) {
+          const name = (item as { name?: unknown })?.name
+          if (typeof name !== 'string' || !name.trim()) continue
+          const v = parseVersion(name)
+          if (!v) continue
+          if (!bestVer || compareVersions(v, bestVer) > 0) {
+            bestVer = v
+            latest = name.trim()
+          }
+        }
       }
+      if (latest) url = TAGS_URL // tags 无单独页面地址，统一跳版本页
     }
   } catch {
     /* GitHub 不可达：静默，下轮再试 */
@@ -163,10 +188,11 @@ export async function checkForUpdate(force = false): Promise<UpdateCheckStatus> 
   await settingsRepo.set(LAST_CHECK_KEY, Date.now())
   if (latest) {
     await settingsRepo.set(LATEST_KEY, latest)
-    await settingsRepo.set(LATEST_URL_KEY, url) // 允许 null：回退到 RELEASES_URL
+    await settingsRepo.set(LATEST_URL_KEY, url) // 允许 null：回退到 TAGS_URL
     await settingsRepo.set(LATEST_PUBLISHED_KEY, published)
     const cur = currentVersion()
-    if (isNewerVersion(latest, cur) && (await isUpdateCheckEnabled())) {
+    const hasUpdate = !!normalizeVersion(latest) && normalizeVersion(latest) !== normalizeVersion(cur)
+    if (hasUpdate && (await isUpdateCheckEnabled())) {
       const notified = await settingsRepo.get<string>(NOTIFIED_KEY).catch(() => null)
       if (notified !== latest) {
         await settingsRepo.set(NOTIFIED_KEY, latest)
@@ -177,12 +203,12 @@ export async function checkForUpdate(force = false): Promise<UpdateCheckStatus> 
   return readStatus()
 }
 
-/** 系统通知点击 → 打开 releases 页（用户下载更新）。 */
+/** 系统通知点击 → 打开版本页（tags，用户下载更新）。 */
 export function setupUpdateCheck(): void {
   if (!chrome.notifications?.onClicked) return
   chrome.notifications.onClicked.addListener((id) => {
     if (id !== NOTIFY_ID) return
-    void chrome.tabs.create({ url: RELEASES_URL }).catch(() => {})
+    void chrome.tabs.create({ url: TAGS_URL }).catch(() => {})
   })
 }
 
