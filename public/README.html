@@ -188,7 +188,7 @@
       <li>🏷️ <strong>站点卡片</strong>：每个中转站的余额、今日使用、今日 Token / 请求、API 往返耗时，以及近 7 天迷你趋势。</li>
       <li>📈 <strong>趋势详情</strong>：单站点近 7 / 30 / 90 天的 Token 与请求趋势、余额曲线、按模型消耗分布。</li>
       <li>🕒 <strong>自动采集</strong>：后台定时（默认 30 分钟）静默刷新，打开侧边栏时也能一键同步。</li>
-      <li>💰 <strong>模型价格</strong>：按当日逐条用量与充值比例，计算各模型的<strong>真实 ¥/百万 tokens 单价</strong>；按模型建档防覆盖、价格变动自动留痕，可随时回看历史价格与数据来源。</li>
+      <li>💰 <strong>模型价格</strong>：按逐条用量明细与充值比例，计算各模型的<strong>真实 ¥/百万 tokens 单价</strong>；当日无数据自动回退历史档案价（带「档」角标）；按模型建档防覆盖、价格变动自动留痕，可随时回看历史价格与数据来源。</li>
       <li>📦 <strong>全量备份与还原</strong>：迁移站点配置、历史数据与可移植设置；不包含 Cookie、Token 或密码。</li>
       <li>⬆️ <strong>自动检测更新</strong>：定期检查 GitHub 新版本，系统通知 + 看板横幅提醒，点击直达发布页；设置页可关闭。</li>
     </ul>
@@ -209,7 +209,7 @@
       <div class="card"><div class="ico">🗂️</div><h3>本地历史账本</h3><p>IndexedDB 保存原始快照与按日聚合；原始快照保留可配（默认 90 天），按日数据长期留存。</p></div>
       <div class="card"><div class="ico">📤</div><h3>全量备份与还原</h3><p>备份站点、历史、用量明细、脱敏诊断与可移植设置；<strong>不包含任何凭证</strong>，重复导入可安全合并。</p></div>
       <div class="card"><div class="ico">⬆️</div><h3>自动检测更新</h3><p>定期检查 GitHub Releases 新版本，系统通知与看板横幅提醒，点击打开发布页手动下载；设置页可关闭或立即检查。</p></div>
-      <div class="card"><div class="ico">💰</div><h3>模型真实价格</h3><p>按逐条用量与充值比例计算各模型 <strong>¥/百万 tokens</strong> 真实单价；双击价格数字打开详情窗口，查看全部模型、原始数据与计算方式，价格变动自动留痕。</p></div>
+      <div class="card"><div class="ico">💰</div><h3>模型真实价格</h3><p>按逐条用量与充值比例计算各模型 <strong>¥/百万 tokens</strong> 真实单价（正文四舍五入显示，<strong>悬停可看精确值</strong>）；当日无数据自动回退历史档案价（带「档」角标）。双击价格数字打开详情窗口，查看全部模型、原始数据与计算方式，价格变动自动留痕。</p></div>
       <div class="card"><div class="ico">🛡️</div><h3>最小权限</h3><p>站点域权限按你填写的地址<strong>逐个动态申请</strong>，不用 <code>&lt;all_urls&gt;</code> 一次性全开。</p></div>
       <div class="card"><div class="ico">🌗</div><h3>浅色 / 深色 / 自动</h3><p>跟随系统或手动切换主题；侧边栏布局紧凑，首屏读缓存即出。</p></div>
     </div>
@@ -522,8 +522,20 @@
       <thead><tr><th>版本</th><th>状态</th><th>主要变动</th></tr></thead>
       <tbody>
         <tr>
+          <td><b>0.5.1</b></td>
+          <td>已发布<br />2026-10-14</td>
+          <td>
+            <ul style="margin:0;padding-left:18px;line-height:1.8">
+              <li><strong>价格显示优化：</strong>正文恢复按量级四舍五入显示（如 <code>¥0.043</code>），鼠标悬停可在提示中查看<strong>精确值</strong>（如 <code>¥0.0429072</code>）。计算层仍全程使用真实数据，不因展示丢失精度。</li>
+              <li><strong>站点均价历史回退：</strong>当日无有效用量数据时，极简面板 / 完整看板 / 详情窗口右上角的站点均价自动回退为<strong>历史档案中用量最大模型</strong>的历史价，并带虚线「档」角标（悬停可看来源说明与精确值）；当日有数据仍显示当日用量最大模型的价格。</li>
+              <li><strong>「模型价格详情」措辞更正：</strong>因价格可能来自历史档案，详情窗口的标题与口径说明不再使用「当日逐条明细」表述，统一改为「逐条用量明细」；「计算方式」说明中同步附上精确结果。</li>
+              <li><strong>设置页布局优化：</strong>「数据采集库」页中与数据表无关的设置（采集通知 / 单击图标行为 / 更新检测 / 真实花费 / 实验室）移至数据区下方，统一收入默认折叠的「⚙️ 通用设置」分组；数据浏览不再被设置项打断，检测到新版本时该分组会自动展开。</li>
+            </ul>
+          </td>
+        </tr>
+        <tr>
           <td><b>0.5.0</b></td>
-          <td>当前构建<br />待发布</td>
+          <td>已发布<br />2026-10-12</td>
           <td>
             <ul style="margin:0;padding-left:18px;line-height:1.8">
               <li><strong>新增「模型价格」功能：</strong>基于站点当日逐条用量明细与充值比例，按模型计算<strong>真实 ¥/百万 tokens 单价</strong>（实扣价优先，缺失回退标价口径并标「标」角标）。极简面板（更新时间 · 价格 · 今日花费三列居中）与完整看板（刷新按钮左侧）同步展示；侧边栏悬停浮窗可查看全部模型列表。</li>

@@ -5,7 +5,18 @@
  */
 import type { ModelAvgSummary } from '../core/messaging/protocol'
 
-/** 均价文本：partial 批次加「≈」前缀；无数据显示「—」（P0-3）。 */
+/**
+ * 精确数值文本（050r3）：不做四舍五入，直接展示真实存储值。
+ * 仅用 12 位有效数字归一化去除二进制浮点运算噪声（如 0.1+0.2=0.30000000000000004 → 0.3）；
+ * 接口原始金额（≤8 位小数）与真实计算结果在此精度下完全无损。
+ * 用途：悬停 title 中展示精确值（050r3：正文四舍五入、title 显精确值）。
+ */
+export function fmtExact(v: number): string {
+  if (!Number.isFinite(v)) return '—'
+  return String(parseFloat(v.toPrecision(12)))
+}
+
+/** 均价文本：partial 批次加「≈」前缀；无数据显示「—」（P0-3）。展示层按量级取小数位，精确值走 fmtExact 供 title。 */
 export function fmtAvgText(s?: ModelAvgSummary | null): string {
   if (!s || !s.hasDetail || s.pricePerM == null || !Number.isFinite(s.pricePerM)) return '—'
   const v = s.pricePerM
@@ -21,7 +32,7 @@ export function fmtTokens(n: number): string {
   return String(n)
 }
 
-/** 行价格式：null/非法显「—」，其余 ¥ 前缀按量级取小数位。 */
+/** 行价格式：null/非法显「—」，其余 ¥ 前缀按量级取小数位（精确值走 fmtExact 供 title，050r3）。 */
 export function fmtRowPrice(v: number | null): string {
   if (v == null || !Number.isFinite(v)) return '—'
   return '¥' + (v >= 100 ? v.toFixed(1) : v >= 1 ? v.toFixed(2) : v.toFixed(3))

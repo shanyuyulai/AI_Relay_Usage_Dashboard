@@ -298,17 +298,32 @@ async function computeAndMergeForSite(
     await modelAvgRepo.putMany(merged.changed)
     await modelAvgRepo.addHistory(merged.history)
   }
-  // 站点摘要：当前批次用量最大模型的合并价（可能是历史档案价）
+  // 站点摘要（050r3）：当日有数据 → 当日用量最大模型的合并价；
+  // 当日无有效数据 → 回退历史档案中用量最大模型的历史价（带 fromHistory，UI 加「档」标记）。
   const top = res.models[0]
-  const topPrice = top ? merged.next.find((p) => p.model === top.model) : undefined
-  const summary: ModelAvgSummary = top
-    ? {
-        pricePerM: topPrice?.pricePerM ?? null,
-        topModel: top.model,
-        partial: res.summary.partial,
-        hasDetail: true,
-      }
-    : { pricePerM: null, topModel: null, partial: false, hasDetail: false }
+  let summary: ModelAvgSummary
+  if (top) {
+    const topPrice = merged.next.find((p) => p.model === top.model)
+    summary = {
+      pricePerM: topPrice?.pricePerM ?? null,
+      topModel: top.model,
+      partial: res.summary.partial,
+      hasDetail: true,
+      fromHistory: false,
+    }
+  } else {
+    // 当日无现算模型时 merged.next 即纯历史档案（按用量倒序），取首位即「历史用量最大模型」
+    const histTop = merged.next[0]
+    summary = histTop
+      ? {
+          pricePerM: histTop.pricePerM ?? null,
+          topModel: histTop.model,
+          partial: false,
+          hasDetail: true,
+          fromHistory: true,
+        }
+      : { pricePerM: null, topModel: null, partial: false, hasDetail: false, fromHistory: false }
+  }
   // rows：合并后档案（现算模型在前），附带来源范围与历史标记
   const seenNow = new Set(res.models.map((m) => m.model))
   const rows: ModelPriceRow[] = merged.next.map((p) => ({

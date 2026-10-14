@@ -11,7 +11,7 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
 import type { ModelAvgSummary, GetSiteModelPricesResponse } from '../core/messaging/protocol'
-import { fmtAvgText, fmtTokens, fmtRowPrice, fmtRange, fmtRangeShort } from './modelAvgFormat'
+import { fmtAvgText, fmtTokens, fmtRowPrice, fmtRange, fmtRangeShort, fmtExact } from './modelAvgFormat'
 import { openAvgDetailWindow } from './avgDetailWindow'
 
 const props = defineProps<{
@@ -35,12 +35,18 @@ let enterTimer: number | null = null
 const text = computed(() => fmtAvgText(props.summary))
 const isNull = computed(() => text.value === '—')
 
-/** 数字 title：按模式提示查看方式（049r1：popup 禁浮窗后引导双击独立窗口）。 */
-const numTitle = computed(() =>
-  props.disableHover
-    ? '当日用量最大模型的价格（双击打开模型价格详情窗口）'
-    : '当日用量最大模型的价格（悬停查看全部模型，双击打开模型价格详情窗口）',
-)
+/** 数字 title：来源说明 + 精确值 + 查看方式（050r3：正文四舍五入，title 显精确值）。 */
+const numTitle = computed(() => {
+  const s = props.summary
+  const src = s?.fromHistory
+    ? `当日无数据，取历史档案中用量最大模型（${s.topModel ?? '—'}）的价格`
+    : '当日用量最大模型的价格'
+  const exact = s?.pricePerM != null && Number.isFinite(s.pricePerM) ? `；精确值 ¥${fmtExact(s.pricePerM)}/百万 tokens` : ''
+  const how = props.disableHover
+    ? '；双击打开模型价格详情窗口'
+    : '；悬停查看全部模型，双击打开模型价格详情窗口'
+  return src + exact + how
+})
 
 /** 浮窗顶部时间范围小字（可配置项③）。 */
 const rangeText = computed(() => {
@@ -103,6 +109,7 @@ onBeforeUnmount(() => {
 <template>
   <span class="map-wrap" @mouseenter="enter" @mouseleave="leave">
     <span class="map-num" :class="{ 'is-null': isNull }" :title="numTitle" @dblclick="emit('detail')">{{ text }}</span>
+    <i v-if="summary?.fromHistory" class="lp his" title="当日无数据，价格来自历史档案（历史用量最大模型）">档</i>
     <span v-if="hover" class="map-pop" :class="align === 'left' ? 'al-left' : 'al-right'">
       <span class="map-loading" v-if="loading && !data">计算中…</span>
       <template v-else>
@@ -128,7 +135,7 @@ onBeforeUnmount(() => {
                 <i v-if="r.fromHistory" class="lp his" title="价格来自历史档案（当前批次无该模型新数据）">档</i>
               </td>
               <td class="c-num">{{ fmtTokens(r.tokens) }}</td>
-              <td class="c-num">{{ fmtRowPrice(r.pricePerM) }}</td>
+              <td class="c-num" :title="r.pricePerM != null ? `¥${fmtExact(r.pricePerM)}/百万 tokens` : ''">{{ fmtRowPrice(r.pricePerM) }}</td>
               <td class="c-range" :title="fmtRange(r.rangeStart ?? null, r.rangeEnd ?? null, r.usedCount ?? 0) || '—'">
                 {{ fmtRangeShort(r.rangeStart, r.rangeEnd) || '—' }}
               </td>

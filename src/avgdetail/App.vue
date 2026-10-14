@@ -3,7 +3,8 @@
  * 模型价格详情 · 独立窗口（方案 049r1，050r1 更名：均价→价格）。
  * - 入口：极简面板 / 完整看板中双击任一价格数字（chrome.windows.create 弹出，不受 popup 尺寸限制）。
  * - 内容：全部站点的模型价格详情**一次性全部展开**（无折叠），每站含：时间范围小字、
- *   提示（未填充值比例 / 无逐条明细 / partial）、完整模型表（模型 / 用量 / ¥每M，按当日用量倒序，不截断行数）。
+ *   提示（未填充值比例 / 无逐条明细 / partial）、完整模型表（模型 / 用量 / ¥每M，按用量倒序，不截断行数；
+ *   价格来自历史档案的模型以「档」标注）。
  * - URL 参数 ?site=<siteId>：高亮并滚动到双击来源站点。
  * 红线：P0-3 无数据显「—」绝不编造；P0-2 不触碰任何凭证。
  */
@@ -18,7 +19,7 @@ import type {
   GetSiteModelAvgHistoryResponse,
 } from '../core/messaging/protocol'
 import type { ModelAvgRawRecord, ModelAvgHistory } from '../shared/types'
-import { fmtAvgText, fmtTokens, fmtRowPrice, fmtRange, fmtRangeShort } from '../shared/modelAvgFormat'
+import { fmtAvgText, fmtTokens, fmtRowPrice, fmtRange, fmtRangeShort, fmtExact } from '../shared/modelAvgFormat'
 const items = ref<DashboardSummaryItem[]>([])
 const maxRecords = ref<number | null>(null)
 const loading = ref(true)
@@ -101,10 +102,10 @@ function openSiteViewer(r: DetailRow): void {
   viewer.value = {
     title: `${r.name} · 原始数据与计算方式`,
     algo: [
-      `数据口径：该站点当日逐条用量明细，取${maxRecordsText.value}（按时间倒序）；本次实际参与 ${d.usedCount} 条${d.skippedCount ? `，跳过 ${d.skippedCount} 条（缺金额或币种与站点计价币种不符）` : ''}。`,
+      `数据口径：该站点逐条用量明细，取${maxRecordsText.value}（按时间倒序）；本次实际参与 ${d.usedCount} 条${d.skippedCount ? `，跳过 ${d.skippedCount} 条（缺金额或币种与站点计价币种不符）` : ''}；价格来自历史档案的模型以「档」标注。`,
       `逐条金额：优先取「实扣」，缺失时回退「标价」（行内标「标」）；人民币折算 = 金额 × 充值比例 ${d.rechargeRate ?? '未填充'}${d.siteCurrency ? `（站点按 ${d.siteCurrency} 计价）` : ''}。`,
       '模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ（输入 + 输出 tokens）× 1,000,000。',
-      `看板默认展示的价格 = 当日用量最大模型的价格；模型列表按当日用量倒序${d.partial ? '；当日明细超上限（≈），按已采集部分计算' : ''}。`,
+      `看板默认展示的价格 = 用量最大模型的价格；模型列表按用量倒序${d.partial ? '；明细超上限（≈），按已采集部分计算' : ''}。`,
     ],
     loading: false,
     records: d.records,
@@ -127,7 +128,7 @@ async function openModelViewer(r: DetailRow, row: GetSiteModelPricesResponse['ro
         algo: [
           `数据口径：该模型参与计算的原始记录 ${p.usedCount} 条（时间范围 ${fmtRange(p.rangeStart, p.rangeEnd, p.usedCount) || '—'}）；采集批次${p.partial ? '超上限（≈），按已采集部分计算' : '完整'}。`,
           `逐条金额：优先取「实扣」，缺失时回退「标价」（行内标「标」）；人民币折算 = 金额 × 充值比例 ${p.rechargeRate ?? '未填充'}${p.missingRate ? '（未填充，无法折算人民币）' : ''}。`,
-          `该模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ（输入 + 输出 tokens）× 1,000,000 = ${fmtRowPrice(p.pricePerM)}；档案计算于 ${fmtTs(p.computedAt)}${row.fromHistory ? '（价格来自历史档案）' : ''}。`,
+          `该模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ（输入 + 输出 tokens）× 1,000,000 = ${fmtRowPrice(p.pricePerM)}${p.pricePerM != null ? `（精确值 ¥${fmtExact(p.pricePerM)}）` : ''}；档案计算于 ${fmtTs(p.computedAt)}${row.fromHistory ? '（价格来自历史档案）' : ''}。`,
         ],
         loading: false,
         records: p.records,
@@ -167,7 +168,7 @@ async function openHistoryViewer(h: ModelAvgHistory): Promise<void> {
   const algoBase = [
     `数据口径：该模型参与本次计算的原始记录 ${h.usedCount} 条（时间范围 ${fmtRange(h.rangeStart, h.rangeEnd, h.usedCount) || '—'}）；采集批次${h.partial ? '超上限（≈），按已采集部分计算' : '完整'}。`,
     `逐条金额：优先取「实扣」，缺失时回退「标价」（行内标「标」）；人民币折算 = 金额 × 充值比例 ${h.rechargeRate ?? '未填充'}${h.missingRate ? '（未填充，无法折算人民币）' : ''}。`,
-    `该模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ（输入 + 输出 tokens）× 1,000,000 = ${fmtRowPrice(h.pricePerM)}；计算于 ${fmtTs(h.computedAt)}。`,
+    `该模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ（输入 + 输出 tokens）× 1,000,000 = ${fmtRowPrice(h.pricePerM)}${h.pricePerM != null ? `（精确值 ¥${fmtExact(h.pricePerM)}）` : ''}；计算于 ${fmtTs(h.computedAt)}。`,
   ]
   const own = Array.isArray(h.records) ? h.records : []
   if (own.length) {
@@ -213,9 +214,18 @@ function fmtTs(ts: number): string {
   return `${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`
 }
 
-/** 本币金额：按量级取小数位（费用常为小数，保留 4 位精度感）。 */
+/** 本币金额展示：按量级取小数位（四舍五入显示，精确值在 title 中，050r3）。 */
 function fmtAmount(v: number): string {
   return v >= 100 ? v.toFixed(2) : v >= 1 ? v.toFixed(2) : v.toFixed(4)
+}
+
+/** 站点均价 title：正文为四舍五入展示，title 补精确值与历史档案来源说明（050r3）。 */
+function avgTitle(s: ModelAvgSummary | null): string {
+  if (!s || fmtAvgText(s) === '—') return ''
+  const exact = s.pricePerM != null ? `精确值 ¥${fmtExact(s.pricePerM)}/百万 tokens` : ''
+  return s.fromHistory
+    ? `当日无数据，取历史档案中用量最大模型（${s.topModel ?? '—'}）的价格；${exact}`
+    : exact
 }
 
 /** 计算条目上限（页面头部口径与弹窗说明共用）。 */
@@ -231,7 +241,7 @@ onMounted(() => {
     <header class="head">
       <span class="title">模型价格详情</span>
       <span class="win">{{
-        maxRecords ? `当日逐条明细 · 最近 ${maxRecords} 条` : '当日逐条用量明细'
+        maxRecords ? `逐条用量明细 · 最近 ${maxRecords} 条` : '逐条用量明细'
       }}</span>
       <button class="refresh" title="重新计算" @click="load">↻ 刷新</button>
     </header>
@@ -251,8 +261,9 @@ onMounted(() => {
         <div class="s-head">
           <span class="s-name" :title="r.name">{{ r.name }}</span>
           <span class="hist-btn" title="查看该站历史价格" @click="openHistory(r)">🕘 历史</span>
-          <span class="s-avg" :class="{ 'is-null': fmtAvgText(r.avg) === '—' }">
+          <span class="s-avg" :class="{ 'is-null': fmtAvgText(r.avg) === '—' }" :title="avgTitle(r.avg)">
             {{ fmtAvgText(r.avg) }}<i class="s-unit">/M</i>
+            <i v-if="r.avg?.fromHistory" class="lp his" title="当日无数据，价格来自历史档案（历史用量最大模型）">档</i>
           </span>
         </div>
 
@@ -275,7 +286,7 @@ onMounted(() => {
             <div v-else-if="!r.detail.hasDetail" class="note">
               该站点无逐条用量明细，暂不支持模型价格
             </div>
-            <div v-if="r.detail.partial" class="note">当日明细超上限，按已采集部分计算</div>
+            <div v-if="r.detail.partial" class="note">明细超上限，按已采集部分计算</div>
             <table v-if="r.detail.rows.length" class="tbl">
               <thead>
                 <tr><th class="h-model">模型</th><th class="h-range">数据范围</th><th class="h-num">用量</th><th class="h-num">次数</th><th class="h-num">¥/M</th></tr>
@@ -292,7 +303,7 @@ onMounted(() => {
                   </td>
                   <td class="c-num">{{ fmtTokens(row.tokens) }}</td>
                   <td class="c-num">{{ row.requests }}</td>
-                  <td class="c-num">{{ fmtRowPrice(row.pricePerM) }}</td>
+                  <td class="c-num" :title="row.pricePerM != null ? `¥${fmtExact(row.pricePerM)}/百万 tokens` : ''">{{ fmtRowPrice(row.pricePerM) }}</td>
                 </tr>
               </tbody>
             </table>
@@ -343,8 +354,8 @@ onMounted(() => {
                     </td>
                     <td class="c-num">{{ fmtTokens(rec.promptTokens) }}</td>
                     <td class="c-num">{{ fmtTokens(rec.completionTokens) }}</td>
-                    <td class="c-num">{{ fmtAmount(rec.amount ?? 0) }}<span class="cur">{{ rec.currency ?? '' }}</span></td>
-                    <td class="c-num" :class="{ 'is-null': rec.rmb == null }">{{ rec.rmb == null ? '—' : fmtRowPrice(rec.rmb) }}</td>
+                    <td class="c-num" :title="rec.amount != null ? fmtExact(rec.amount) : ''">{{ fmtAmount(rec.amount ?? 0) }}<span class="cur">{{ rec.currency ?? '' }}</span></td>
+                    <td class="c-num" :class="{ 'is-null': rec.rmb == null }" :title="rec.rmb != null ? `¥${fmtExact(rec.rmb)}` : ''">{{ rec.rmb == null ? '—' : fmtRowPrice(rec.rmb) }}</td>
                   </tr>
                 </tbody>
               </table>
@@ -381,7 +392,7 @@ onMounted(() => {
                     {{ h.model }}
                     <i v-if="h.listPriceBased" class="lp" title="部分记录缺实扣价，按标价口径计算">标</i>
                   </td>
-                  <td class="c-num" :class="{ 'is-null': h.pricePerM == null }">{{ fmtRowPrice(h.pricePerM) }}</td>
+                  <td class="c-num" :class="{ 'is-null': h.pricePerM == null }" :title="h.pricePerM != null ? `¥${fmtExact(h.pricePerM)}/百万 tokens` : ''">{{ fmtRowPrice(h.pricePerM) }}</td>
                   <td class="c-range linkable" title="点击查看该次计算的数据来源" @click="openHistoryViewer(h)">{{ fmtRangeShort(h.rangeStart, h.rangeEnd) || '—' }}</td>
                   <td class="c-num">{{ h.usedCount }}</td>
                 </tr>

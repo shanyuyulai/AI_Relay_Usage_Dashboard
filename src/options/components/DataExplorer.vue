@@ -759,187 +759,6 @@ onMounted(() => {
       <b>静默模式已开启：</b>定时与看板的后台刷新将在<b>最小化后台窗口</b>中静默采集所有已启用的站点（无论标签是否打开；不抢焦点、不弹前台，采完自动关闭）。关闭则按老模式<b>正常开窗</b>采集（窗口会短暂获取焦点），同样覆盖所有已启用站点。
     </div>
 
-    <details class="settings-card">
-      <summary>🔔 采集通知 <span class="settings-summary-hint">（默认折叠）</span></summary>
-      <p class="settings-desc">控制后台自动采集 / 手动同步完成后的通知方式。</p>
-      <div class="radio-group">
-        <label class="radio-item">
-          <input type="radio" value="system" v-model="notifyMode" @change="onNotifyModeChange" />
-          <span><b>系统弹窗通知</b><br /><small>每次采集都弹出系统级通知（默认行为）</small></span>
-        </label>
-        <label class="radio-item">
-          <input type="radio" value="optionsOnly" v-model="notifyMode" @change="onNotifyModeChange" />
-          <span><b>仅配置界面通知</b><br /><small>只在扩展设置页打开时，于页内显示提示（配置界面打开时才有效）</small></span>
-        </label>
-        <label class="radio-item">
-          <input type="radio" value="dailyFirst" v-model="notifyMode" @change="onNotifyModeChange" />
-          <span><b>每天第一次调用时通知</b><br /><small>同一天内仅首次采集弹窗，其余静默</small></span>
-        </label>
-        <label class="radio-item">
-          <input type="radio" value="off" v-model="notifyMode" @change="onNotifyModeChange" />
-          <span><b>完全关闭通知</b><br /><small>任何采集都不发通知</small></span>
-        </label>
-      </div>
-    </details>
-
-    <details class="settings-card">
-      <summary>🖱️ 单击图标行为</summary>
-      <p class="settings-desc">设置单击工具栏图标时的动作（本设置独立生效，与下方实验室「用量看板」开关无关）。</p>
-      <div class="radio-group">
-        <label class="radio-item">
-          <input type="radio" value="panel" v-model="clickBehavior" @change="saveClickBehavior" />
-          <span><b>极简面板</b><br /><small>单击图标弹出只含各中转站名称 + 剩余金额的极简看板（默认）</small></span>
-        </label>
-        <label class="radio-item">
-          <input type="radio" value="sidebar" v-model="clickBehavior" @change="saveClickBehavior" />
-          <span><b>侧边栏</b><br /><small>单击图标打开完整的用量看板侧边栏</small></span>
-        </label>
-      </div>
-    </details>
-
-    <details class="settings-card" :open="upd.hasUpdate && !upd.dismissed">
-      <summary>⬆️ 更新检测</summary>
-      <p class="settings-desc">
-        定期访问 GitHub Releases 检查插件新版本（每 12 小时一次）。发现新版本时通过系统通知与看板横幅提醒，
-        点击即可打开发布页手动下载更新。检测只读取公开的版本信息，<b>不下载任何文件、不上传任何本地数据</b>。
-      </p>
-      <label class="lab-toggle">
-        <input type="checkbox" v-model="upd.enabled" @change="onUpdateCheckToggle" />
-        <span>自动检测更新（默认开启；关闭后不再定期检查，仍可手动「立即检查」）</span>
-      </label>
-      <div class="upd-status">
-        <small class="upd-line">
-          当前版本 <b>v{{ upd.currentVersion || '—' }}</b><template v-if="upd.latestVersion">
-          · 最新版本 <b>v{{ upd.latestVersion }}</b></template><template v-if="upd.lastCheckedAt">
-          · 上次检查 {{ fmtUpdTime(upd.lastCheckedAt) }}</template>
-        </small>
-        <div class="upd-acts">
-          <button class="btn" :disabled="upd.checking" @click="checkUpdateNow">{{ upd.checking ? '检查中…' : '立即检查' }}</button>
-          <button class="btn" @click="openReleasesPage()">打开发布页</button>
-        </div>
-        <small v-if="upd.hasUpdate && !upd.dismissed" class="upd-new">
-          🆕 有新版本 v{{ upd.latestVersion }} 可用（当前 v{{ upd.currentVersion }}），点击「打开发布页」下载更新
-        </small>
-        <small v-else-if="upd.err" class="upd-err">{{ upd.err }}</small>
-      </div>
-    </details>
-
-    <details class="settings-card">
-      <summary>💰 真实花费与极简面板</summary>
-      <p class="settings-desc">
-        开启「计算真实花费」后，每个站点的编辑表单里会出现「充值比例」输入框；侧边栏与极简面板的「今日花费」将按真实人民币显示（如
-        <code>$18.67 / ¥1.867</code>）。「极简面板显示今日花费」独立控制极简面板是否在余额正下方显示花费行。<br />
-        下方「花费统计周期」切换后，极简面板顶栏的「真实总花费」、侧边栏「总余额（按币种）」右侧的真实总花费，以及极简面板 / 侧边栏所有「今日使用 / 24h 使用」金额，都会同步切换为对应口径的数据。
-      </p>
-      <label class="lab-toggle">
-        <input type="checkbox" v-model="calcRealCost" />
-        <span>计算真实花费（各站可设充值比例，今日花费按真实人民币显示）</span>
-      </label>
-      <label class="lab-toggle">
-        <input type="checkbox" v-model="showTodayCostInPopup" />
-        <span>极简面板显示今日花费（在余额正下方显示花费行）</span>
-      </label>
-      <label class="lab-toggle">
-        <input type="checkbox" v-model="balanceRmbMode" />
-        <span>站点余额显示真实人民币（极简面板/侧边栏点击余额可随时切换，按各站充值比例换算）</span>
-      </label>
-      <div class="radio-group">
-        <label class="radio-item">
-          <input type="radio" value="h24" v-model="costWindow" />
-          <span><b>24 小时</b><br /><small>花费统计周期为「昨天 ~ 今天」（与站点用量页的近 24 小时一致）：极简面板顶栏「真实总花费」与所有「使用金额」取该区间数据（需站点支持该口径，不支持者显「24h 无数据」）</small></span>
-        </label>
-        <label class="radio-item">
-          <input type="radio" value="today" v-model="costWindow" />
-          <span><b>今日</b><br /><small>花费统计周期为自然日（当日 0 点起）：兼容性最好，默认选项</small></span>
-        </label>
-      </div>
-      <p class="lab-warn">
-        充值比例含义：充值 <b>1 人民币</b> 到账多少站点计价货币。写法 <code>10</code>（=10）或
-        <code>1:1.1</code>（冒号左 RMB、右站点货币 =1.1）。关闭「计算真实花费」不会清除已保存的比例，重新开启后仍生效。
-        余额换算同样使用该比例：<code>人民币余额 = 站点余额 ÷ 比例</code>；未填比例的站点仍显示原币种，不会臆造数值。
-      </p>
-      <p class="lab-warn">
-        <b>若「24 小时」显示「24h 无数据」</b>：说明当前快照里没有该口径数据。请到上方站点列表对该站点执行
-        <b>「探测」</b>后再<b>「立即同步」</b>——统计接口路径（<code>/api/v1/usage/stats</code> 等）需探测才会写入站点配置。
-        切换周期<b>不会</b>重新采集，读的是最近一次快照（顶栏提示会显示数据时间）。
-      </p>
-      <label class="lab-toggle">
-        <input type="checkbox" v-model="showModelAvgPrice" />
-        <span>计算并显示模型价格（极简面板与侧边栏显示当日用量最大模型的 ¥/百万 tokens 真实价格，鼠标悬停可查看全部模型列表）</span>
-      </label>
-      <div v-if="showModelAvgPrice" class="avg-opts">
-        <label class="avg-count">
-          计算条目：<input
-            type="number"
-            min="20"
-            max="500"
-            step="10"
-            v-model.number="modelAvgMaxInput"
-            @change="saveModelAvgMax"
-          />
-          条（默认 200）
-        </label>
-        <small class="avg-hint">取当日用量明细中最近 N 条参与计算；采集端单日明细上限为 200 条，设置高于 200 时实际仍以已采集条数为准（允许范围 20–500）。</small>
-      </div>
-    </details>
-
-    <details class="lab">
-      <summary>🧪 实验室功能（实验性 · 默认关闭）</summary>
-      <div class="lab-body">
-        <label class="lab-toggle">
-          <input type="checkbox" v-model="labEnabled" @change="saveLab" />
-          <span>SW 零标签后台采集（无需打开任何标签即可后台采集）</span>
-        </label>
-        <p class="lab-warn">
-          <b>这是什么：</b>开启后，对<strong>没有打开标签页</strong>的站点，扩展会在 Service Worker 内直接读取该站点的登录
-          Cookie 并手动注入请求头去抓取数据，从而<strong>真正后台静默采集、不弹任何窗口</strong>（比「临时后台窗口」更彻底）。
-        </p>
-        <p class="lab-warn"><b>优势：</b>彻底无可见标签 / 窗口，最贴近「登录一次、后台默默采」的体验。</p>
-        <p class="lab-warn">
-          <b>劣势与极不稳定性（请务必知悉）：</b>
-          ① 这需要在扩展内读取你的站点登录 Cookie（<strong>仅本次请求内存使用，绝不写入本地数据库或导出</strong>）；
-          ② 多数中转站 API <strong>不设 CORS</strong>，跨源请求会被浏览器直接拦截 → 大概率失败；
-          ③ 会话常不止一个 Cookie，还绑 <strong>CSRF / SameSite / 内存态 Token</strong>（如 ikuncode 依赖 localStorage 的 Bearer，SW 读不到）→ 很可能只能采到部分字段或完全失败；
-          ④ 因此<strong>可能十分不稳定</strong>，失败时在侧边栏显示错误、并可能在通知里提示。
-        </p>
-        <p class="lab-warn">
-          若开启后某站采集失败，可<strong>关闭本选项</strong>（回退到临时后台窗口方案），或保持该站标签登录。本选项不影响已开启的「临时后台窗口」逻辑。
-        </p>
-
-        <hr class="lab-hr" />
-
-        <label class="lab-toggle">
-          <input type="checkbox" v-model="labCorsEnabled" @change="saveLabCors" />
-          <span>动态 CORS 放行（实验性）</span>
-        </label>
-        <p class="lab-warn">
-          <b>这是什么：</b>多数中转站 API 返回的响应没有
-          <code>Access-Control-Allow-Origin</code>
-          头，导致扩展在 Service Worker 内跨域 fetch 时读不到响应体（报错「Failed to fetch」或 CORS 错误）。开启后，扩展会通过
-          <code>chrome.declarativeNetRequest</code>
-          给已启用站点的响应<strong>动态添加</strong>
-          <code>Access-Control-Allow-Origin: *</code>，作用和「CORS Unblock」插件类似。
-        </p>
-        <p class="lab-warn">
-          <b>局限与提示：</b>① 该功能依赖 Chrome MV3 的声明式网络请求，部分版本/策略可能不生效；② 仍受
-          <code>SameSite</code>、CSRF、内存态 Token（如 ikuncode 的 localStorage Bearer）限制；③
-          <strong>如仍失败，可尝试安装浏览器插件「CORS Unblock」作为备选</strong>；④ 本功能仅影响扩展自身发起的请求，不会修改你正常浏览该站时的响应。
-        </p>
-
-        <hr class="lab-hr" />
-
-        <label class="lab-toggle">
-          <input type="checkbox" v-model="labShowDashboard" @change="saveLabShowDashboard" />
-          <span>用量看板（实验性 · 默认关闭）</span>
-        </label>
-        <p class="lab-warn">
-          这是什么：开启后，设置页顶部会显示「📊 用量看板」Tab，可在其中查看完整复刻的用量看板页。关闭则隐藏该 Tab。本开关只控制顶部 Tab 的显隐，与「🖱️ 单击图标行为」相互独立。
-        </p>
-        <p class="lab-warn">
-          关于「悬浮(hover)」：Chrome 扩展的工具栏图标没有「鼠标悬停弹出自定义浮层」的原生 API（只有系统自带的 tooltip 文字）。极简面板是单击触发的原生 popup，这是 MV3 下能做成的形态。
-        </p>
-      </div>
-    </details>
 
     <div v-if="msg" class="dex-msg">{{ msg }}</div>
 
@@ -1215,6 +1034,194 @@ onMounted(() => {
     </template>
 
     <div v-else class="state-msg">选择站点并点击「刷新」查看已采集数据</div>
+
+    <details class="settings-group" :open="upd.hasUpdate && !upd.dismissed">
+      <summary>⚙️ 通用设置 <span class="settings-summary-hint">（采集通知 · 单击图标行为 · 真实花费 · 更新检测 · 实验室；与数据表无关，默认折叠）</span></summary>
+      <div class="settings-group-body">
+    <details class="settings-card">
+      <summary>🔔 采集通知 <span class="settings-summary-hint">（默认折叠）</span></summary>
+      <p class="settings-desc">控制后台自动采集 / 手动同步完成后的通知方式。</p>
+      <div class="radio-group">
+        <label class="radio-item">
+          <input type="radio" value="system" v-model="notifyMode" @change="onNotifyModeChange" />
+          <span><b>系统弹窗通知</b><br /><small>每次采集都弹出系统级通知（默认行为）</small></span>
+        </label>
+        <label class="radio-item">
+          <input type="radio" value="optionsOnly" v-model="notifyMode" @change="onNotifyModeChange" />
+          <span><b>仅配置界面通知</b><br /><small>只在扩展设置页打开时，于页内显示提示（配置界面打开时才有效）</small></span>
+        </label>
+        <label class="radio-item">
+          <input type="radio" value="dailyFirst" v-model="notifyMode" @change="onNotifyModeChange" />
+          <span><b>每天第一次调用时通知</b><br /><small>同一天内仅首次采集弹窗，其余静默</small></span>
+        </label>
+        <label class="radio-item">
+          <input type="radio" value="off" v-model="notifyMode" @change="onNotifyModeChange" />
+          <span><b>完全关闭通知</b><br /><small>任何采集都不发通知</small></span>
+        </label>
+      </div>
+    </details>
+
+    <details class="settings-card">
+      <summary>🖱️ 单击图标行为</summary>
+      <p class="settings-desc">设置单击工具栏图标时的动作（本设置独立生效，与下方实验室「用量看板」开关无关）。</p>
+      <div class="radio-group">
+        <label class="radio-item">
+          <input type="radio" value="panel" v-model="clickBehavior" @change="saveClickBehavior" />
+          <span><b>极简面板</b><br /><small>单击图标弹出只含各中转站名称 + 剩余金额的极简看板（默认）</small></span>
+        </label>
+        <label class="radio-item">
+          <input type="radio" value="sidebar" v-model="clickBehavior" @change="saveClickBehavior" />
+          <span><b>侧边栏</b><br /><small>单击图标打开完整的用量看板侧边栏</small></span>
+        </label>
+      </div>
+    </details>
+
+    <details class="settings-card" :open="upd.hasUpdate && !upd.dismissed">
+      <summary>⬆️ 更新检测</summary>
+      <p class="settings-desc">
+        定期访问 GitHub Releases 检查插件新版本（每 12 小时一次）。发现新版本时通过系统通知与看板横幅提醒，
+        点击即可打开发布页手动下载更新。检测只读取公开的版本信息，<b>不下载任何文件、不上传任何本地数据</b>。
+      </p>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="upd.enabled" @change="onUpdateCheckToggle" />
+        <span>自动检测更新（默认开启；关闭后不再定期检查，仍可手动「立即检查」）</span>
+      </label>
+      <div class="upd-status">
+        <small class="upd-line">
+          当前版本 <b>v{{ upd.currentVersion || '—' }}</b><template v-if="upd.latestVersion">
+          · 最新版本 <b>v{{ upd.latestVersion }}</b></template><template v-if="upd.lastCheckedAt">
+          · 上次检查 {{ fmtUpdTime(upd.lastCheckedAt) }}</template>
+        </small>
+        <div class="upd-acts">
+          <button class="btn" :disabled="upd.checking" @click="checkUpdateNow">{{ upd.checking ? '检查中…' : '立即检查' }}</button>
+          <button class="btn" @click="openReleasesPage()">打开发布页</button>
+        </div>
+        <small v-if="upd.hasUpdate && !upd.dismissed" class="upd-new">
+          🆕 有新版本 v{{ upd.latestVersion }} 可用（当前 v{{ upd.currentVersion }}），点击「打开发布页」下载更新
+        </small>
+        <small v-else-if="upd.err" class="upd-err">{{ upd.err }}</small>
+      </div>
+    </details>
+
+    <details class="settings-card">
+      <summary>💰 真实花费与极简面板</summary>
+      <p class="settings-desc">
+        开启「计算真实花费」后，每个站点的编辑表单里会出现「充值比例」输入框；侧边栏与极简面板的「今日花费」将按真实人民币显示（如
+        <code>$18.67 / ¥1.867</code>）。「极简面板显示今日花费」独立控制极简面板是否在余额正下方显示花费行。<br />
+        下方「花费统计周期」切换后，极简面板顶栏的「真实总花费」、侧边栏「总余额（按币种）」右侧的真实总花费，以及极简面板 / 侧边栏所有「今日使用 / 24h 使用」金额，都会同步切换为对应口径的数据。
+      </p>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="calcRealCost" />
+        <span>计算真实花费（各站可设充值比例，今日花费按真实人民币显示）</span>
+      </label>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="showTodayCostInPopup" />
+        <span>极简面板显示今日花费（在余额正下方显示花费行）</span>
+      </label>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="balanceRmbMode" />
+        <span>站点余额显示真实人民币（极简面板/侧边栏点击余额可随时切换，按各站充值比例换算）</span>
+      </label>
+      <div class="radio-group">
+        <label class="radio-item">
+          <input type="radio" value="h24" v-model="costWindow" />
+          <span><b>24 小时</b><br /><small>花费统计周期为「昨天 ~ 今天」（与站点用量页的近 24 小时一致）：极简面板顶栏「真实总花费」与所有「使用金额」取该区间数据（需站点支持该口径，不支持者显「24h 无数据」）</small></span>
+        </label>
+        <label class="radio-item">
+          <input type="radio" value="today" v-model="costWindow" />
+          <span><b>今日</b><br /><small>花费统计周期为自然日（当日 0 点起）：兼容性最好，默认选项</small></span>
+        </label>
+      </div>
+      <p class="lab-warn">
+        充值比例含义：充值 <b>1 人民币</b> 到账多少站点计价货币。写法 <code>10</code>（=10）或
+        <code>1:1.1</code>（冒号左 RMB、右站点货币 =1.1）。关闭「计算真实花费」不会清除已保存的比例，重新开启后仍生效。
+        余额换算同样使用该比例：<code>人民币余额 = 站点余额 ÷ 比例</code>；未填比例的站点仍显示原币种，不会臆造数值。
+      </p>
+      <p class="lab-warn">
+        <b>若「24 小时」显示「24h 无数据」</b>：说明当前快照里没有该口径数据。请到上方站点列表对该站点执行
+        <b>「探测」</b>后再<b>「立即同步」</b>——统计接口路径（<code>/api/v1/usage/stats</code> 等）需探测才会写入站点配置。
+        切换周期<b>不会</b>重新采集，读的是最近一次快照（顶栏提示会显示数据时间）。
+      </p>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="showModelAvgPrice" />
+        <span>计算并显示模型价格（极简面板与侧边栏显示当日用量最大模型的 ¥/百万 tokens 真实价格，鼠标悬停可查看全部模型列表）</span>
+      </label>
+      <div v-if="showModelAvgPrice" class="avg-opts">
+        <label class="avg-count">
+          计算条目：<input
+            type="number"
+            min="20"
+            max="500"
+            step="10"
+            v-model.number="modelAvgMaxInput"
+            @change="saveModelAvgMax"
+          />
+          条（默认 200）
+        </label>
+        <small class="avg-hint">取当日用量明细中最近 N 条参与计算；采集端单日明细上限为 200 条，设置高于 200 时实际仍以已采集条数为准（允许范围 20–500）。</small>
+      </div>
+    </details>
+
+    <details class="lab">
+      <summary>🧪 实验室功能（实验性 · 默认关闭）</summary>
+      <div class="lab-body">
+        <label class="lab-toggle">
+          <input type="checkbox" v-model="labEnabled" @change="saveLab" />
+          <span>SW 零标签后台采集（无需打开任何标签即可后台采集）</span>
+        </label>
+        <p class="lab-warn">
+          <b>这是什么：</b>开启后，对<strong>没有打开标签页</strong>的站点，扩展会在 Service Worker 内直接读取该站点的登录
+          Cookie 并手动注入请求头去抓取数据，从而<strong>真正后台静默采集、不弹任何窗口</strong>（比「临时后台窗口」更彻底）。
+        </p>
+        <p class="lab-warn"><b>优势：</b>彻底无可见标签 / 窗口，最贴近「登录一次、后台默默采」的体验。</p>
+        <p class="lab-warn">
+          <b>劣势与极不稳定性（请务必知悉）：</b>
+          ① 这需要在扩展内读取你的站点登录 Cookie（<strong>仅本次请求内存使用，绝不写入本地数据库或导出</strong>）；
+          ② 多数中转站 API <strong>不设 CORS</strong>，跨源请求会被浏览器直接拦截 → 大概率失败；
+          ③ 会话常不止一个 Cookie，还绑 <strong>CSRF / SameSite / 内存态 Token</strong>（如 ikuncode 依赖 localStorage 的 Bearer，SW 读不到）→ 很可能只能采到部分字段或完全失败；
+          ④ 因此<strong>可能十分不稳定</strong>，失败时在侧边栏显示错误、并可能在通知里提示。
+        </p>
+        <p class="lab-warn">
+          若开启后某站采集失败，可<strong>关闭本选项</strong>（回退到临时后台窗口方案），或保持该站标签登录。本选项不影响已开启的「临时后台窗口」逻辑。
+        </p>
+
+        <hr class="lab-hr" />
+
+        <label class="lab-toggle">
+          <input type="checkbox" v-model="labCorsEnabled" @change="saveLabCors" />
+          <span>动态 CORS 放行（实验性）</span>
+        </label>
+        <p class="lab-warn">
+          <b>这是什么：</b>多数中转站 API 返回的响应没有
+          <code>Access-Control-Allow-Origin</code>
+          头，导致扩展在 Service Worker 内跨域 fetch 时读不到响应体（报错「Failed to fetch」或 CORS 错误）。开启后，扩展会通过
+          <code>chrome.declarativeNetRequest</code>
+          给已启用站点的响应<strong>动态添加</strong>
+          <code>Access-Control-Allow-Origin: *</code>，作用和「CORS Unblock」插件类似。
+        </p>
+        <p class="lab-warn">
+          <b>局限与提示：</b>① 该功能依赖 Chrome MV3 的声明式网络请求，部分版本/策略可能不生效；② 仍受
+          <code>SameSite</code>、CSRF、内存态 Token（如 ikuncode 的 localStorage Bearer）限制；③
+          <strong>如仍失败，可尝试安装浏览器插件「CORS Unblock」作为备选</strong>；④ 本功能仅影响扩展自身发起的请求，不会修改你正常浏览该站时的响应。
+        </p>
+
+        <hr class="lab-hr" />
+
+        <label class="lab-toggle">
+          <input type="checkbox" v-model="labShowDashboard" @change="saveLabShowDashboard" />
+          <span>用量看板（实验性 · 默认关闭）</span>
+        </label>
+        <p class="lab-warn">
+          这是什么：开启后，设置页顶部会显示「📊 用量看板」Tab，可在其中查看完整复刻的用量看板页。关闭则隐藏该 Tab。本开关只控制顶部 Tab 的显隐，与「🖱️ 单击图标行为」相互独立。
+        </p>
+        <p class="lab-warn">
+          关于「悬浮(hover)」：Chrome 扩展的工具栏图标没有「鼠标悬停弹出自定义浮层」的原生 API（只有系统自带的 tooltip 文字）。极简面板是单击触发的原生 popup，这是 MV3 下能做成的形态。
+        </p>
+      </div>
+    </details>
+      </div>
+    </details>
+
   </section>
 </template>
 
@@ -1518,6 +1525,43 @@ onMounted(() => {
 .pg-select {
   min-width: 72px;
   padding: 5px 8px;
+}
+
+/* ── 通用设置分组（050r3）：与数据表无关的设置项统一收纳到数据区下方，默认折叠 ── */
+.settings-group {
+  margin-top: 22px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  overflow: hidden;
+}
+.settings-group > summary {
+  cursor: pointer;
+  padding: 10px 14px;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+  user-select: none;
+  list-style: none;
+}
+.settings-group > summary::-webkit-details-marker {
+  display: none;
+}
+.settings-group > summary::before {
+  content: '▸';
+  font-size: 11px;
+  color: var(--sub);
+  margin-right: 6px;
+}
+.settings-group[open] > summary::before {
+  content: '▾';
+}
+.settings-group-body {
+  padding: 0 14px 14px;
+}
+.settings-group-body .settings-card {
+  margin-top: 12px;
+  margin-bottom: 0;
 }
 
 /* ── 实验室功能（实验性）── */

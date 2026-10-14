@@ -70,6 +70,8 @@ export interface ModelAvgSummary {
   partial: boolean
   /** 站点是否有当日明细批次。 */
   hasDetail: boolean
+  /** true = 当日无有效数据，价格回退为历史档案中用量最大模型的历史价（UI 带「档」标记，050r3）。 */
+  fromHistory?: boolean
 }
 
 /**
