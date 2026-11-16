@@ -10,6 +10,7 @@
 // ---- 类型定义 ----
 
 import type { AccountSemantics, SiteConfig } from '../shared/types'
+import { effectiveSiteCurrency } from '../shared/settlement'
 
 export type Family = 'one-api-compatible' | 'new-api-capable' | 'independent' | 'unknown'
 export type RouteProfile = 'standard' | 'fork-path' | 'discovered'
@@ -322,6 +323,19 @@ export function buildStrategy(
   if (classification.capabilities.includes('usageLogs')) {
     endpoints.push({ role: 'usage', endpointId: 'logSelf', path: '/api/log/self', source: 'raw_logs' })
     endpoints.push({ role: 'usage', endpointId: 'logSelfV1', path: '/api/v1/log/self', source: 'raw_logs' })
+    // 方案 056：New API 日志统计接口（/api/log/self/stat）返回区间 quota 合计。
+    // 以端点描述注册、由通用采集器按区间参数执行，**不判断 hostname**（GPT P0-6）。
+    // 站点无此端点时返回 404，采集侧静默跳过，不产生副作用。
+    endpoints.push({
+      role: 'usage_stats',
+      endpointId: 'logStat',
+      path: '/api/log/self/stat',
+      method: 'GET',
+      usageWindow: 'calendar_day',
+      sideEffect: 'none',
+      safeToAutoPoll: true,
+      authRole: 'none',
+    })
   }
 
   // 当日用量明细列表（hubway_v1 = /api/v1/usage，generic = /api/usage）
@@ -462,7 +476,9 @@ export function buildEffectiveStrategy(site: SiteConfig, _manualCollect: boolean
   const strategy = buildStrategy(
     classification,
     userSelfPath,
-    site.currency ?? undefined,
+    // 方案 054：币种走唯一真源。cnyOnly 站点即使 DB 里 currency 被写脏成 USD，
+    // 采集策略仍恒为 CNY（不读站点 quota_display_type，不受站点公开配置漂移影响）。
+    effectiveSiteCurrency(site),
     {
       usageStatsPath: discovered?.usageStatsPath ?? '/api/v1/usage/dashboard/stats',
       usageStatsKind: discovered?.usageStatsKind ?? 'hubway_dashboard_stats',

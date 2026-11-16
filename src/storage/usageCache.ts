@@ -177,8 +177,10 @@ function aggregateTopMetrics(records: UsageRecord[], hoursWindow: number): Usage
   let cacheCreation = 0
   // 平均响应：明细里没有精确的单次耗时字段，一律 null（禁模拟数据，UI 显「—」）
   for (const r of records) {
-    totalRequests++
-    const parts = recordTokenParts(r)
+    // 方案 056：聚合桶代表 N 次调用；逐次记录缺省 1 次（GPT P0-3）
+    totalRequests += r.granularity === 'bucket' ? Math.max(0, r.requestCount ?? 0) : 1
+    // 桶只提供总量、无 prompt/completion 拆分 → 不参与输入/输出拆分统计，避免伪造拆分（GPT P0-2）
+    const parts = r.granularity === 'bucket' ? { input: 0, output: 0 } : recordTokenParts(r)
     inputTokens += parts.input
     outputTokens += parts.output
     cacheRead += r.cacheReadTokens ?? 0
@@ -220,7 +222,8 @@ function aggregateDistribution(
       b = { key, label: key, requests: 0, tokens: 0, costByCurrency: {}, ratio: 0 }
       map.set(key, b)
     }
-    b.requests++
+    // 方案 056：桶记录按 requestCount 累加，逐次记录按 1 次
+    b.requests += r.granularity === 'bucket' ? Math.max(0, r.requestCount ?? 0) : 1
     b.tokens += recordTokenTotal(r)
     if (r.cost != null) b.costByCurrency[r.costCurrency] = (b.costByCurrency[r.costCurrency] || 0) + r.cost
   }
@@ -271,6 +274,14 @@ function aggregateTrend(records: UsageRecord[], startMs: number, endMs: number):
     const hourTs = startMs + Math.floor((r.ts - startMs) / HOUR) * HOUR
     const b = buckets.get(hourTs)
     if (!b) continue
+    // 方案 056：桶记录只有总量，单独累加到 totalTokens，绝不塞进 input/output（GPT P0-2）
+    if (r.granularity === 'bucket') {
+      b.totalTokens = (b.totalTokens ?? 0) + recordTokenTotal(r)
+      b.cacheCreationTokens += r.cacheCreationTokens ?? 0
+      b.cacheReadTokens += r.cacheReadTokens ?? 0
+      b.requests += Math.max(0, r.requestCount ?? 0)
+      continue
+    }
     const parts = recordTokenParts(r)
     b.inputTokens += parts.input
     b.outputTokens += parts.output
@@ -279,6 +290,7 @@ function aggregateTrend(records: UsageRecord[], startMs: number, endMs: number):
     b.requests++
   }
   for (const b of buckets.values()) {
+    // 命中率分母：有拆分时 input+cacheRead；只有总量时用总 token 作分母
     const total = b.inputTokens + b.cacheReadTokens
     b.cacheHitRate = total > 0 ? b.cacheReadTokens / total : 0
   }

@@ -28,7 +28,7 @@ const CURRENCIES = [
   { id: 'EUR', label: 'EUR（€）' },
 ]
 
-const form = ref({ name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', rechargeRate: '', rechargeDiscount: '' })
+const form = ref({ name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', cnyOnly: false, rechargeRate: '', rechargeDiscount: '' })
 const alertDrafts = ref<AlertRuleDraft[]>([])
 const formError = ref('')
 const submitting = ref(false)
@@ -49,14 +49,22 @@ watch(
         name: props.site.name,
         baseUrl: props.site.baseUrl,
         adapter: props.site.adapter,
-        currency: props.site.currency || 'USD',
+        // 方案 054：固定人民币站点编辑态仍锁定 CNY，即使旧数据 currency 被写脏。
+        currency: props.site.cnyOnly === true ? 'CNY' : (props.site.currency || 'USD'),
+        cnyOnly: props.site.cnyOnly === true,
         rechargeRate: props.site.rechargeRate ?? '',
         rechargeDiscount: '', // 折扣是 UI 派生输入，编辑时不预填（rate 已有等价信息）
       }
     } else {
-      form.value = { name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', rechargeRate: '', rechargeDiscount: '' }
+      form.value = { name: '', baseUrl: '', adapter: adapters[0]?.id ?? '', currency: 'USD', cnyOnly: false, rechargeRate: '', rechargeDiscount: '' }
     }
   },
+)
+
+// 方案 054：勾选「仅人民币结算」立即锁定 CNY，防止表单里出现 cnyOnly=true + USD 的组合。
+watch(
+  () => form.value.cnyOnly,
+  (v) => { if (v) form.value.currency = 'CNY' },
 )
 
 // 保存站点（权限已提前在用户手势同步路径中申请）
@@ -70,7 +78,7 @@ async function doSave(origin: string) {
     if (props.site) {
       await send('UPDATE_SITE', {
         id: props.site.id,
-        patch: { name: form.value.name, baseUrl: form.value.baseUrl, currency: form.value.currency, rechargeRate, alerts },
+        patch: { name: form.value.name, baseUrl: form.value.baseUrl, currency: form.value.currency, cnyOnly: form.value.cnyOnly, rechargeRate, alerts },
       })
     } else {
       await send<{ siteId: string }>('ADD_SITE', {
@@ -78,6 +86,7 @@ async function doSave(origin: string) {
         name: form.value.name,
         baseUrl: form.value.baseUrl,
         currency: form.value.currency,
+        cnyOnly: form.value.cnyOnly,
         rechargeRate: rechargeRate ?? undefined,
         alerts,
       })
@@ -253,12 +262,23 @@ function handleSubmit() {
       </div>
       <div class="f">
         <label>计价货币</label>
-        <select v-model="form.currency">
+        <select v-model="form.currency" :disabled="form.cnyOnly">
           <option v-for="c in CURRENCIES" :key="c.id" :value="c.id">{{ c.label }}</option>
         </select>
       </div>
 
-      <div v-if="dashboardSettings.calcRealCost" class="f">
+      <div class="f field-wide cny-only-row">
+        <label class="cny-only-label">
+          <input type="checkbox" v-model="form.cnyOnly" />
+          仅使用人民币结算（固定 ¥）
+        </label>
+        <div class="f-cny-note">
+          勾选后该站点所有余额与花费固定按站点公布的汇率折算为人民币，不再按美元口径显示；「计价货币」将锁定 CNY，也不再做「真实人民币」二次换算。<br />
+          启用前采集的历史记录保留当时的币种（旧美元记录继续显示 $ 并单独分组），不追溯换算。取消勾选仅解除锁定，站点币种仍为 CNY。
+        </div>
+      </div>
+
+      <div v-if="dashboardSettings.calcRealCost && !form.cnyOnly" class="f">
         <label>充值比例</label>
         <input
           v-model="form.rechargeRate"
@@ -271,7 +291,7 @@ function handleSubmit() {
         </details>
       </div>
 
-      <div v-if="dashboardSettings.calcRealCost" class="f">
+      <div v-if="dashboardSettings.calcRealCost && !form.cnyOnly" class="f">
         <label>充值折扣</label>
         <input
           v-model="form.rechargeDiscount"
@@ -375,6 +395,12 @@ function handleSubmit() {
 .f input:focus, .f select:focus { outline: 2px solid var(--brand); outline-offset: 1px; }
 .f-hint { margin-top: 5px; font-size: 11px; color: var(--sub); line-height: 1.6; overflow-wrap: anywhere; }
 .f-hint summary { cursor: pointer; }
+/* 方案 054：固定人民币结算开关（不用 f-hint，避免影响表单布局测试的 details 计数） */
+.cny-only-row { padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); }
+.cny-only-label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text); cursor: pointer; margin: 0; }
+.cny-only-label input { width: 15px; height: 15px; accent-color: var(--brand); cursor: pointer; }
+.f-cny-note { margin-top: 8px; font-size: 11px; color: var(--sub); line-height: 1.7; overflow-wrap: anywhere; }
+.f select:disabled { opacity: .6; cursor: not-allowed; }
 .f-hint[open] summary { margin-bottom: 5px; }
 .steps { background: var(--panel-soft); border-radius: 10px; padding: 10px 14px; font-size: 11px; color: var(--sub); line-height: 1.7; margin-top: 16px; }
 .steps b { color: var(--text); }

@@ -1,5 +1,6 @@
 import { normalizeAlertRules, exportAlertRules } from '../shared/alertRules'
 import { invalidateSiteAlertState } from './alerts'
+import { normalizeSite } from '../shared/settlement'
 /**
  * 全量数据备份 / 还原（GPT terra High 评审通过后实现）。
  *
@@ -45,6 +46,10 @@ const SNAPSHOT_KEYS: (keyof Snapshot)[] = [
   // 统计接口 + IKunCode provider 采集字段（方案 §2/§7）
   'cumulativeInputTokens', 'cumulativeOutputTokens', 'totalConsumedCost', 'recent24hCost',
   'recent24hTokens', 'recent24hSource', 'usageWindow', 'todayCostSource', 'usageStatsSource',
+  // 方案 056：今日缓存命中与用量来源（与 todayTokens 同源同窗口）
+  'todayCacheReadTokens', 'todayUsageSource',
+  // 方案 057：明细来源与覆盖（明细表口径说明）
+  'usageDetailSource', 'usageDetailCoverage',
 ]
 const DAILY_KEYS: (keyof DailyStat)[] = [
   'siteId', 'date', 'tokens', 'requests', 'cost', 'currency', 'byModel', 'source',
@@ -57,6 +62,8 @@ const USAGE_BATCH_KEYS: (keyof UsageRecordBatch)[] = [
   'id', 'siteId', 'date', 'collectedAt', 'takenAt', 'records', 'totalTokens', 'recordCount',
   'costByCurrency', 'totalActualCostByCurrency', 'totalStandardCostByCurrency', 'totalRequests',
   'isComplete', 'truncatedReason', 'pageCount', 'schemaVersion', 'source',
+  // 方案 057：明细来源契约 + 逐条明细（仅展示通道）
+  'detailSource', 'detailCoverage', 'detailRecords',
 ]
 // diagnostics 为脱敏指纹，无秘密字段；导出保留 recordId、剔除自增 id，其余全留
 const DIAGNOSTIC_DROP_KEYS = ['id']
@@ -78,7 +85,7 @@ const MODEL_AVG_HISTORY_KEYS: (keyof ModelAvgHistory)[] = [
 // 且 lastError/lastAuthEvidence 可能携带诊断信息，不应随备份外泄。
 const SITE_KEYS: (keyof SiteConfig)[] = [
   'id', 'name', 'baseUrl', 'origin', 'adapter', 'color', 'enabled', 'order',
-  'createdAt', 'currency', 'discovered', 'customRequests',
+  'createdAt', 'currency', 'cnyOnly', 'discovered', 'customRequests',
   'rechargeRate', 'alerts',
 ]
 // 递归扫描禁止的敏感字段名（仅查字段名，不查值，避免 URL 等正常内容误报）
@@ -130,6 +137,8 @@ const PORTABLE_SETTING_KEYS = new Set<string>([
   // 模型均价（方案 048：显示开关 + 计算条目，均为用户偏好）
   'aihub.showModelAvgPrice',
   'aihub.modelAvgMaxRecords',
+  // 极简面板今日用量开关（方案 056）
+  'aihub.showTodayUsageInPopup',
   'aihub.updateCheckEnabled',
   // 实验室开关（均为用户偏好布尔，无敏感值）
   'aihub.lab.zeroTab',
@@ -326,10 +335,14 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
         continue
       }
       const found = byOrigin.get(origin)
+      // 方案 054：严格布尔 + 导入侧强制 CNY（本路径直接 db.sites.put，未经 siteRepo，
+      // 必须与 repo 共用同一个 normalizer 才能维持 cnyOnly=true => currency='CNY'）。
+      const effectiveCnyOnly = s.cnyOnly === true
+      const effectiveCurrency = effectiveCnyOnly ? 'CNY' : (s.currency || found?.currency || 'USD')
       // 导入侧：仅按 SITE_KEYS 投影（P0-1 双向白名单），非白名单字段一律丢弃；rechargeRate 复用严格校验
       const pickSite = pick(s, SITE_KEYS) as Partial<SiteConfig>
       if (Object.prototype.hasOwnProperty.call(s, 'alerts')) {
-        pickSite.alerts = normalizeAlertRules(s.alerts, s.currency || found?.currency || 'USD', found?.alerts)
+        pickSite.alerts = normalizeAlertRules(s.alerts, effectiveCurrency, found?.alerts)
       } else if (found?.alerts && s.currency && s.currency !== found.currency) {
         // An old backup changing currency cannot silently reinterpret enabled old thresholds.
         pickSite.alerts = normalizeAlertRules(found.alerts.map((r) => ({ ...r, enabled: false })), s.currency, found.alerts)
@@ -347,7 +360,8 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
           origin,
           baseUrl: s.baseUrl,
           adapter: s.adapter,
-          currency: s.currency || found.currency || 'USD',
+          currency: effectiveCurrency,
+          cnyOnly: effectiveCnyOnly,
           color: s.color || found.color,
           enabled: s.enabled ?? found.enabled,
           lastStatus: 'unknown',
@@ -373,7 +387,8 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
           createdAt: Date.now(),
           lastCollectAt: null,
           lastStatus: 'unknown',
-          currency: s.currency || 'USD',
+          currency: effectiveCurrency,
+          cnyOnly: effectiveCnyOnly,
         }
         siteWrites.push(site)
         byOrigin.set(origin, site)
@@ -393,8 +408,11 @@ export async function importAll(config: ExportConfig): Promise<ImportResult> {
       async () => {
         const credentialUpdatedAt = Date.now()
         for (const site of siteWrites) {
-          await invalidateSiteAlertState(await db.sites.get(site.id), site)
-          await db.sites.put(site)
+          // 方案 054：批量导入是唯一绕过 siteRepo 的站点写入口，必须过同一个 normalizer。
+          // 这里再归一一次，覆盖备份里 cnyOnly=true 但 currency 被写脏的组合。
+          const normalized = normalizeSite(site)
+          await invalidateSiteAlertState(await db.sites.get(normalized.id), normalized)
+          await db.sites.put(normalized)
           await db.credentials.put({
             siteId: site.id,
             method: 'cookie',

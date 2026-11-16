@@ -31,12 +31,13 @@ import {
   importAll,
 } from '../storage'
 import { applyCorsRules, refreshCorsRules } from './corsRules'
+import { getLabBearerAutoRefresh, setLabBearerAutoRefresh } from '../storage/autoRefreshLabConfig'
 import { applyIconBehavior } from './popupBehavior'
 import { collectAllInTabs, collectSpecificInTabs, probeSessionInTab, captureCustomInTab } from './pageCollect'
 import { applyInterval } from './scheduler'
 import { registry } from '../adapters'
 import { normalizeOrigin, isValidSiteUrl, todayKey, dateKey, dateKeyInTz, HUBWAY_TZ, HUBWAY_TZ_OFFSET_MIN, isValidDateKey } from '../shared/util'
-import { parseRechargeRate } from '../shared/recharge'
+import { parseRechargeRate, realRmb } from '../shared/recharge'
 import {
   readDashboardSettings,
   setCostWindow,
@@ -78,6 +79,8 @@ import type {
   LabZeroTabResponse,
   LabCorsPayload,
   LabCorsResponse,
+  LabBearerAutoRefreshPayload,
+  LabBearerAutoRefreshResponse,
   UpdateCheckStatusResponse,
   UpdateCheckEnabledPayload,
   LabShowDashboardPayload,
@@ -114,12 +117,14 @@ import type {
   SetModelAvgSettingsPayload,
   SetModelAvgSettingsResponse,
   GetModelAvgSourcePayload,
+  GetSiteUsageDetailPayload,
+  GetSiteUsageDetailResponse,
   GetModelAvgSourceResponse,
   GetSiteModelAvgHistoryPayload,
   GetSiteModelAvgHistoryResponse,
 } from '../core/messaging/protocol'
 import type { Req } from '../core/messaging/protocol'
-import type { SiteConfig, SiteCollectionProfile, AccountSemantics, ModelAvgPrice } from '../shared/types'
+import type { SiteConfig, SiteCollectionProfile, AccountSemantics, ModelAvgPrice, ModelAvgRawRecord } from '../shared/types'
 import { mergeModelAvgPrices } from '../core/modelAvgMerge'
 import { modelAvgRepo } from '../storage/modelAvgRepo'
 import { buildSiteCollectionProfile } from '../core/collectionProfile'
@@ -128,6 +133,7 @@ import { probeSiteEndpoints, type ProbeResult, type ProbeAttempt } from '../cont
 import { classifySite, type SiteFingerprint, type EndpointSignal } from '../core/classifySite'
 import { discoverNetworkRequests, type NetDiscoveryRequest } from './netDiscovery'
 import { checkForUpdate, dismissUpdate, getUpdateStatus, reconcileUpdateCheckAlarm, setUpdateCheckEnabled } from './updateCheck'
+import { effectiveSiteCurrency } from '../shared/settlement'
 
 type Handler = (payload: any, req: Req) => Promise<unknown>
 
@@ -425,10 +431,12 @@ export const handlers: Record<string, Handler> = {
    */
   async GET_SITE_COLLECTION_PROFILES(): Promise<GetSiteCollectionProfilesResponse> {
     const labEnabled = await getLabZeroTab()
-    const engine: 'page_main_world' | 'sw_lab' = labEnabled ? 'sw_lab' : 'page_main_world'
     const sites = await siteRepo.list()
     const profiles: Record<string, SiteCollectionProfile> = {}
     for (const site of sites) {
+      // 方案 054：SW 零标签旁路仅允许有效币种为 USD 的站点（非 USD 会落库未换算的 quota 原值）。
+      const engine: 'page_main_world' | 'sw_lab' =
+        labEnabled && effectiveSiteCurrency(site) === 'USD' ? 'sw_lab' : 'page_main_world'
       let latestDiag: any = null
       try {
         latestDiag = (await diagnosticsRepo.listBySite(site.id, 1))[0] ?? null
@@ -449,6 +457,10 @@ export const handlers: Record<string, Handler> = {
     const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] })
     if (!granted) throw new Error('未获得该站点的 host 权限，请在设置页添加并授权')
     const id = crypto.randomUUID()
+    // 方案 054：站点「仅人民币结算」是显式声明，写入边界即强制 currency='CNY'（不信任 UI 传入的币种）。
+    // 旧版 UI 不带 cnyOnly → false，行为完全不变。
+    const cnyOnly = payload.cnyOnly === true
+    const currency = cnyOnly ? 'CNY' : (payload.currency || 'USD')
     // 充值比例（新建可预填）：trim 后严格校验，非法直接报错（不落库脏值）
     const rrRaw = (typeof payload.rechargeRate === 'string' ? payload.rechargeRate : '').trim()
     if (rrRaw && parseRechargeRate(rrRaw) == null) {
@@ -466,10 +478,12 @@ export const handlers: Record<string, Handler> = {
       createdAt: Date.now(),
       lastCollectAt: null,
       lastStatus: 'unknown',
-      currency: payload.currency || 'USD',
-      alerts: normalizeAlertRules(payload.alerts === undefined ? [] : payload.alerts, payload.currency || 'USD'),
+      currency,
+      cnyOnly,
+      alerts: normalizeAlertRules(payload.alerts === undefined ? [] : payload.alerts, currency),
       ...(rrRaw ? { rechargeRate: rrRaw } : {}),
     }
+    // siteRepo.add 内部再过 normalizeSite（唯一写入不变量），此处已提前归一以便告警规则同币种。
     await siteRepo.add(site)
     await credentialRepo.setAuthorized(id, false) // 尚未授权
     void refreshCorsRules() // 若 CORS 放行开启，同步新增规则
@@ -509,6 +523,14 @@ export const handlers: Record<string, Handler> = {
     }
     if (payload.patch.enabled != null) patch.enabled = payload.patch.enabled
     if (payload.patch.currency != null) patch.currency = payload.patch.currency
+    // 方案 054：cnyOnly 是用户可编辑字段，严格布尔（拒脏值）；勾选时写入边界强制 CNY。
+    // repo 事务内还会再过一次 normalizeSite，覆盖并发 UPDATE。
+    if (payload.patch.cnyOnly !== undefined) patch.cnyOnly = payload.patch.cnyOnly === true
+    if (patch.cnyOnly === true) patch.currency = 'CNY'
+    // 有效结算币种（cnyOnly 优先）：告警规则迁移与失效一律以此为准，
+    // 这样仅提交 {cnyOnly:true}（patch 无 currency）也能停用旧 USD 阈值。
+    const prevEffectiveCurrency = effectiveSiteCurrency(existing)
+    const nextEffectiveCurrency = effectiveSiteCurrency({ ...existing, ...patch })
     // 用户可编辑字段白名单：UI 可改的站点配置，SW 单向拷贝；
     // 绝不在此暴露 discovered/lastStatus/lastCollectAt 等内部派生字段，防止 UI 误覆盖。
     // 新增可编辑字段只需在此数组追加，避免「忘了加白名单 → 配置丢失」的复发 bug。
@@ -526,9 +548,9 @@ export const handlers: Record<string, Handler> = {
       }
     }
     if (Object.prototype.hasOwnProperty.call(payload.patch, 'alerts')) {
-      patch.alerts = normalizeAlertRules(payload.patch.alerts, patch.currency ?? existing.currency ?? 'USD', existing.alerts)
-    } else if (patch.currency && patch.currency !== existing.currency && existing.alerts) {
-      patch.alerts = normalizeAlertRules(existing.alerts.map((r) => ({ ...r, enabled: false })), patch.currency, existing.alerts)
+      patch.alerts = normalizeAlertRules(payload.patch.alerts, nextEffectiveCurrency, existing.alerts)
+    } else if (nextEffectiveCurrency !== prevEffectiveCurrency && existing.alerts) {
+      patch.alerts = normalizeAlertRules(existing.alerts.map((r) => ({ ...r, enabled: false })), nextEffectiveCurrency, existing.alerts)
     }
     await siteRepo.update(payload.id, patch)
     void refreshCorsRules() // 若 CORS 放行开启，同步启用/禁用规则
@@ -1029,6 +1051,18 @@ export const handlers: Record<string, Handler> = {
       siteCurrency: site.currency ?? null,
       batchComplete: batch?.isComplete ?? true,
     })
+    // 方案 057 口径契约（GPT P0-4）：
+    //  detailSource   = 明细表实际展示来源（bucket=聚合桶 / call=逐条 / null=无）
+    //  pricingBasis   = 均价的计算基础；bucket=全天聚合（精确），call=逐条且已抓齐（精确），null=不完整
+    //  sample         = true 表示价格只是「最近 N 条样本均价」，不得当作全天均价展示
+    const detailSource = batch?.detailSource ?? (records.length > 0 ? 'bucket' : null)
+    const detailCoverage = batch?.detailCoverage ?? null
+    const pricingBasis: 'bucket' | 'call' | null =
+      detailSource === 'bucket'
+        ? 'bucket'
+        : detailSource === 'call' && (batch?.isComplete ?? false)
+          ? 'call'
+          : null
     return {
       siteId: site.id,
       rows: merged.rows,
@@ -1042,6 +1076,56 @@ export const handlers: Record<string, Handler> = {
       skippedCount: res.skippedCount,
       rechargeRate: site.rechargeRate ?? null,
       siteCurrency: site.currency ?? null,
+      detailSource,
+      detailCoverage,
+      pricingBasis,
+      sample: pricingBasis == null && res.summary.hasDetail,
+      detailCount: batch?.detailRecords?.length ?? 0,
+      detailTokens: (batch?.detailRecords ?? []).reduce((s, r) => s + (r.tokens || 0), 0),
+    }
+  },
+
+  // ── 方案 057：逐条明细懒加载（详情页「逐条明细 N 条」弹窗）──
+  async GET_SITE_USAGE_DETAIL(payload: GetSiteUsageDetailPayload): Promise<GetSiteUsageDetailResponse> {
+    const site = await siteRepo.get(payload?.siteId)
+    if (!site) throw new Error('站点不存在')
+    const isHubway = site.discovered?.usageListKind === 'hubway_v1'
+    const date = isHubway ? dateKeyInTz(Date.now(), HUBWAY_TZ) : todayKey()
+    const batch = await usageRecordsRepo.getBySiteDate(site.id, date)
+    const rows = batch?.detailRecords ?? []
+    const rate = parseRechargeRate(site.rechargeRate ?? null)
+    const siteCur = (site.currency ?? '').toUpperCase()
+    // 投影成与「数据来源」弹窗同构的原始记录（白名单字段；币种不一致者 rmb=null，绝不臆造汇率）
+    const records: ModelAvgRawRecord[] = rows.map((r) => {
+      const amount = r.actualCost != null ? r.actualCost : r.cost != null ? r.cost : null
+      const cur = r.actualCost != null ? (r.actualCostCurrency ?? null) : (r.costCurrency ?? null)
+      const same = !cur || !siteCur || cur.toUpperCase() === siteCur
+      const rmb = amount == null || !same
+        ? null
+        : cur && cur.toUpperCase() === 'CNY'
+          ? amount
+          : rate == null
+            ? null
+            : realRmb(amount, rate)
+      return {
+        ts: r.ts,
+        model: r.model,
+        promptTokens: r.promptTokens ?? 0,
+        completionTokens: r.completionTokens ?? 0,
+        amount,
+        listPrice: r.actualCost == null && r.cost != null,
+        currency: cur,
+        rmb,
+      }
+    })
+    return {
+      detailSource: batch?.detailSource ?? null,
+      detailCoverage: batch?.detailCoverage ?? null,
+      // detailRecords 存在即代表「不以桶为主口径」的情形，其完整性沿用批次 isComplete
+      isComplete: !!batch?.isComplete,
+      records,
+      tokens: rows.reduce((s, r) => s + (r.tokens || 0), 0),
+      count: rows.length,
     }
   },
 
@@ -1082,6 +1166,17 @@ export const handlers: Record<string, Handler> = {
 
   async SET_LAB_ZEROTAB(payload: LabZeroTabPayload): Promise<LabZeroTabResponse> {
     return { enabled: await setLabZeroTab(payload.enabled === true) }
+  },
+
+  // ── 实验室：新版 New API Bearer 会话「后台自动刷新」开关（方案 052 v2，默认关闭）──
+  // 仅控制定时 alarm 采集是否允许发起有副作用的 POST /api/user/auth/refresh。
+  // 手动「立即同步」不受此开关影响；开启后仍需通过只读协议确认 + Web Locks 三重门控。
+  async GET_LAB_BEARER_AUTO_REFRESH(): Promise<LabBearerAutoRefreshResponse> {
+    return { enabled: await getLabBearerAutoRefresh() }
+  },
+
+  async SET_LAB_BEARER_AUTO_REFRESH(payload: LabBearerAutoRefreshPayload): Promise<LabBearerAutoRefreshResponse> {
+    return { enabled: await setLabBearerAutoRefresh(payload.enabled === true) }
   },
 
   // ── 实验室：动态 CORS 放行开关（默认关闭）──
@@ -1178,6 +1273,13 @@ export const handlers: Record<string, Handler> = {
             todayCost: snap ? (snap.todayCost ?? null) : null,
             recent24hCost: snap ? (snap.recent24hCost ?? null) : null,
             rechargeRate: site.rechargeRate ?? null,
+            // 方案 054：下发固定人民币标记，极简面板据此按**记录自身币种**决定是否跳过二次换算。
+            cnyOnly: site.cnyOnly === true,
+            // 方案 056：今日用量（token / 请求数 / 缓存命中），极简面板直接展示，无需二次请求
+            todayTokens: snap ? (snap.todayTokens ?? null) : null,
+            todayRequests: snap ? (snap.todayRequests ?? null) : null,
+            todayCacheReadTokens: snap ? (snap.todayCacheReadTokens ?? null) : null,
+            todayUsageSource: snap ? (snap.todayUsageSource ?? null) : null,
             // 模型均价最小摘要（方案 048；开关关闭时为 undefined，UI 不渲染）
             modelAvg: await computeSiteModelAvg(site, settings),
           }

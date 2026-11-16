@@ -48,6 +48,17 @@ export function fmtNum(val: number | null): string {
   return val.toLocaleString('en-US')
 }
 
+/**
+ * 中文紧凑 Token 格式化（方案 056，极简面板 260px 专用）：
+ * ≥1 亿 → 9.07亿；≥1 万 → 38.0万；其余整数千分位。null / 非法 → 「—」。
+ */
+export function fmtTokenCn(val: number | null): string {
+  if (val == null || !Number.isFinite(val) || val < 0) return '—'
+  if (val >= 100_000_000) return (val / 100_000_000).toFixed(2) + '亿'
+  if (val >= 10_000) return (val / 10_000).toFixed(1) + '万'
+  return val.toLocaleString('en-US')
+}
+
 /** HH:MM 格式化。 */
 export function fmtTime(ts: number | null | undefined): string {
   if (!ts) return '—'

@@ -143,6 +143,13 @@ export interface SiteConfig {
   /** 计价货币（默认 USD；ikuncode 等以 ¥/CNY 计价的站点显式设置为 CNY）。仅影响展示符号，不参与跨币种相加（P1-3）。 */
   currency?: string
   /**
+   * 方案 054：站点「仅使用人民币结算」的显式声明（默认关闭）。
+   * 勾选后由 normalizeSite 强制 currency='CNY'，采集/快照/UI 恒按人民币口径，
+   * 且不再读取站点 quota_display_type。绝不接受非布尔脏值。
+   * 历史 USD 快照不回溯改写，仍按各自 currency 显示与分组（P1-3）。
+   */
+  cnyOnly?: boolean
+  /**
    * 页面主世界探测到的真实接口路径与站点分类（MV3 SW 无法直接读取 SPA 内部 API）。
    * 分类由 SW 侧 classifySite() 纯函数根据脱敏指纹判定，写入此字段。
    */
@@ -273,6 +280,17 @@ export interface Snapshot {
   todayCostSource?: 'dashboard_stats' | 'range_usage' | 'logs' | null
   /** 统计/账户指标来源：dashboard_stats / account_snapshot / range_usage / null。 */
   usageStatsSource?: 'dashboard_stats' | 'account_snapshot' | 'range_usage' | null
+  /**
+   * 今日缓存命中 token（方案 056）：仅当服务端提供精确 cache_read 时写入，否则 null。
+   * 与 todayTokens 同源同窗口，用于展示缓存占比（绝不跨源拼凑）。
+   */
+  todayCacheReadTokens?: number | null
+  /** 今日用量来源（方案 056）：data_self=小时/模型聚合桶 / usage_list=明细列表 / raw_logs=日志分页 / null=无。 */
+  todayUsageSource?: 'data_self' | 'usage_list' | 'raw_logs' | null
+  /** 明细来源（方案 057）：bucket=仅聚合桶 / call=逐条明细 / null=无。 */
+  usageDetailSource?: 'bucket' | 'call' | null
+  /** 明细覆盖范围（方案 057）：full_day_aggregate / all_day_exact / recent_incomplete。 */
+  usageDetailCoverage?: 'full_day_aggregate' | 'all_day_exact' | 'recent_incomplete' | null
 }
 
 /**
@@ -429,6 +447,13 @@ export interface UsageRecord {
   type: string | null
   /** 计费模式（hubway "计费模式" 列） */
   billingMode: string | null
+  /**
+   * 记录粒度（方案 056）：'call'=逐次调用（默认，缺省视同 call）；
+   * 'bucket'=服务端按「小时×模型」聚合的桶（一条记录代表 N 次调用，禁止当作一次调用统计）。
+   */
+  granularity?: 'call' | 'bucket'
+  /** 该记录代表的调用次数（bucket 专用；call 记录缺省视同 1）。仅 granularity='bucket' 有意义。 */
+  requestCount?: number
 }
 
 /**
@@ -537,6 +562,18 @@ export interface UsageRecordBatch {
   schemaVersion: number
   /** 来源适配器：hubway_v1 | generic */
   source: string
+  /**
+   * 方案 057：明细来源（明细表实际展示的来源）。
+   * bucket = 只有聚合桶（服务端全天聚合，非逐条）；call = 逐条调用日志；缺省 = 未区分（旧批次）。
+   */
+  detailSource?: 'bucket' | 'call' | null
+  /** 方案 057：明细覆盖范围（full_day_aggregate / all_day_exact / recent_incomplete）。 */
+  detailCoverage?: 'full_day_aggregate' | 'all_day_exact' | 'recent_incomplete' | null
+  /**
+   * 方案 057：逐条调用明细（仅在 records 主口径为聚合桶时提供）。
+   * 只用于明细表展示；不参与趋势、分布与模型均价计算，避免与桶重复计数。
+   */
+  detailRecords?: UsageRecord[]
 }
 
 /** usageCache 单条缓存（DB v4 新增）。只缓存昂贵聚合/分页结果，不缓存原始记录。 */
@@ -604,6 +641,11 @@ export interface UsageTrendPoint {
   /** 桶内命中率（0-1，UI 自行 *100 显示为 %） */
   cacheHitRate: number
   requests: number
+  /**
+   * 桶内 token 总量（方案 056）：仅当数据源只提供总量、无 input/output 拆分时填充。
+   * 消费方应优先展示该序列，不得把它塞进 input/output 伪装成拆分（GPT P0-2）。
+   */
+  totalTokens?: number
 }
 
 /** 详情表过滤项。 */

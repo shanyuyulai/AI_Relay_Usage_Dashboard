@@ -2,6 +2,50 @@
 
 本文件记录「AI 中转站用量看板」的版本变更。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本（主版本.次版本.修订号）。
 
+## [0.6.0] - 2026-11-16
+
+本版本核心：用量统计口径固化（今日用量上极简面板、模型均价可追溯到逐条明细）、站点级「仅人民币结算」、新版 New API 二开版站点采集修复。
+
+### 新增
+- **极简面板「今日用量」行**（方案 056）
+  - 余额下方显示 `今日 9.07亿 tok · 2,010 次`，并单独标注 `缓存 98.9%`；
+  - 无精确用量接口时显示「—」，绝不估算；设置页可单独关闭（`极简面板显示今日用量`，默认开启）。
+- **用量统计三层口径**（方案 056）
+  - 今日花费权威值：站点统计接口 `/api/log/self/stat`（`data.quota`）；
+  - 模型均价主源与花费兜底：`/api/data/self` 小时×模型聚合桶（服务端对当天全量汇总）；
+  - 逐条日志仅作兜底与明细展示，分页上限 20 页 / 2000 条，按服务端 `total` 判定完整性，截断标记「不完整」而不当完整总量使用。
+- **聚合桶识别**：`UsageRecord.granularity='bucket'` + `requestCount`，明细表显示「聚合」标签与真实请求次数，趋势图新增独立「总量」序列（不污染输入/输出拆分）。
+- **独立明细通道**（方案 057）
+  - `/api/log/self?p=1&page_size=100&start_timestamp&end_timestamp&type=2`，默认 5 页 / 500 条；
+  - `rl:<log.id>` 命名空间主键 + 真去重；跨页时间倒序断点 / 页长异常 / 早于当日零点 → 标 `anomaly` 并判为不完整；
+  - 明细**只用于展示**，不参与均价、不改写今日总量；新增 `GET_SITE_USAGE_DETAIL` 供详情页懒加载逐条记录。
+- **均价基础三态**（方案 057）：`全天小时聚合` / `逐条明细 N 条` / `样本均价（未覆盖全天）`；采样数据不再冒充全天均价。
+- **站点级「仅人民币结算」**（方案 054）
+  - 站点表单新增勾选项，勾选后币种锁定 CNY，对旧数据中 `currency` 被写脏的情况同样生效；
+  - 新增 `shared/settlement.ts` 作为唯一真源（`effectiveSiteCurrency` / `effectiveRechargeRate` / `normalizeSite`），`siteRepo.add` / `siteRepo.update` / 表单 / 告警失效 / 备份导入共用同一不变量；
+  - 告警规则币种比较改用「有效结算币种」，仅切换开关不会再误判为币种变更。
+- **实验室：后台自动刷新会话**（方案 052 v2，默认关闭）
+  - 面向「短期 Bearer access_token + HttpOnly refresh Cookie」的新版 New API 二开版站点；
+  - 定时采集发起 refresh 需同时满足：开关开启 + 只读协议确认通过 + 浏览器支持 Web Locks（与页面共用 `new-api:auth-refresh` 独占锁），任一不满足即 fail closed；
+  - 手动「立即同步」始终允许，不受开关影响；access_token 只在本次采集内存闭包内使用，不落库、不导出。
+
+### 修复
+- **新版 New API 站点采集失败**（方案 052）：会话校验把 `user.role` 当字符串判断，而站点返回数字 → 令牌提取失败 → 余额与用量全部 401。改为数字/字符串双兼容。
+- **模型价格详情显示「该站点无逐条用量明细」**（方案 057）：`hasDetail` 只来自批次 `records.length`，而小时聚合与日志两条分支只累加数字、从不产出记录。现由 `detailSource` 驱动文案，明细通道独立抓取。
+- **小时聚合分支解析恒为 null**（方案 057）：`extractRangeUsage` 首行只接受 object，而该分支传入的是已解包的数组 → 改为 `Array.isArray(data) ? data : unwrapStats(data)`，该分支首次真正生效。
+- **固定人民币站点模型均价恒为空**：`computeModelPrices` 全局 `!missingRate` 否决 + 只认 `rechargeRate`，无充值比例的 CNY 站点算不出价格。改为 CNY 记录按 1:1，只对需要汇率换算的币种要求比例。
+- **内网站点余额显示 $8.88 而非 ¥64.81**（方案 053/054）：`quota/500000` 后未乘站点汇率；由「仅人民币结算」显式声明解决，不采用「从 `/api/status` 自动推导币种」的高风险做法。
+- **更新检测误报**：远端版本比本地旧时也会提醒 → 改为逐段数值比较（`isNewerVersion`）；启动时一次性清洗旧版遗留的 Releases 缓存与旧跳转地址。
+- **日志分页参数**：`p=0` → `p=1`（站点为 1-based），并补 `type=2` 过滤。
+
+### 优化
+- 极简面板 / 侧边栏 / 设置页更新提示统一为「新版本 vX 可用（本地 vY）」。
+- `settingsRepo` 新增 `remove()`，用于清理旧缓存键。
+- 备份/导出字段白名单同步新增 `todayCacheReadTokens`、`todayUsageSource`、`detailSource`、`detailCoverage`、`detailRecords`、`granularity`、`requestCount`（仍不含任何凭证）。
+
+### 文档
+- 使用说明弹窗（`public/README.html`）新增 0.6.0 更新记录；补充「今日用量行」「模型均价怎么算」「仅人民币结算」三处说明。
+
 ## [0.5.1] - 2026-10-14
 
 本版本核心：模型价格显示优化（四舍五入 + 悬停精确值）、站点均价历史回退、设置页布局整理。
@@ -13,7 +57,7 @@
 
 ### 修复
 - 「模型价格详情」窗口措辞：因价格支持历史档案回退，不再全是当日数据，「当日逐条明细」统一更正为「逐条用量明细」，并补充「档」标注说明。
-- 更新检测更正：仓库以 tags 标记版本，检查更新改用 GitHub Tags API（取语义化版本最大的标签），判定口径为远端最新版本与本地不一致即提醒；横幅 / 通知 / 「打开版本页」统一跳转 `github.com/shanyuyulai/AI_Relay_Usage_Dashboard/tags`。
+- 更新检测更正：仓库以 tags 标记版本，检查更新改用 GitHub Tags API（取语义化版本最大的标签），仅当远端版本比本地新时才提醒，并自动清洗旧版遗留的 Releases 缓存（错误版本号与旧跳转地址）；横幅 / 通知 / 「打开版本页」统一跳转 `github.com/shanyuyulai/AI_Relay_Usage_Dashboard/tags`。
 
 ### 文档
 - 使用说明弹窗（README.html）新增 0.5.1 更新记录，同步「模型价格」功能描述。

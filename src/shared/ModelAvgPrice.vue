@@ -115,7 +115,14 @@ onBeforeUnmount(() => {
       <template v-else>
         <div v-if="rangeText" class="map-range">{{ rangeText }}</div>
         <div v-if="data?.missingRate" class="map-note">未填充值比例，无法换算人民币（去设置页填写充值比例）</div>
-        <div v-else-if="data && !data.hasDetail" class="map-note">该站点无逐条用量明细，暂不支持模型价格</div>
+        <div v-else-if="data && !data.hasDetail" class="map-note">该站点未返回可用用量数据（既无小时聚合桶，也无逐条明细）</div>
+        <div v-if="data?.hasDetail" class="map-note src">
+          {{ data.pricingBasis === 'bucket'
+            ? '均价基础：全天小时聚合（服务端汇总，非逐条）'
+            : data.pricingBasis === 'call'
+              ? '均价基础：今日逐条明细（已抓齐）'
+              : '样本均价：仅最近若干条明细，未覆盖全天' }}
+        </div>
         <div v-if="data?.partial" class="map-note">当日明细超上限，按已采集部分计算</div>
         <table v-if="data?.rows?.length" class="map-table">
           <thead>

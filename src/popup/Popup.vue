@@ -11,6 +11,8 @@ import type {
 } from '../core/messaging/protocol'
 import { isValidSiteUrl } from '../shared/util'
 import { fmtTodayCost, fmtBalanceRmb } from '../shared/recharge'
+import { fmtTokenCn, fmtNum } from '../shared/format'
+import { effectiveRechargeRate } from '../shared/settlement'
 import { AIHUB_SETTINGS_CHANGED } from '../shared/dashboardSettings'
 import ModelAvgPrice from '../shared/ModelAvgPrice.vue'
 import { openAvgDetailWindow } from '../shared/avgDetailWindow'
@@ -32,6 +34,7 @@ const settings = ref<DashboardSettings>({
   balanceRmbMode: false,
   showModelAvgPrice: true,
   modelAvgMaxRecords: 200,
+  showTodayUsageInPopup: true,
 })
 const loading = ref(true)
 const error = ref('')
@@ -41,7 +44,11 @@ const notice = ref('')
 // 花费统计周期（今日 / 24 小时）+ 真实总花费（跨币种不直接相加，先换算人民币再求和）
 const costWindow = computed<CostWindow>(() => normalizeCostWindow(settings.value.costWindow))
 const calcRealCost = computed(() => settings.value.calcRealCost === true)
-const costTotal = computed(() => sumCostTotal(items.value, costWindow.value, calcRealCost.value))
+const costTotal = computed(() => sumCostTotal(
+  // 方案 054：聚合同样按每条记录自身币种取有效充值比例，避免总花费口径与单行不一致。
+  items.value.map((it) => ({ ...it, rechargeRate: rowRate(it) })),
+  costWindow.value, calcRealCost.value,
+))
 const costText = computed(() => fmtCostTotal(costTotal.value, calcRealCost.value, costWindow.value))
 
 /** 切换花费统计周期：本地立即生效（两个周期字段已随摘要下发），再持久化 + 广播给侧边栏。
@@ -70,15 +77,21 @@ const latestUpdatedAt = computed<number | null>(() => {
 })
 const costTitleWithAsOf = computed(() => `${costText.value.title}${fmtAsOf(latestUpdatedAt.value)}`)
 
+/** 方案 054：按记录自身币种取有效充值比例；固定人民币站点的新 CNY 数据不再二次换算，
+ *  启用前的旧 USD 记录仍保留原语义。 */
+function rowRate(it: DashboardSummaryItem): string | null {
+  return effectiveRechargeRate(it, it.currency)
+}
+
 /** 站点余额文本：人民币模式下按充值比例换算，比例无效则显示原币种。 */
 function balText(it: DashboardSummaryItem): string {
-  return fmtBalanceRmb(it.balance ?? null, it.currency, it.rechargeRate ?? null, balanceRmbMode.value).text
+  return fmtBalanceRmb(it.balance ?? null, it.currency, rowRate(it), balanceRmbMode.value).text
 }
 function balTitle(it: DashboardSummaryItem): string {
-  return fmtBalanceRmb(it.balance ?? null, it.currency, it.rechargeRate ?? null, balanceRmbMode.value).title
+  return fmtBalanceRmb(it.balance ?? null, it.currency, rowRate(it), balanceRmbMode.value).title
 }
 function balIsRmb(it: DashboardSummaryItem): boolean {
-  return fmtBalanceRmb(it.balance ?? null, it.currency, it.rechargeRate ?? null, balanceRmbMode.value).isRmb
+  return fmtBalanceRmb(it.balance ?? null, it.currency, rowRate(it), balanceRmbMode.value).isRmb
 }
 
 /** 点击任一站点余额 → 全局切换（所有站点一起变），持久化 + 广播。 */
@@ -95,7 +108,34 @@ async function toggleBalanceRmbMode() {
 
 /** 站点行花费：按当前周期取 todayCost / recent24hCost，无数据显示「—」。 */
 function rowCost(it: DashboardSummaryItem): string {
-  return fmtTodayCost(pickCost(it, costWindow.value), it.currency, it.rechargeRate ?? null, calcRealCost.value)
+  return fmtTodayCost(pickCost(it, costWindow.value), it.currency, rowRate(it), calcRealCost.value)
+}
+
+// ── 今日用量（方案 056）：token 总量（含缓存）+ 请求数；无数据显示「—」 ──
+function todayUsageText(it: DashboardSummaryItem): string {
+  const parts: string[] = []
+  if (it.todayTokens != null) parts.push(fmtTokenCn(it.todayTokens) + ' tok')
+  if (it.todayRequests != null) parts.push(fmtNum(it.todayRequests) + ' 次')
+  return parts.length ? '今日 ' + parts.join(' · ') : '今日 —'
+}
+
+/** 缓存命中占比：仅在两个字段同源可用且 tokens>0 时展示；否则返回空串（绝不显示 0%）。 */
+function cacheText(it: DashboardSummaryItem): string {
+  const c = it.todayCacheReadTokens
+  const t = it.todayTokens
+  if (c == null || t == null || t <= 0 || c < 0 || c > t) return ''
+  const pct = (c / t) * 100
+  if (!Number.isFinite(pct)) return ''
+  return `缓存 ${pct >= 99.95 ? '≈100' : pct.toFixed(1)}%`
+}
+
+/** 今日用量的悬浮说明：标明口径（含缓存）与数据来源，避免被误读。 */
+function usageTitle(it: DashboardSummaryItem): string {
+  const src = it.todayUsageSource === 'data_self' ? '站点小时聚合'
+    : it.todayUsageSource === 'usage_list' ? '站点用量明细'
+    : it.todayUsageSource === 'raw_logs' ? '站点日志分页'
+    : '未知来源'
+  return `今日用量（自然日，口径含缓存命中）｜来源：${src}`
 }
 
 // ── 模型均价详情（方案 049r1）：双击任一均价数字 → 打开独立详情窗口（不受 popup 尺寸限制） ──
@@ -254,13 +294,18 @@ onUnmounted(() => {
             {{ rowCost(it) }}
           </div>
         </div>
+        <!-- 第三行（方案 056）：今日用量（token · 请求数）+ 缓存命中占比 -->
+        <div v-if="settings.showTodayUsageInPopup" class="pop-row-usage" :title="usageTitle(it)">
+          <span class="pu-main">{{ todayUsageText(it) }}</span>
+          <span v-if="cacheText(it)" class="pu-cache">{{ cacheText(it) }}</span>
+        </div>
       </li>
     </ul>
 
     <!-- 自动检测更新横幅（方案 051）：点击打开版本页（tags），✕ 忽略此版本 -->
     <div v-if="updShow" class="upd-banner">
       <button class="upd-link" title="前往 GitHub 版本页下载更新" @click="openReleasesPage">
-        🆕 最新版本 v{{ upd!.latestVersion }}（本地 v{{ upd!.currentVersion }}），点击前往版本页
+        🆕 新版本 v{{ upd!.latestVersion }} 可用（本地 v{{ upd!.currentVersion }}），点击前往版本页
       </button>
       <button class="upd-x" title="忽略此版本" @click="dismissUpd">✕</button>
     </div>
@@ -472,6 +517,28 @@ onUnmounted(() => {
   /* 三列布局（方案 048）：右列撑满剩余空间并右对齐，使中列均价尽量居中 */
   flex: 1 1 0;
   text-align: right;
+}
+/* 第三行：今日用量（方案 056） */
+.pop-row-usage {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--sub);
+  font-variant-numeric: tabular-nums;
+}
+.pu-main {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pu-cache {
+  flex: 0 0 auto;
+  opacity: 0.85;
+  white-space: nowrap;
 }
 .dot {
   width: 7px;

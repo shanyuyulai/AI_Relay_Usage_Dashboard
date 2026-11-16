@@ -21,19 +21,22 @@ const COST_WINDOW_KEY = 'aihub.costWindow'
 const BALANCE_RMB_KEY = 'aihub.balanceRmbMode'
 const SHOW_MODEL_AVG_KEY = 'aihub.showModelAvgPrice'
 const MODEL_AVG_MAX_RECORDS_KEY = 'aihub.modelAvgMaxRecords'
+/** 方案 056：极简面板显示今日用量（token / 请求数）。默认开启。 */
+const SHOW_TODAY_USAGE_KEY = 'aihub.showTodayUsageInPopup'
 
 /** 广播消息类型（popup / sidepanel 监听后重载）。 */
 export const AIHUB_SETTINGS_CHANGED = 'AIHUB_SETTINGS_CHANGED'
 
 /** 从 db.settings 读取各开关与花费周期（缺失/非法 → 默认值）。 */
 export async function readDashboardSettings(): Promise<DashboardSettings> {
-  const [a, b, c, d, e, f] = await Promise.all([
+  const [a, b, c, d, e, f, g] = await Promise.all([
     settingsRepo.get<boolean>(CALC_REAL_COST_KEY),
     settingsRepo.get<boolean>(SHOW_TODAY_COST_KEY),
     settingsRepo.get<string>(COST_WINDOW_KEY),
     settingsRepo.get<boolean>(BALANCE_RMB_KEY),
     settingsRepo.get<boolean>(SHOW_MODEL_AVG_KEY),
     settingsRepo.get<number>(MODEL_AVG_MAX_RECORDS_KEY),
+    settingsRepo.get<boolean>(SHOW_TODAY_USAGE_KEY),
   ])
   return {
     calcRealCost: a === true,
@@ -43,6 +46,8 @@ export async function readDashboardSettings(): Promise<DashboardSettings> {
     // 方案 048：模型均价默认开启；仅显式 false 关闭（不覆盖既有用户配置）
     showModelAvgPrice: e !== false,
     modelAvgMaxRecords: normalizeModelAvgMaxRecords(f),
+    // 方案 056：今日用量默认开启；仅显式 false 关闭
+    showTodayUsageInPopup: g !== false,
   }
 }
 
@@ -54,6 +59,7 @@ export const dashboardSettings = reactive<DashboardSettings>({
   balanceRmbMode: false,
   showModelAvgPrice: true,
   modelAvgMaxRecords: 200,
+  showTodayUsageInPopup: true,
 })
 
 /** options 页面挂载时载入一次，同步响应式 store。 */
@@ -65,6 +71,7 @@ export async function loadDashboardSettings(): Promise<DashboardSettings> {
   dashboardSettings.balanceRmbMode = s.balanceRmbMode
   dashboardSettings.showModelAvgPrice = s.showModelAvgPrice
   dashboardSettings.modelAvgMaxRecords = s.modelAvgMaxRecords
+  dashboardSettings.showTodayUsageInPopup = s.showTodayUsageInPopup
   return s
 }
 
@@ -120,5 +127,13 @@ export async function setModelAvgMaxRecords(v: number): Promise<void> {
   const n = normalizeModelAvgMaxRecords(v)
   await settingsRepo.set(MODEL_AVG_MAX_RECORDS_KEY, n)
   dashboardSettings.modelAvgMaxRecords = n
+  await broadcastSettingsChanged()
+}
+
+/** 写入「极简面板显示今日用量」并广播（方案 056）。 */
+export async function setShowTodayUsageInPopup(v: boolean): Promise<void> {
+  const on = v === true
+  await settingsRepo.set(SHOW_TODAY_USAGE_KEY, on)
+  dashboardSettings.showTodayUsageInPopup = on
   await broadcastSettingsChanged()
 }

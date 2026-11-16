@@ -12,6 +12,7 @@ import { isValidSiteUrl } from '../shared/util'
 import { shouldShowReauthorize } from '../core/authState'
 import { getLabShowDashboard, LAB_SHOWDASHBOARD_CHANGED } from '../storage/labConfig'
 import { fmtTodayCostParts, fmtBalanceRmb } from '../shared/recharge'
+import { effectiveRechargeRate } from '../shared/settlement'
 import { AIHUB_SETTINGS_CHANGED } from '../shared/dashboardSettings'
 import {
   normalizeCostWindow,
@@ -105,7 +106,8 @@ const costTotal = computed(() =>
       todayCost: s.latest?.todayCost ?? null,
       recent24hCost: s.latest?.recent24hCost ?? null,
       currency: s.latest?.currency ?? null,
-      rechargeRate: s.site.rechargeRate ?? null,
+      // 方案 054：按记录自身币种决定是否跳过二次换算，旧 USD 快照保留原语义。
+      rechargeRate: effectiveRechargeRate(s.site, s.latest?.currency ?? null),
     })),
     costWindow.value,
     calcRealCost.value,
@@ -130,7 +132,8 @@ async function toggleCostWindow() {
 const balanceRmbMode = computed(() => dashboard.value?.settings?.balanceRmbMode === true)
 
 function balParts(site: SiteConfig, latest: Snapshot | undefined) {
-  return fmtBalanceRmb(latest?.balance ?? null, latest?.currency ?? null, site.rechargeRate ?? null, balanceRmbMode.value)
+  return fmtBalanceRmb(latest?.balance ?? null, latest?.currency ?? null,
+    effectiveRechargeRate(site, latest?.currency ?? null), balanceRmbMode.value)
 }
 
 async function toggleBalanceRmbMode() {
@@ -272,7 +275,7 @@ function windowCostParts(site: SiteConfig, latest: Snapshot | undefined) {
   return fmtTodayCostParts(
     pickCost(latest, costWindow.value),
     latest?.currency ?? null,
-    site.rechargeRate ?? null,
+    effectiveRechargeRate(site, latest?.currency ?? null),
     calcRealCost.value,
   )
 }
@@ -396,7 +399,7 @@ onUnmounted(() => {
     <!-- 自动检测更新横幅（方案 051）：点击打开版本页（tags），✕ 忽略此版本 -->
     <div v-if="upd?.hasUpdate && !upd.dismissed" class="sp-upd">
       <button class="u-link" title="前往 GitHub 版本页下载更新" @click="openReleasesPage">
-        🆕 最新版本 v{{ upd.latestVersion }}（本地 v{{ upd.currentVersion }}），点击前往版本页
+        🆕 新版本 v{{ upd.latestVersion }} 可用（本地 v{{ upd.currentVersion }}），点击前往版本页
       </button>
       <button class="u-x" title="忽略此版本" @click="dismissUpd">✕</button>
     </div>

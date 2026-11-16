@@ -1,5 +1,6 @@
 import { invalidateSiteAlertState } from './alerts'
 import { db } from './db'
+import { normalizeSite } from '../shared/settlement'
 import type { SiteConfig, SettingsRow } from '../shared/types'
 
 // 站点配置仓储（唯一读写入口，UI/采集层不直接碰 Dexie）
@@ -14,17 +15,27 @@ export const siteRepo = {
   },
 
   async add(site: SiteConfig): Promise<void> {
-    await db.sites.add(site)
+    // 方案 054：所有站点写入口共用 normalizer，杜绝 cnyOnly=true + currency!=='CNY' 的脏组合。
+    await db.sites.add(normalizeSite(site))
   },
 
   async update(id: string, patch: Partial<SiteConfig>): Promise<void> {
-    if (['alerts', 'currency', 'enabled', 'origin'].some((key) => Object.prototype.hasOwnProperty.call(patch, key))) {
+    // cnyOnly 必须进触发键：仅提交 {cnyOnly:true}（patch 无 currency）时也要走事务，
+    // 否则会跳过告警失效判断。GPT 评审第 3 轮硬约束 1。
+    if (['alerts', 'currency', 'enabled', 'origin', 'cnyOnly'].some((key) => Object.prototype.hasOwnProperty.call(patch, key))) {
       await db.transaction('rw', db.sites, db.alertBaselines, db.alertDeliveries, async () => {
         const previous = await db.sites.get(id)
         if (!previous) return
-        const next = { ...previous, ...patch }
+        // 合并 patch **之后**再归一：覆盖并发 UPDATE（A 设 cnyOnly:true、B 设 currency:'USD'
+        // 交错时，事务内读到的最终状态仍会被强制成 CNY）。
+        const next = normalizeSite({ ...previous, ...patch })
         await invalidateSiteAlertState(previous, next)
-        await db.sites.update(id, { ...patch, alertGeneration: next.alertGeneration })
+        await db.sites.update(id, {
+          ...patch,
+          currency: next.currency,
+          cnyOnly: next.cnyOnly,
+          alertGeneration: next.alertGeneration,
+        })
       })
     } else {
       await db.sites.update(id, patch)
@@ -98,6 +109,9 @@ export const settingsRepo = {
   },
   async set(key: string, value: unknown): Promise<void> {
     await db.settings.put({ key, value } as SettingsRow)
+  },
+  async remove(key: string): Promise<void> {
+    await db.settings.delete(key)
   },
 }
 

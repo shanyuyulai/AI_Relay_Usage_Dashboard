@@ -41,9 +41,12 @@ test('desktop grid has two columns and narrow viewport explicitly restores a sin
 test('site controls and save/permission flow bindings remain present with disclosure help', () => {
   const { descriptor } = component('SiteForm')
   const template = descriptor.template.content
-  for (const name of ['name', 'baseUrl', 'adapter', 'currency', 'rechargeRate', 'rechargeDiscount']) {
+  for (const name of ['name', 'baseUrl', 'adapter', 'currency', 'cnyOnly', 'rechargeRate', 'rechargeDiscount']) {
     assert.ok(template.includes(`v-model="form.${name}"`))
   }
+  // 方案 054：固定人民币站点锁定计价货币下拉，避免 cnyOnly=true + USD 组合
+  assert.ok(template.includes(':disabled="form.cnyOnly"'))
+  assert.ok(template.includes('仅使用人民币结算'))
   assert.ok(template.includes('v-model="alertDrafts"'))
   assert.ok(template.includes(':disabled="submitting" @click="handleSubmit"'))
   assert.equal((template.match(/<details class="f-hint">/g) ?? []).length, 3)

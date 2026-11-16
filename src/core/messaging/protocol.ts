@@ -112,6 +112,8 @@ export interface AddSitePayload {
   name: string
   baseUrl: string
   currency?: string
+  /** 方案 054：站点「仅使用人民币结算」显式声明；旧版 UI 不带此字段即视为 false。 */
+  cnyOnly?: boolean
   /** 可选：新建站点时预填的充值比例（"10" 或 "1:1.1"），保存前严格校验。 */
   rechargeRate?: string
 }
@@ -261,6 +263,8 @@ export interface UsageTrendPointDto {
   cacheReadTokens: number
   cacheHitRate: number
   requests: number
+  /** 方案 056：仅总量口径（无 input/output 拆分）的 token 总量；UI 单独成线。 */
+  totalTokens?: number
 }
 export interface GetUsageDashboardResponse {
   siteId: string
@@ -357,6 +361,14 @@ export interface LabCorsResponse {
   enabled: boolean
 }
 
+// ── 实验室：新版 New API Bearer 会话后台自动刷新（方案 052 v2，默认关闭） ──
+export interface LabBearerAutoRefreshPayload {
+  enabled: boolean
+}
+export interface LabBearerAutoRefreshResponse {
+  enabled: boolean
+}
+
 // ── 自动检测更新（方案 051） ───────────────
 export interface UpdateCheckStatusResponse {
   enabled: boolean
@@ -414,6 +426,11 @@ export interface DashboardSettings {
   showModelAvgPrice: boolean
   /** 模型均价计算条目（方案 048 可配置项②）：取当日明细最近 N 条；默认 200。 */
   modelAvgMaxRecords: number
+  /**
+   * 极简面板显示今日用量（方案 056）：开启后在站点行显示「今日 token 数 · 请求数」。
+   * 默认开启（用量是核心指标）；数据缺失时显「—」，不隐藏整行以免误读为 0。
+   */
+  showTodayUsageInPopup: boolean
 }
 
 /**
@@ -446,6 +463,18 @@ export interface GetSiteModelPricesResponse {
   rechargeRate: string | null
   /** 站点计价币种（P1-3 展示用）。 */
   siteCurrency: string | null
+  /** 方案 057：明细表实际展示的来源（bucket=聚合桶 / call=逐条明细 / null=无）。 */
+  detailSource?: 'bucket' | 'call' | null
+  /** 方案 057：明细覆盖范围（full_day_aggregate / all_day_exact / recent_incomplete）。 */
+  detailCoverage?: 'full_day_aggregate' | 'all_day_exact' | 'recent_incomplete' | null
+  /** 方案 057：均价计算基础；bucket=全天聚合（精确）、call=逐条且已抓齐（精确）、null=不完整。 */
+  pricingBasis?: 'bucket' | 'call' | null
+  /** 方案 057：true = 当前价格只是「最近 N 条样本均价」，不得当作全天均价展示。 */
+  sample?: boolean
+  /** 方案 057：逐条明细条数（明细表头部展示「逐条 N 条」）。 */
+  detailCount?: number
+  /** 方案 057：逐条明细的 token 合计（仅展示，绝不与今日总量相加）。 */
+  detailTokens?: number
 }
 
 // ── 模型均价档案（方案 050）──
@@ -456,6 +485,21 @@ export interface GetModelAvgSourcePayload {
 /** 单模型均价档案（含来源原始记录投影）；无档案时 null。 */
 export interface GetModelAvgSourceResponse {
   price: ModelAvgPrice | null
+}
+/** 方案 057：逐条明细（明细表懒加载；仅当批次另有 detailRecords 时才有数据）。 */
+export interface GetSiteUsageDetailPayload {
+  siteId: string
+}
+export interface GetSiteUsageDetailResponse {
+  /** 明细来源：call=逐条日志 / bucket=聚合桶 / null=无 */
+  detailSource: 'bucket' | 'call' | null
+  detailCoverage: 'full_day_aggregate' | 'all_day_exact' | 'recent_incomplete' | null
+  /** 逐条明细是否完整（false=仅最近若干条，不代表全天） */
+  isComplete: boolean
+  /** 投影后的原始记录（白名单字段，无凭证） */
+  records: ModelAvgRawRecord[]
+  tokens: number
+  count: number
 }
 export interface GetSiteModelAvgHistoryPayload {
   siteId: string
@@ -489,6 +533,17 @@ export interface DashboardSummaryItem {
   todayCost?: number | null // 取自最新快照 snap.todayCost（站点本币，自然日口径）
   recent24hCost?: number | null // 取自最新快照 snap.recent24hCost（站点本币，滚动近 24h 口径）
   rechargeRate?: string | null // 取自 site.rechargeRate（原始写法）
+  /** 方案 054：站点是否固定人民币结算；极简面板据此按记录币种决定是否跳过二次换算。 */
+  cnyOnly?: boolean
+  // ── 今日用量（方案 056）：全部可选，缺失即无数据，UI 显「—」──
+  /** 今日 token 总量（含缓存命中，与站点 token_used 同口径）。 */
+  todayTokens?: number | null
+  /** 今日请求数。 */
+  todayRequests?: number | null
+  /** 今日缓存命中 token（用于展示缓存占比；无精确值时为 null）。 */
+  todayCacheReadTokens?: number | null
+  /** 今日用量来源：data_self / usage_list / raw_logs / null。 */
+  todayUsageSource?: 'data_self' | 'usage_list' | 'raw_logs' | null
   // 模型均价最小摘要（方案 048；开关关闭/未计算时缺省 undefined）
   modelAvg?: ModelAvgSummary
 }

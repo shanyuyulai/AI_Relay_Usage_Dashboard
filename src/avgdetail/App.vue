@@ -17,6 +17,7 @@ import type {
   ModelAvgSummary,
   GetModelAvgSourceResponse,
   GetSiteModelAvgHistoryResponse,
+  GetSiteUsageDetailResponse,
 } from '../core/messaging/protocol'
 import type { ModelAvgRawRecord, ModelAvgHistory } from '../shared/types'
 import { fmtAvgText, fmtTokens, fmtRowPrice, fmtRange, fmtRangeShort, fmtExact } from '../shared/modelAvgFormat'
@@ -112,8 +113,33 @@ function openSiteViewer(r: DetailRow): void {
   }
 }
 
-/** 单模型口径（方案 050）：懒加载该模型档案（含来源原始记录投影）。 */
-async function openModelViewer(r: DetailRow, row: GetSiteModelPricesResponse['rows'][number]): Promise<void> {
+/** 方案 057：逐条明细查看器（懒加载站点使用日志明细，仅展示，不进均价）。 */
+async function openDetailViewer(r: DetailRow): Promise<void> {
+  if (srcLoading) return
+  srcLoading = true
+  viewer.value = { title: `${r.name} · 逐条用量明细`, algo: [], loading: true, records: [] }
+  try {
+    const res = await send<GetSiteUsageDetailResponse>('GET_SITE_USAGE_DETAIL', { siteId: r.id })
+    viewer.value = {
+      title: viewer.value!.title,
+      algo: [
+        `数据来源：站点使用日志（逐条调用记录）${res.count} 条，合计 ${fmtTokens(res.tokens)} tokens。`,
+        res.detailCoverage === 'all_day_exact'
+          ? '覆盖范围：今日全部调用记录（已抓齐）。'
+          : '覆盖范围：仅最近若干条记录（受采集页数预算限制），**不代表全天**，不可与「今日总量」相加或对账。',
+        '提示：模型均价的计算基础是「全天小时聚合」，与本明细表口径不同，二者不互为校验依据。',
+      ],
+      loading: false,
+      records: res.records,
+    }
+  } catch (e) {
+    viewer.value = { ...viewer.value!, loading: false, algo: [e instanceof MessagingError ? e.message : '加载失败'], records: [] }
+  } finally {
+    srcLoading = false
+  }
+}
+
+/** 单模型口径（方案 050）：懒加载该模型档案（含来源原始记录投影）。 */async function openModelViewer(r: DetailRow, row: GetSiteModelPricesResponse['rows'][number]): Promise<void> {
   if (srcLoading) return
   srcLoading = true
   viewer.value = { title: `${r.name} · ${row.model} · 数据来源`, algo: [], loading: true, records: [] }
@@ -231,6 +257,17 @@ function avgTitle(s: ModelAvgSummary | null): string {
 /** 计算条目上限（页面头部口径与弹窗说明共用）。 */
 const maxRecordsText = computed(() => (maxRecords.value ? `最近 ${maxRecords.value} 条` : '最近 N 条'))
 
+/**
+ * 方案 057：均价计算基础说明。
+ * 桶 = 服务端对「今日 0 点~采集时刻」的全量聚合（精确）；call = 逐条且已抓齐（精确）；
+ * 其余 = 只是最近若干条样本，必须显式标注，不得当作全天均价。
+ */
+function basisText(d: GetSiteModelPricesResponse): string {
+  if (d.pricingBasis === 'bucket') return '均价基础：全天小时聚合（服务端汇总，非逐条）'
+  if (d.pricingBasis === 'call') return '均价基础：今日逐条明细（已抓齐）'
+  return '样本均价：仅最近若干条明细，未覆盖全天'
+}
+
 onMounted(() => {
   void load()
 })
@@ -284,7 +321,18 @@ onMounted(() => {
               未填充值比例，无法换算人民币（去设置页填写充值比例）
             </div>
             <div v-else-if="!r.detail.hasDetail" class="note">
-              该站点无逐条用量明细，暂不支持模型价格
+              该站点未返回可用用量数据（既无小时聚合桶，也无逐条明细）
+            </div>
+            <div v-if="r.detail.hasDetail" class="note src">
+              {{ basisText(r.detail) }}
+            </div>
+            <div
+              v-if="r.detail.detailSource === 'call' && r.detail.detailCount"
+              class="range link"
+              title="点击查看逐条用量明细（来自站点使用日志，仅供展示）"
+              @click="openDetailViewer(r)"
+            >
+              逐条明细 {{ r.detail.detailCount }} 条 · {{ fmtTokens(r.detail.detailTokens || 0) }} tok（仅展示，不计入今日总量） ▸
             </div>
             <div v-if="r.detail.partial" class="note">明细超上限，按已采集部分计算</div>
             <table v-if="r.detail.rows.length" class="tbl">

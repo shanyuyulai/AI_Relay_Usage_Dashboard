@@ -14,6 +14,7 @@ import { siteRepo, snapshotRepo, dailyStatRepo, captureRepo, purgeOlderThan, get
 import { USAGE_RECORD_SCHEMA_VERSION } from '../shared/types'
 import { maybeNotify, resolveNotifyMode } from '../shared/notify'
 import { collectViaSw } from './swCollect'
+import { getLabBearerAutoRefresh } from '../storage/autoRefreshLabConfig'
 import {
   collectInPage,
   probeSessionInPage,
@@ -26,6 +27,7 @@ import type { SiteConfig, Snapshot, CustomCaptureRecord, UsageRecordBatch, AuthE
 import type { CollectResult } from './collector'
 import { dateKeyInTz, HUBWAY_TZ, todayKey, isValidDateKey } from '../shared/util'
 import { authReasonToFailure } from '../core/authState'
+import { effectiveSiteCurrency } from '../shared/settlement'
 
 /** 等待标签页加载完成（最多 10s）。 */
 function waitForTabLoad(tabId: number): Promise<void> {
@@ -140,6 +142,9 @@ async function collectSiteInTabUnlocked(site: SiteConfig, tabId: number, manual 
       collectRunId,
       // 受控手动流程标志：仅用户「立即同步」时为 true，允许 IKunCode refresh 这类有副作用端点（方案 §4.6）
       manualCollect: manual,
+      // 方案 052 v2：新版 New API Bearer 站点后台自动刷新会话开关（默认关闭）。
+      // 页面主世界还需通过只读协议确认 + Web Locks 才会真正放行定时 refresh。
+      allowAutoRefresh: await getLabBearerAutoRefresh(),
       // 注意：不注入任何扩展密钥到 MAIN 世界。假名化在页面内以无密钥 SHA-256 + 页面 origin 命名空间完成（GPT P0-MAIN-WORLD-KEY）。
     }
     const [frame] = await chrome.scripting.executeScript({
@@ -182,6 +187,15 @@ async function collectSiteInTabUnlocked(site: SiteConfig, tabId: number, manual 
       collectedAt: diagnosticAt,
     })
     return { siteId: site.id, ok: false, errorKind: kind, message: res.reason }
+  }
+
+  // 方案 054：固定人民币站点的采集结果必须是 CNY，否则拒绝落库（统一 writer 之前的友好拦截）。
+  // 典型触发：策略被绕过、/api/status 缺汇率导致换算失败、未来新增 collector 未接真源。
+  // 只写固定脱敏文案，绝不记录响应原文 / 凭证（P1-1）。
+  if (site.cnyOnly === true && res.currency !== 'CNY') {
+    const msg = '固定人民币站点：本次采集结果币种异常，已拒绝落库（请检查站点配置后重新同步）'
+    await siteRepo.update(site.id, { lastStatus: 'error', lastCollectAt: Date.now(), lastError: msg })
+    return { siteId: site.id, ok: false, errorKind: 'PARSE', message: msg }
   }
 
   if (res.usageListPath && res.usageListKind) {
@@ -244,6 +258,12 @@ async function collectSiteInTabUnlocked(site: SiteConfig, tabId: number, manual 
     usageWindow: res.usageWindow,
     todayCostSource: res.todayCostSource,
     usageStatsSource: res.usageStatsSource,
+    // 方案 056：今日缓存命中与今日用量来源
+    todayCacheReadTokens: res.todayCacheReadTokens,
+    todayUsageSource: res.todayUsageSource,
+    // 方案 057：明细来源与覆盖（供均价详情页说明「逐条 / 聚合」）
+    usageDetailSource: res.usageDetailSource ?? null,
+    usageDetailCoverage: res.usageDetailCoverage ?? null,
   }
   await commitBalanceSnapshot(site, snap, alertRevision, res.balanceUnits)
   if (snap.todayTokens != null) await dailyStatRepo.upsertForDay(snap)
@@ -310,16 +330,27 @@ async function collectSiteInTabUnlocked(site: SiteConfig, tabId: number, manual 
       takenAt: now,
       records,
       totalTokens,
-      recordCount: records.length,
+      // 方案 056（GPT P0-3）：recordCount 只统计「逐次调用」记录；
+      // totalRequests 用桶自带的 requestCount 求和，避免 9 个聚合桶被当成 9 次请求。
+      recordCount: records.filter((r) => r.granularity !== 'bucket').length,
       costByCurrency,
       totalActualCostByCurrency,
       totalStandardCostByCurrency,
-      totalRequests: records.length,
+      totalRequests: records.reduce(
+        (sum, r) => sum + (r.granularity === 'bucket' ? Math.max(0, r.requestCount ?? 0) : 1),
+        0,
+      ),
       isComplete,
       truncatedReason: records.length > 0 ? res.usageRecordsTruncatedReason : null,
       pageCount: 0,
       schemaVersion: USAGE_RECORD_SCHEMA_VERSION,
       source: res.usageListKind ?? site.discovered?.usageListKind ?? 'generic',
+      // 方案 057：明细来源契约 + 可选逐条明细（仅展示用，不参与趋势/均价）
+      detailSource: res.usageDetailSource ?? null,
+      detailCoverage: res.usageDetailCoverage ?? null,
+      detailRecords: res.usageDetailRecords && res.usageDetailRecords.length > 0
+        ? res.usageDetailRecords.slice(0, 500)
+        : undefined,
     }
 
     // 仅在写库真正成功后，才视为「已持久化」并失效缓存（GPT P1-invalidate-after-write）：
@@ -400,7 +431,10 @@ async function collectOrchestrate(sites: SiteConfig[], openMode: CollectOpenMode
       tasks.push(collectSiteInTab(site, tabId, manual)) // 复用已有标签
       continue
     }
-    if (labEnabled) {
+    // 方案 054：SW 零标签旁路的 quotaToCurrency 仅对 USD 做 /500000 换算，
+    // 非 USD 会落库 quota 原值（如 4,439,041）。故按**有效币种**限制，覆盖
+    // 「取消固定人民币但 currency 仍为 CNY」的半锁定状态。
+    if (labEnabled && effectiveSiteCurrency(site) === 'USD') {
       tasks.push(collectViaSw(site)) // 实验室：SW 内零标签采集，无可见窗口
     } else {
       missingByWindow.push(site)

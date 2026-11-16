@@ -31,6 +31,9 @@ const USAGE_RECORD_KEYS: (keyof UsageRecord)[] = [
   'group',
   'type',
   'billingMode',
+  // 方案 056：聚合桶记录必须显式标注粒度与代表调用次数，禁止被当作逐次调用统计。
+  'granularity',
+  'requestCount',
 ]
 function sanitizeRecord(r: UsageRecord): UsageRecord {
   const out = {} as UsageRecord
@@ -59,6 +62,10 @@ const BATCH_KEYS: (keyof UsageRecordBatch)[] = [
   'pageCount',
   'schemaVersion',
   'source',
+  // 方案 057：明细来源契约与逐条明细（仅供明细表展示；不参与趋势/均价）
+  'detailSource',
+  'detailCoverage',
+  'detailRecords',
 ]
 function sanitizeBatch(b: UsageRecordBatch): UsageRecordBatch {
   const out = {} as UsageRecordBatch
@@ -66,6 +73,10 @@ function sanitizeBatch(b: UsageRecordBatch): UsageRecordBatch {
     ;(out as unknown as Record<string, unknown>)[k] = (b as unknown as Record<string, unknown>)[k]
   }
   out.records = (b.records ?? []).map(sanitizeRecord)
+  // detailRecords 也必须过同一白名单，避免明细通道绕过 P0-2 字段裁剪
+  out.detailRecords = b.detailRecords && b.detailRecords.length > 0
+    ? b.detailRecords.slice(0, 500).map(sanitizeRecord)
+    : undefined
   return out
 }
 

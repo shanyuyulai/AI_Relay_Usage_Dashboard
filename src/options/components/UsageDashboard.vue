@@ -174,6 +174,8 @@ interface DistRow {
   costByCurrency: Record<string, number>
   ratio: number
   primaryCost: number | null
+  /** 方案 054：金额必须配「记录自身币种」显示，不能用顶卡选中的币种错标。 */
+  primaryCurrency: string | null
 }
 function buildDistRows(buckets: UsageDistributionBucketDto[] | undefined): DistRow[] {
   if (!buckets) return []
@@ -190,6 +192,7 @@ function buildDistRows(buckets: UsageDistributionBucketDto[] | undefined): DistR
       costByCurrency: b.costByCurrency,
       ratio: b.ratio,
       primaryCost: showCur != null ? (b.costByCurrency[showCur] ?? null) : null,
+      primaryCurrency: showCur ?? null,
     }
   })
 }
@@ -209,7 +212,8 @@ const trendData = computed(() => {
       p.outputTokens > 0 ||
       p.cacheCreationTokens > 0 ||
       p.cacheReadTokens > 0 ||
-      p.requests > 0,
+      p.requests > 0 ||
+      (p.totalTokens ?? 0) > 0,
   )
   if (!hasAny) return null
   const labels = pts.map((p) => fmtTime(p.ts))
@@ -219,6 +223,8 @@ const trendData = computed(() => {
     output: pts.map((p) => p.outputTokens),
     cacheCreation: pts.map((p) => p.cacheCreationTokens),
     cacheRead: pts.map((p) => p.cacheReadTokens),
+    // 方案 056：只有总量口径的站点（无 input/output 拆分）单独成序列，不伪装拆分
+    totalTokens: pts.map((p) => p.totalTokens ?? 0),
     hitRate: pts.map((p) => p.cacheHitRate),
     requests: pts.map((p) => p.requests),
   }
@@ -283,7 +289,7 @@ function renderDistCanvas(key: string, canvas: HTMLCanvasElement | null, rows: D
               const row = rows[ctx.dataIndex]
               if (!row) return ctx.label ?? ''
               const costStr =
-                row.primaryCost != null ? `费用 ${fmtBalance(row.primaryCost, preferredCurrency.value)}` : ''
+                row.primaryCost != null ? `费用 ${fmtBalance(row.primaryCost, row.primaryCurrency)}` : ''
               return `${row.label}  ${fmtTokens(row.tokens)}  ${row.requests}次  ${costStr}`
             },
           },
@@ -304,7 +310,7 @@ function renderTrend() {
   const c = themeColors()
   // 实际有数据的桶数（任一四项 > 0 视为有效）；24 小时空桶也算点 → 单/全空都正确
   const nonEmptyPoints = t.input.map((v, i) =>
-    v > 0 || t.output[i] > 0 || t.cacheCreation[i] > 0 || t.cacheRead[i] > 0 ? 1 : 0,
+    v > 0 || t.output[i] > 0 || t.cacheCreation[i] > 0 || t.cacheRead[i] > 0 || t.totalTokens[i] > 0 ? 1 : 0,
   )
   const effectiveCount = nonEmptyPoints.reduce<number>((s, v) => s + v, 0)
   // 单点：实际只有 1 个有效数据点 → 点半径给大一点；多点/全空：常规 0
@@ -314,6 +320,22 @@ function renderTrend() {
     data: {
       labels: t.labels,
       datasets: [
+        // 方案 056：存在「只有总量、无 input/output 拆分」的记录时才追加总量线，
+        // 避免把总量塞进 Input 伪装成拆分（GPT P0-2）。
+        ...(t.totalTokens.some((v) => v > 0)
+          ? [
+              {
+                label: 'Total（仅总量口径）',
+                data: t.totalTokens,
+                borderColor: '#22c55e',
+                backgroundColor: 'rgba(34,197,94,0.10)',
+                tension: 0.25,
+                fill: false,
+                pointRadius,
+                yAxisID: 'yTokens',
+              },
+            ]
+          : []),
         {
           label: 'Input',
           data: t.input,
@@ -867,7 +889,7 @@ const detailTotalPages = computed(() => {
                 </td>
                 <td>{{ fmtNum(r.requests) }}</td>
                 <td>{{ fmtTokens(r.tokens) }}</td>
-                <td>{{ r.primaryCost != null ? fmtBalance(r.primaryCost, preferredCurrency) : '—' }}</td>
+                <td>{{ r.primaryCost != null ? fmtBalance(r.primaryCost, r.primaryCurrency) : '—' }}</td>
                 <td>{{ (r.ratio * 100).toFixed(2) }}%</td>
               </tr>
               <tr v-if="distModel.length === 0">
@@ -905,7 +927,7 @@ const detailTotalPages = computed(() => {
                 </td>
                 <td>{{ fmtNum(r.requests) }}</td>
                 <td>{{ fmtTokens(r.tokens) }}</td>
-                <td>{{ r.primaryCost != null ? fmtBalance(r.primaryCost, preferredCurrency) : '—' }}</td>
+                <td>{{ r.primaryCost != null ? fmtBalance(r.primaryCost, r.primaryCurrency) : '—' }}</td>
                 <td>{{ (r.ratio * 100).toFixed(2) }}%</td>
               </tr>
               <tr v-if="distGroup.length === 0">
@@ -943,7 +965,7 @@ const detailTotalPages = computed(() => {
                 </td>
                 <td>{{ fmtNum(r.requests) }}</td>
                 <td>{{ fmtTokens(r.tokens) }}</td>
-                <td>{{ r.primaryCost != null ? fmtBalance(r.primaryCost, preferredCurrency) : '—' }}</td>
+                <td>{{ r.primaryCost != null ? fmtBalance(r.primaryCost, r.primaryCurrency) : '—' }}</td>
                 <td>{{ (r.ratio * 100).toFixed(2) }}%</td>
               </tr>
               <tr v-if="distEndpoint.length === 0">
@@ -1065,7 +1087,15 @@ const detailTotalPages = computed(() => {
         <tbody>
           <tr v-for="r in detailsData?.rows ?? []" :key="r.id">
             <td :title="r.apiKeyId ?? undefined">{{ shortKey(r.apiKeyId) }}</td>
-            <td :title="r.model">{{ r.model }}</td>
+            <td :title="r.model">
+              {{ r.model }}
+              <!-- 方案 056：聚合桶不是一次调用，必须显式标注，避免被读成「单次 9 亿 token」 -->
+              <span
+                v-if="r.granularity === 'bucket'"
+                class="ud-bucket-tag"
+                :title="`站点按小时×模型聚合的桶，代表 ${r.requestCount ?? 0} 次调用（无单次明细）`"
+              >聚合</span>
+            </td>
             <td>{{ r.reasoningEffort ?? '—' }}</td>
             <td :title="r.endpoint ?? undefined">{{ r.endpoint ?? '—' }}</td>
             <td :title="r.ipHash ?? undefined">{{ r.ipHash ? r.ipHash.slice(0, 12) + '…' : '—' }}</td>
@@ -1073,17 +1103,33 @@ const detailTotalPages = computed(() => {
             <td>{{ r.type ?? '—' }}</td>
             <td>{{ r.billingMode ?? '—' }}</td>
             <td class="ud-td-token">
-              <div class="ud-bar">
-                <span class="ud-bar-in" :style="{ width: tokenBarPct(r.promptTokens, r.completionTokens) + '%' }">
-                  {{ fmtTokens(r.promptTokens) }}
-                </span>
-                <span class="ud-bar-out" :style="{ width: tokenBarPct(r.completionTokens, r.promptTokens) + '%' }">
-                  {{ fmtTokens(r.completionTokens) }}
-                </span>
-              </div>
-              <div v-if="r.cacheReadTokens" class="ud-cache-bar" :title="'缓存读 ' + fmtTokens(r.cacheReadTokens)">
-                <span :style="{ width: Math.min(100, (r.cacheReadTokens / Math.max(1, r.tokens)) * 100) + '%' }"></span>
-              </div>
+              <!-- 方案 056：桶记录只有总量，无 input/output 拆分 → 不做伪拆分条形图 -->
+              <template v-if="r.granularity === 'bucket'">
+                <div class="ud-bucket-token">
+                  {{ fmtTokens(r.tokens) }}
+                  <small>{{ r.requestCount ?? 0 }} 次</small>
+                </div>
+                <div
+                  v-if="r.cacheReadTokens"
+                  class="ud-cache-bar"
+                  :title="'缓存读 ' + fmtTokens(r.cacheReadTokens)"
+                >
+                  <span :style="{ width: Math.min(100, (r.cacheReadTokens / Math.max(1, r.tokens)) * 100) + '%' }"></span>
+                </div>
+              </template>
+              <template v-else>
+                <div class="ud-bar">
+                  <span class="ud-bar-in" :style="{ width: tokenBarPct(r.promptTokens, r.completionTokens) + '%' }">
+                    {{ fmtTokens(r.promptTokens) }}
+                  </span>
+                  <span class="ud-bar-out" :style="{ width: tokenBarPct(r.completionTokens, r.promptTokens) + '%' }">
+                    {{ fmtTokens(r.completionTokens) }}
+                  </span>
+                </div>
+                <div v-if="r.cacheReadTokens" class="ud-cache-bar" :title="'缓存读 ' + fmtTokens(r.cacheReadTokens)">
+                  <span :style="{ width: Math.min(100, (r.cacheReadTokens / Math.max(1, r.tokens)) * 100) + '%' }"></span>
+                </div>
+              </template>
             </td>
             <td class="ud-td-cost">
               <div class="ud-cost-line">
@@ -1490,6 +1536,27 @@ const detailTotalPages = computed(() => {
   display: block;
   height: 100%;
   background: #f59e0b;
+}
+/* 方案 056：聚合桶标记（桶 ≠ 一次调用） */
+.ud-bucket-tag {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 3px;
+  font-size: 9px;
+  line-height: 14px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--sub);
+  vertical-align: middle;
+}
+.ud-bucket-token {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.ud-bucket-token small {
+  margin-left: 4px;
+  font-weight: 400;
+  color: var(--sub);
 }
 .ud-th-cost {
   min-width: 90px;

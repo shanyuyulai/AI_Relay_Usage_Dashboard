@@ -1,6 +1,7 @@
 import { db } from './db'
 import { parsePluginEnabled, PLUGIN_ENABLED_KEY, PLUGIN_REVISION_KEY } from './enableConfig'
 import { isDownwardCrossing, ruleSignature } from '../shared/alertRules'
+import { effectiveSiteCurrency } from '../shared/settlement'
 import type { SiteConfig, Snapshot, AlertDelivery, AlertBaseline } from '../shared/types'
 
 export const ALERT_RETRY_ALARM = 'aihub-alert-retry'
@@ -23,6 +24,10 @@ export async function commitAlertObservation(initialSite: SiteConfig, snap: Snap
     if (!(await alertEpochAllowed(pluginRevision))) return null
     const site = await db.sites.get(snap.siteId)
     if (!site?.enabled || site.origin !== initialSite.origin || (site.alertGeneration ?? 0) !== (initialSite.alertGeneration ?? 0)) return null
+    // 方案 054：真实采集快照落库的统一边界（备份导入从不调用本函数，故旧 USD 快照不受影响）。
+    // 固定人民币站点的新结果必须是 CNY；否则拒绝落库并让整笔事务无写入。
+    // 页面采集层会提前返回可读的 ok:false + 脱敏诊断，这里是最后一道防线。
+    if (site.cnyOnly === true && snap.currency !== 'CNY') return null
     // Immutable snapshot recordId is the observation id. Same milliseconds are not identity.
     if (await db.snapshots.where('recordId').equals(snap.recordId!).first()) return null
     await db.snapshots.add(snap)
@@ -36,7 +41,8 @@ export async function commitAlertObservation(initialSite: SiteConfig, snap: Snap
       const original = initialSite.alerts?.find((r) => r.id === rule.id)
       // Config edited while collection was running: do not evaluate an old observation against new rules.
       if (!rule.enabled || !original || ruleSignature(original) !== ruleSignature(rule)) continue
-      if (rule.currency !== snap.currency || rule.currency !== (site.currency ?? 'USD')) {
+      // 方案 054：规则币种按站点**有效**结算币种比较（cnyOnly 优先级高于 currency）。
+      if (rule.currency !== snap.currency || rule.currency !== effectiveSiteCurrency(site)) {
         await db.alertBaselines.delete(key)
         continue
       }
@@ -61,7 +67,11 @@ export async function commitAlertObservation(initialSite: SiteConfig, snap: Snap
 /** Caller provides the surrounding sites/baselines/deliveries transaction. */
 export async function invalidateSiteAlertState(before: SiteConfig | undefined, after: SiteConfig): Promise<void> {
   if (!before) return
-  const all = before.origin !== after.origin || before.currency !== after.currency || before.enabled !== after.enabled
+  // 方案 054：比较「有效结算币种」而非裸 currency。
+  // 这样仅提交 {cnyOnly:true} 会触发失效；原配置已是 CNY 时仅切换开关不会误判为币种变更。
+  const all = before.origin !== after.origin
+    || effectiveSiteCurrency(before) !== effectiveSiteCurrency(after)
+    || before.enabled !== after.enabled
   const signatures = new Set((after.alerts ?? []).filter((r) => r.enabled).map(ruleSignature))
   await db.alertBaselines.where('siteId').equals(after.id).filter((b) => all || !signatures.has(b.ruleSignature)).delete()
   if (all) after.alertGeneration = (before.alertGeneration ?? 0) + 1

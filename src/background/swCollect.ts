@@ -12,6 +12,7 @@ import type { SiteConfig, Snapshot, AccountMetricCandidate } from '../shared/typ
 import type { CollectResult } from './collector'
 import { normalizeAccount } from '../core/accountContract'
 import { siteRepo, snapshotRepo, dailyStatRepo, authStateRepo } from '../storage'
+import { effectiveSiteCurrency } from '../shared/settlement'
 
 type DashboardStats = {
   todayCost: number | null
@@ -302,6 +303,13 @@ export function collectViaSw(site: SiteConfig): Promise<CollectResult> {
 }
 async function collectViaSwUnlocked(site: SiteConfig): Promise<CollectResult> {
   const alertRevision = getPluginState().revision
+  // 方案 054：本路径 quotaToCurrency 只对 USD 做 /500000 换算，非 USD 会落库 quota 原值。
+  // 编排层已按有效币种分流，这里保留入口自身防御，杜绝其他调用方绕过。
+  if (effectiveSiteCurrency(site) !== 'USD') {
+    const msg = '实验室零标签采集不支持非美元计价站点，已跳过（将使用页面采集通道）'
+    await siteRepo.update(site.id, { lastStatus: 'error', lastCollectAt: Date.now(), lastError: msg })
+    return { siteId: site.id, ok: false, errorKind: 'NOT_FOUND', message: msg }
+  }
   const cookie = await readCookieHeader(site.origin)
   if (!cookie) {
     // 方案 029 §5.6 / §D：读不到 Cookie 不等于登录失效；标记为实验室会话不可用，
@@ -311,7 +319,7 @@ async function collectViaSwUnlocked(site: SiteConfig): Promise<CollectResult> {
     return { siteId: site.id, ok: false, errorKind: 'NOT_FOUND', message: msg }
   }
 
-  const fallbackCurrency = site.currency ?? 'USD'
+  const fallbackCurrency = effectiveSiteCurrency(site)
   const balancePaths = uniquePaths([
     site.discovered?.userSelfPath ?? '',
     '/api/user/self',

@@ -125,6 +125,23 @@ export interface PageCollectResult {
   todayCostSource: 'dashboard_stats' | 'range_usage' | 'logs' | null
   /** 统计/账户指标来源：dashboard_stats / account_snapshot / range_usage / null */
   usageStatsSource: 'dashboard_stats' | 'account_snapshot' | 'range_usage' | null
+  /** 方案 056：今日缓存命中 token（仅服务端精确 cache_read；否则 null） */
+  todayCacheReadTokens: number | null
+  /** 方案 056：今日用量来源 data_self=聚合桶 / usage_list=明细 / raw_logs=日志分页 / null=无 */
+  todayUsageSource: 'data_self' | 'usage_list' | 'raw_logs' | null
+  /**
+   * 方案 057：明细来源（明细表实际展示的那一份）。
+   * bucket = 只有聚合桶（服务端全量聚合，非逐条）；call = 逐条调用日志；null = 无任何可用明细。
+   */
+  usageDetailSource?: 'bucket' | 'call' | null
+  /**
+   * 方案 057：明细覆盖范围。
+   * full_day_aggregate = 桶（全天已发生时段的服务端聚合）；
+   * all_day_exact = 逐条且已抓齐；recent_incomplete = 仅最近若干条（不代表全天）。
+   */
+  usageDetailCoverage?: 'full_day_aggregate' | 'all_day_exact' | 'recent_incomplete' | null
+  /** 方案 057：逐条调用记录（仅当 records 主口径为桶时提供，供明细表展示；不进趋势/均价） */
+  usageDetailRecords?: UsageRecord[]
   // ===== 诊断日志（脱敏指纹，P0-1/P0-4 安全边界）=====
   /** 每个端点请求的脱敏诊断条目（不含任何私密值原文） */
   diags: Array<{
@@ -957,7 +974,7 @@ export async function collectInPage(
   const sessionStorageKeys = Object.keys(sessionStorage)
 
   // 解析 strategy（executeScript 序列化为普通对象，此处用 any 访问）
-  const endpoints: Array<{ role: string; path: string; source?: string; needsToken?: boolean; usageListKind?: string }> =
+  const endpoints: Array<{ role: string; endpointId?: string; path: string; source?: string; needsToken?: boolean; usageListKind?: string }> =
     strategy?.endpoints ?? []
   const balanceEp = endpoints.find((e: any) => e.role === 'balance')
   const usageEps = endpoints.filter((e: any) => e.role === 'usage')
@@ -972,6 +989,90 @@ export async function collectInPage(
   let refreshSnapshotRaw: any = null
   // IKunCode refresh token remains in memory for this collection only.
   let sessionAccessToken: string | null = null
+
+  // ===== 方案 052 v2：新版 New API（Bearer access_token + HttpOnly refresh Cookie）受控门控 =====
+  // GPT 设计评审要求：定时采集默认 fail closed。只有「用户显式开启实验室开关
+  // + 只读协议确认通过 + Web Locks 可用」三者同时成立，后台才允许主动 refresh。
+  // 手动「立即同步」不受此限制（原本就允许 refresh）。
+  const REFRESH_LOCK_NAME = 'new-api:auth-refresh'
+  const webLocksAvailable = (() => {
+    try {
+      return typeof navigator !== 'undefined' &&
+        !!(navigator as any).locks &&
+        typeof (navigator as any).locks.request === 'function'
+    } catch { return false }
+  })()
+
+  /** 只读协议确认：绝不产生会话副作用；任一条件不满足即放弃后台 refresh。 */
+  async function detectBearerRefreshProtocol(): Promise<boolean> {
+    try {
+      // ① 会话标记 Cookie（前端 I() 也用它判断是否 bootstrap）
+      if (!/(?:^|;\s*)new_api_has_session\s*=/.test(document.cookie || '')) return false
+      // ②③ 同源公开只读接口，要求版本响应头与响应体版本字段同时存在
+      const res = await fetch(origin + '/api/status', {
+        credentials: 'include',
+        headers: { Accept: 'application/json', 'Cache-Control': 'no-store' },
+      })
+      const headerVersion = (res.headers.get('X-New-Api-Version') || '').trim()
+      let bodyVersion = ''
+      if ((res.headers.get('content-type') || '').includes('json')) {
+        try {
+          const parsed = JSON.parse(await res.text())
+          bodyVersion = String(parsed?.data?.version ?? parsed?.version ?? '').trim()
+        } catch { /* 非 JSON 视为确认失败 */ }
+      }
+      return headerVersion.length > 0 && bodyVersion.length > 0
+    } catch { return false }
+  }
+  let refreshProtocolConfirmed: boolean | null = null
+  async function confirmRefreshProtocol(): Promise<boolean> {
+    if (refreshProtocolConfirmed === null) refreshProtocolConfirmed = await detectBearerRefreshProtocol()
+    return refreshProtocolConfirmed
+  }
+  const autoRefreshRequested = !!(strategy?.allowAutoRefresh)
+  let refreshGate = manualCollect
+  if (!refreshGate && autoRefreshRequested && webLocksAvailable) {
+    refreshGate = await confirmRefreshProtocol()
+  }
+
+  /**
+   * 完整刷新临界区（GPT 评审 §9.2）：同一执行上下文 single-flight + 同源 Web Lock，
+   * 锁内完成 POST refresh → bundle 校验 → 更新 sessionAccessToken。
+   * 无 Web Lock 时后台一律不 refresh（仅手动同步允许降级），绝不静默引入并发竞争。
+   */
+  let refreshInFlight: Promise<{ status: number; json: any; isJson: boolean }> | null = null
+  let lastRefreshResult: { status: number; json: any; isJson: boolean } | null = null
+  async function refreshSessionOnce(
+    run: () => Promise<{ status: number; json: any; isJson: boolean }>,
+  ): Promise<{ status: number; json: any; isJson: boolean }> {
+    if (refreshInFlight) return refreshInFlight
+    const work = async () => {
+      // 获得锁后重新检查：已有可用令牌则复用上次结果，避免重复轮换
+      if (sessionAccessToken && lastRefreshResult) return lastRefreshResult
+      const result = await run()
+      lastRefreshResult = result
+      if (result.status >= 200 && result.status < 400 && result.isJson) {
+        const token = extractAuthAccessToken(result.json)
+        if (token) sessionAccessToken = token
+      }
+      return result
+    }
+    let pending: Promise<{ status: number; json: any; isJson: boolean }>
+    if (webLocksAvailable) {
+      pending = (navigator as any).locks.request(REFRESH_LOCK_NAME, { mode: 'exclusive' }, work)
+    } else if (manualCollect) {
+      pending = work()
+    } else {
+      // fail closed：后台采集在无法跨实例互斥时绝不刷新会话
+      return { status: 0, json: null, isJson: false }
+    }
+    refreshInFlight = pending
+    try {
+      return await pending
+    } finally {
+      refreshInFlight = null
+    }
+  }
 
   // 若 strategy 为空或无余额端点，回退旧逻辑（向后兼容）
   let matchedPath: string | null = null
@@ -1152,7 +1253,7 @@ export async function collectInPage(
 
   // IKunCode 只有 POST /api/user/auth/refresh 能返回账户快照时，必须在用户主动同步时受控调用。
   // 该调用不能放在 dataObj 失败后的 early return 之后，否则永远不会执行。
-  if (!dataObj && manualCollect) {
+  if (!dataObj && refreshGate) {
     const refreshPath = '/api/user/auth/refresh'
     refreshAttempted = true
     const ref = await requestEndpoint({
@@ -1299,6 +1400,52 @@ export async function collectInPage(
   let usageStatsSource: 'dashboard_stats' | 'account_snapshot' | 'range_usage' | null = null
   let todayCostSource: 'dashboard_stats' | 'range_usage' | 'logs' | null = null
   let usageWindowVal: 'calendar_day' | 'rolling_24h' | 'range' | null = null
+  /** 方案 056：今日缓存命中 token / 今日用量来源 / 聚合桶（供模型均价与分布）。 */
+  let todayCacheReadTokens: number | null = null
+  let todayUsageSource: 'data_self' | 'usage_list' | 'raw_logs' | null = null
+  /**
+   * 方案 057：明细数据采取「候选制」。
+   * 各分支只把结果放进自己的候选变量，**不得直接追加** usageRecords；
+   * 末尾由唯一提交点择一，杜绝「顺序相关判断」造成的来源混用 / 重复计数（GPT P0-2/P0-3）。
+   */
+  let bucketRows: Array<{
+    ts: number
+    model: string
+    tokens: number
+    requests: number
+    quota: number | null
+    cacheRead: number | null
+    cacheCreate: number | null
+  }> = []
+  /** 桶候选的来源（首次成功的 /api/data/self 响应）。 */
+  let bucketSource: 'hourly_aggregate' | 'range_usage' | null = null
+  /** 逐条调用候选（usage_list / raw_logs），null = 无候选。 */
+  let callRecords: UsageRecord[] | null = null
+  let callSource: 'usage_list' | 'raw_logs' | null = null
+  /** 逐条候选是否被证明「覆盖完整今日」（GPT P0-3：去重后条数达标不得据此恢复完整）。 */
+  let callComplete = false
+  let callServerTotal: number | null = null
+  let callFetched = 0
+  let callAnomaly = false
+
+  /** 收桶候选（首次成功者为准）：hourly_aggregate 与 range_usage 请求同一 URL，只保留一份。 */
+  function takeBucketCandidate(
+    rows: Array<{
+      ts: number
+      model: string
+      tokens: number
+      requests: number
+      quota: number | null
+      cacheRead: number | null
+      cacheCreate: number | null
+    }>,
+    src: 'hourly_aggregate' | 'range_usage',
+  ): void {
+    if (bucketRows.length > 0) return
+    if (!rows || rows.length === 0) return
+    bucketRows = rows
+    bucketSource = src
+  }
   /** 从任意 JSON 对象中尝试提取累计 Token 和平均响应（与余额端点的提取逻辑一致）。 */
   function extractExtraMetrics(data: Record<string, unknown>) {
     if (usageCumulativeTokens == null) {
@@ -1327,8 +1474,12 @@ export async function collectInPage(
     const direct = findNumber(item, ['cost', 'amount', 'fee', 'spend', 'price'])
     if (direct != null) return direct
     const quota = findNumber(item, ['quota'])
-    if (quota != null) return quota / 500000
-    return null
+    if (quota == null) return null
+    // 方案 056（R1）：原实现 `quota / 500000` 既硬编码单位、又漏乘 usd_exchange_rate，
+    // 会让人民币站点少算 7.3 倍。改为按站点计价配置换算；配置缺失时返回 null
+    // （P0-3：宁可「—」，绝不写入错误单位的金额）。
+    if (!billingConfig || billingConfig.quotaPerUnit == null || billingConfig.quotaPerUnit <= 0) return null
+    return quotaToCurrency(quota, billingConfig, stratCurrency).value
   }
 
   // ===== 统计接口 + IKunCode provider 解析/请求（方案 §4/§5/§7）=====
@@ -1447,23 +1598,27 @@ export async function collectInPage(
       // 如果站点版本实际要求 localStorage Bearer，再只补一次 Bearer 请求。
       const cookieHeaders = { ...headers }
       delete cookieHeaders.Authorization
-      let result = await fetchOnce(isSessionRefresh ? cookieHeaders : headers)
-      const error = isRecord(result.json) && isRecord(result.json.error) ? result.json.error : null
-      const businessAuthFailure = isRecord(result.json) && (
-        result.json.success === false ||
-        result.json.code === 'AUTH_UNAUTHORIZED' ||
-        result.json.code === 'UNAUTHORIZED' ||
-        error?.code === 'AUTH_UNAUTHORIZED' ||
-        error?.code === 'UNAUTHORIZED'
-      )
-      if ((result.status === 401 || result.status === 403 || businessAuthFailure) &&
-        (bearerToken || isSessionRefresh) && pageAuthContext.provider !== 'new_api_user_object') {
-        result = await fetchOnce(isSessionRefresh ? headers : cookieHeaders)
+      // 完整临界区：refresh 的首次请求、401 补 Bearer 重试、bundle 解析与令牌更新
+      // 全部在同名 Web Lock 内完成；业务端点的 401 重试不进锁（评审 §9.2）。
+      const runRequest = async () => {
+        let result = await fetchOnce(isSessionRefresh ? cookieHeaders : headers)
+        const error = isRecord(result.json) && isRecord(result.json.error) ? result.json.error : null
+        const businessAuthFailure = isRecord(result.json) && (
+          result.json.success === false ||
+          result.json.code === 'AUTH_UNAUTHORIZED' ||
+          result.json.code === 'UNAUTHORIZED' ||
+          error?.code === 'AUTH_UNAUTHORIZED' ||
+          error?.code === 'UNAUTHORIZED'
+        )
+        if ((result.status === 401 || result.status === 403 || businessAuthFailure) &&
+          (bearerToken || isSessionRefresh) && pageAuthContext.provider !== 'new_api_user_object') {
+          result = await fetchOnce(isSessionRefresh ? headers : cookieHeaders)
+        }
+        return result
       }
-      if (isSessionRefresh && result.status >= 200 && result.status < 400 && result.isJson) {
-        const refreshedToken = extractAuthAccessToken(result.json)
-        if (refreshedToken) sessionAccessToken = refreshedToken
-      }
+      const result = isSessionRefresh
+        ? await refreshSessionOnce(runRequest)
+        : await runRequest()
       return { ...result, elapsedMs: Math.round(performance.now() - t0) }
     } catch {
       return { status: 0, json: null, isJson: false, elapsedMs: Math.round(performance.now() - t0) }
@@ -1602,7 +1757,7 @@ export async function collectInPage(
     const hasUserIdentity = !!user &&
       user.id !== undefined && user.id !== null &&
       typeof user.username === 'string' && user.username.trim().length > 0 &&
-      typeof user.role === 'string' && user.role.trim().length > 0
+      ((typeof user.role === 'string' && user.role.trim().length > 0) || (typeof user.role === 'number' && Number.isFinite(user.role)))
     const hasSessionIdentity = !!session &&
       typeof session.sid === 'string' && session.sid.trim().length > 0 &&
       session.current !== undefined && session.current !== null &&
@@ -1644,14 +1799,36 @@ export async function collectInPage(
     costSum: number | null
     tokenSum: number | null
     requestSum: number | null
+    /** 方案 056：逐条聚合桶的白名单数值投影（不含任何原文/凭证）。 */
+    buckets: Array<{
+      ts: number
+      model: string
+      tokens: number
+      requests: number
+      quota: number | null
+      cacheRead: number | null
+      cacheCreate: number | null
+    }>
   } | null {
-    const root = unwrapStats(data)
+    // 方案 057（R2-fix）：调用方可能已传入 unwrap 后的数组（hourly_aggregate 分支），
+    // 而 unwrapStats 只接受 record → 旧实现下数组响应恒返回 null（小时桶分支因此从不生效）。
+    // 这里先兼容数组，再退回单层解包，两种形态都能解析。
+    const root = Array.isArray(data) ? data : unwrapStats(data)
     if (!root) return null
-    const arr: any[] = findList(root) ?? []
+    const arr: any[] = Array.isArray(root) ? root : (findList(root) ?? [])
     if (!Array.isArray(arr) || arr.length === 0) return null
     let costSum: number | null = null
     let tokenSum: number | null = null
     let requestSum: number | null = null
+    const buckets: Array<{
+      ts: number
+      model: string
+      tokens: number
+      requests: number
+      quota: number | null
+      cacheRead: number | null
+      cacheCreate: number | null
+    }> = []
     for (const item of arr) {
       if (!isRecord(item)) continue
       // 服务端部分版本会返回近 24 小时或更宽窗口；created_at 存在时必须
@@ -1666,9 +1843,22 @@ export async function collectInPage(
       if (q != null) costSum = (costSum ?? 0) + q
       if (tk != null) tokenSum = (tokenSum ?? 0) + tk
       if (ct != null) requestSum = (requestSum ?? 0) + ct
+      // 方案 056：仅当该桶至少有 token 或 quota 时才作为用量桶保留（避免空桶影响均值分母）。
+      if (tk != null || q != null) {
+        const rawModel = getPath(item, 'model_name') ?? getPath(item, 'model')
+        buckets.push({
+          ts: createdAt,
+          model: typeof rawModel === 'string' && rawModel.trim() ? rawModel.trim().slice(0, 64) : '',
+          tokens: tk ?? 0,
+          requests: ct ?? 0,
+          quota: q,
+          cacheRead: toFiniteNonNegative(getPath(item, 'cache_read_tokens')),
+          cacheCreate: toFiniteNonNegative(getPath(item, 'cache_creation_tokens')),
+        })
+      }
     }
     if (costSum == null && tokenSum == null && requestSum == null) return null
-    return { costSum, tokenSum, requestSum }
+    return { costSum, tokenSum, requestSum, buckets }
   }
 
   /** quota → 本币金额转换（方案 §5.5/§3.4.3）：仅 unit=quota 时执行；缺失 quotaPerUnit 才用默认 500000 并标记 unitAssumed。 */
@@ -1724,11 +1914,24 @@ export async function collectInPage(
             // 方案 029 §5.3：严格区间解析（仅 token_used/count + 上海自然日过滤），不复用宽松 extractUsage
             const ru = extractRangeUsage(udata, fromMs, toMs)
             if (ru && ru.tokenSum != null) {
+              // 方案 057（D3）：同一份响应的桶必须在这里也收下。
+              // 旧实现只在 range_usage 角色分支保留桶，若该角色未跑/失败，桶整批丢失。
+              takeBucketCandidate(ru.buckets, 'hourly_aggregate')
               todayTokens = ru.tokenSum
               todayRequests = ru.requestSum
               // 今日使用金额：仅当响应含明确货币字段时展示，否则留 null（§4.4）
               const hc = findNumber(udata, ['total_cost', 'cost', 'amount', 'spend'])
               if (hc != null) todayCost = hc
+              else if (ru.costSum != null) {
+                // 方案 056（R2）：聚合响应是数组，上面的 findNumber 对数组恒为 null；
+                // 金额一律由 quota 合计按站点计价配置换算（含汇率），不再猜测字段。
+                todayCost = quotaToCurrency(
+                  ru.costSum,
+                  billingConfig ?? { quotaPerUnit: null, usdExchangeRate: null, customCurrencyExchangeRate: null },
+                  stratCurrency,
+                ).value
+              }
+              todayUsageSource = 'data_self'
               modelUsages = [{ model: '*', tokens: todayTokens, cost: todayCost ?? 0 }]
               usageSource = 'hourly_aggregate'
               break
@@ -1747,14 +1950,29 @@ export async function collectInPage(
         // A 类 /api/log/self 日志分页累加（P0-2 修正：不可仅抓第 1 页）
         const logResult = await (async function fetchUsageLogs() {
           // —— fetchUsageLogs 完全自包含 ——
-          const MAX_PAGES = 5
-          const MAX_ITEMS = 200
+          // 方案 056（GPT P0-4）：按服务端 total 翻页，替代原先「5 页 / 200 条」的硬截断。
+          // 方案 057：同时产出**逐条调用记录**（此前只累加数字，导致均价页 hasDetail=false）。
+          //   预算：默认 5 页（=500 条，与 modelAvgMaxRecords 上限对齐），硬上限 10 页。
+          //   完整性（GPT P0-3）：以服务端 total + 页间一致性判定；去重后条数达标**不**据此恢复完整。
+          const DETAIL_MAX_PAGES = 5
+          const DETAIL_MAX_RECORDS = 500
+          const MAX_PAGES = 20
+          const PAGE_SIZE = 100
+          const MAX_ITEMS = 2000
           let totalTokens = 0
           let totalReqs = 0
           let totalCost = 0
           let pageCount = 0
           let itemCount = 0
+          let serverTotal: number | null = null
+          let complete = false
+          /** 页间异常（重复 id / 页长异常 / 时间倒序断点）→ 永不判完整。 */
+          let anomaly = false
+          let fetched = 0
           const seen = new Set<string>()
+          const recs: UsageRecord[] = []
+          /** 上一页末条时间（用于发现时间倒序断点）。 */
+          let prevMinTs: number | null = null
 
           function logTs(item: any): number | null {
             const raw = item?.created_at ?? item?.timestamp ?? item?.created_at_unixtime ?? item?.time
@@ -1766,7 +1984,7 @@ export async function collectInPage(
             return Number.isNaN(parsed) ? null : parsed
           }
 
-          // 去重键：优先用 log.id，否则组合键
+          // 去重键：优先用 log.id（站点内自增唯一），否则组合键
           function dedupKey(item: any): string | null {
             if (typeof item.id === 'number' || typeof item.id === 'string') return `id:${item.id}`
             const model = String(item.model_name ?? item.model ?? '')
@@ -1778,8 +1996,36 @@ export async function collectInPage(
             return `${model}|${ts}|${pt}|${ct}|${tk}`
           }
 
-          for (let p = 0; p < MAX_PAGES; p++) {
-            const lUrl = `${origin}${ep.path}?p=${p}&page_size=50&start_timestamp=${fromSec}&end_timestamp=${toSec}`
+          /** 记录主键：命名空间 + 服务端 id（GPT P1：避免与 usage_list 的键空间冲突）。 */
+          function recId(item: any): string {
+            const raw = item.id ?? item.log_id ?? item.record_id
+            if (typeof raw === 'number' || typeof raw === 'string') return `rl:${raw}`
+            let h = 0x811c9dc5
+            const seed = String(dedupKey(item) ?? `${Math.random()}`)
+            for (let i = 0; i < seed.length; i++) {
+              h ^= seed.charCodeAt(i)
+              h = Math.imul(h, 0x01000193)
+            }
+            return `rlh:${(h >>> 0).toString(16)}`
+          }
+
+          /** other 字段是 JSON 字符串：只取 cache_tokens 数值，绝不保留原文（P0-2）。 */
+          function readOtherCache(item: any): number | null {
+            const other = item?.other ?? item?.other_info ?? item?.metadata
+            let obj: any = null
+            if (typeof other === 'string') {
+              try { obj = JSON.parse(other) } catch { return null }
+            } else if (isRecord(other)) {
+              obj = other
+            }
+            if (!isRecord(obj)) return null
+            const v = toNumber((obj as any).cache_tokens ?? (obj as any).cached_tokens ?? (obj as any).cache_read_tokens)
+            return Number.isNaN(v) || v < 0 ? null : v
+          }
+
+          for (let p = 1; p <= MAX_PAGES; p++) {
+            // 固定 toSec=asOf（循环外计算），page_size 与站点一致；type=2 = 站点自身的「消费日志」筛选。
+            const lUrl = `${origin}${ep.path}?p=${p}&page_size=${PAGE_SIZE}&start_timestamp=${fromSec}&end_timestamp=${toSec}&type=2`
             const lt0 = performance.now()
             const { status, json, isJson: isJ } = await fetchJson(lUrl)
             const lDt = performance.now() - lt0
@@ -1788,8 +2034,17 @@ export async function collectInPage(
             if (!d) { recordDiag('usage', lUrl, status, 'application/json', Math.round(lDt), null, `日志分页 p=${p} 无法 unwrap`); break }
             recordDiag('usage', lUrl, status, 'application/json', Math.round(lDt), d, `日志分页 p=${p}`)
             const arr: any[] = findList(d) ?? []
-            if (arr.length === 0) break
+            if (serverTotal == null) {
+              const t = toNumber((d as any).total)
+              if (!Number.isNaN(t) && t >= 0) serverTotal = t
+            }
+            if (arr.length === 0) {
+              // 空页 = 已到末尾；仅当没有更权威的 total 时据此判定完整
+              if (serverTotal == null || fetched >= serverTotal) complete = true
+              break
+            }
             pageCount++
+            if (arr.length > PAGE_SIZE) anomaly = true
 
             // 检查最早日志是否早于今天零点（如是则停止分页）
             let earliestBeyondToday = false
@@ -1801,6 +2056,7 @@ export async function collectInPage(
                 break // 此条已越过今天，但同页后续可能还有今天的
               }
             }
+            if (earliestBeyondToday) anomaly = true // 服务端未按区间过滤 → 覆盖不可证
 
             for (const item of arr) {
               if (!isRecord(item)) continue
@@ -1812,39 +2068,100 @@ export async function collectInPage(
               const itemTs = logTs(item)
               if (itemTs != null && (itemTs < fromMs || itemTs > toMs)) continue
 
-              // 去重
+              // 去重（时间倒序断点：本页出现比上一页更晚的时间 → 排序不稳定）
+              if (itemTs != null && prevMinTs != null && itemTs > prevMinTs) anomaly = true
               const key = dedupKey(item)
-              if (key && seen.has(key)) continue
+              const dup = !!key && seen.has(key)
               if (key) seen.add(key)
+              if (dup) { anomaly = true; continue }
 
               const pt = toNumber((item as any).prompt_tokens ?? (item as any).input_tokens)
               const ct = toNumber((item as any).completion_tokens ?? (item as any).output_tokens)
               const tk = toNumber((item as any).token_used ?? (item as any).total_tokens ?? (item as any).tokens)
               const splitTokens = (!Number.isNaN(pt) ? pt : 0) + (!Number.isNaN(ct) ? ct : 0)
-              totalTokens += splitTokens > 0 || Number.isNaN(tk) ? splitTokens : tk
+              const usedTokens = splitTokens > 0 || Number.isNaN(tk) ? splitTokens : tk
+              totalTokens += usedTokens
               const c = extractCost(item)
               if (c != null) totalCost += c
               totalReqs++
               itemCount++
+              fetched++
+              // 逐条记录（白名单；不含 ip / token_name / content / other 原文）
+              // 预算只限制「明细展示条数」，**不影响总量累加**（否则今日 token 会被预算截断）。
+              if (recs.length < DETAIL_MAX_RECORDS && itemTs != null) {
+                const rawModel = (item as any).model_name ?? (item as any).model
+                recs.push({
+                  id: recId(item),
+                  ts: itemTs,
+                  model: typeof rawModel === 'string' && rawModel.trim() ? rawModel.trim().slice(0, 64) : '(unknown)',
+                  promptTokens: Number.isNaN(pt) ? 0 : pt,
+                  completionTokens: Number.isNaN(ct) ? 0 : ct,
+                  tokens: usedTokens,
+                  cacheReadTokens: readOtherCache(item),
+                  cacheCreationTokens: null,
+                  cost: c,
+                  actualCost: c,
+                  actualCostCurrency: c != null ? stratCurrency : null,
+                  standardCost: null,
+                  standardCostCurrency: null,
+                  costCurrency: stratCurrency,
+                  endpoint: null,
+                  apiKeyId: null,
+                  apiKeyLabel: null,
+                  ipHash: null,
+                  reasoningEffort: null,
+                  group: null,
+                  type: 'consume',
+                  billingMode: null,
+                  granularity: 'call',
+                })
+              }
               if (itemCount >= MAX_ITEMS) break
             }
-            if (itemCount >= MAX_ITEMS || earliestBeyondToday) break
+            if (arr.length > 0) {
+              const tsList = arr.filter((x) => isRecord(x)).map((x) => logTs(x)).filter((x): x is number => x != null)
+              if (tsList.length) prevMinTs = Math.min(...tsList)
+            }
+            // 完整性判定（GPT P0-4）：以服务端 total 为权威，页未满也视为末尾
+            if (serverTotal != null && fetched >= serverTotal) { complete = true; break }
+            if (itemCount >= MAX_ITEMS) break
+            if (arr.length < PAGE_SIZE) { complete = serverTotal == null; break }
+            if (earliestBeyondToday) break
           }
-
+          // 页间异常时永不宣称完整（GPT P0-3：去重后条数达标不得恢复为完整）
+          if (anomaly) complete = false
+          // 服务端确认 total 且抓齐，方才完整
+          if (serverTotal != null && fetched < serverTotal) complete = false
           return {
             todayTokens: totalTokens,
             todayRequests: totalReqs,
             todayCost: totalCost,
-            partial: pageCount >= MAX_PAGES || itemCount >= MAX_ITEMS,
+            partial: !complete,
             source: 'raw_logs' as const,
+            records: recs,
+            complete,
+            serverTotal,
+            fetched,
+            anomaly,
           }
         })()
+
+        // 明细候选（无论总量是否被采用都要保留：总量另有权威源时不代表明细没用）
+        if (logResult.records.length > 0) {
+          callRecords = logResult.records
+          callSource = 'raw_logs'
+          callComplete = logResult.complete
+          callServerTotal = logResult.serverTotal
+          callFetched = logResult.fetched
+          callAnomaly = logResult.anomaly
+        }
 
         if (logResult.todayTokens > 0 || logResult.todayRequests > 0 || logResult.todayCost > 0) {
           todayTokens = logResult.todayTokens
           todayRequests = logResult.todayRequests
           if (logResult.todayCost > 0) todayCost = logResult.todayCost
           isPartial = logResult.partial
+          todayUsageSource = 'raw_logs'
           modelUsages = [{ model: '*', tokens: todayTokens, cost: logResult.todayCost }]
           usageSource = logResult.source
           break
@@ -1898,10 +2215,128 @@ export async function collectInPage(
       }
     }
 
+    // ===== 方案 057：明细专用通道（与总量解耦）=====
+    // 上一步的 usage 循环首个成功即 break，因此「小时聚合成功的站点」永远不会走到 raw_logs 分支，
+    // 也就拿不到逐条明细。这里独立补抓一次，**只取明细、绝不改 todayTokens/todayCost**。
+    if (callRecords == null) {
+      const detailEp = usageEps.find((e: any) => e.source === 'raw_logs' && e.path)
+      if (detailEp) {
+        const DETAIL_PAGES = 5
+        const DETAIL_SIZE = 100
+        const recs: UsageRecord[] = []
+        let fetched = 0
+        let serverTotal: number | null = null
+        let complete = false
+        let anomaly = false
+        let prevMinTs: number | null = null
+        const seenIds = new Set<string>()
+        for (let p = 1; p <= DETAIL_PAGES; p++) {
+          const dUrl = `${origin}${detailEp.path}?p=${p}&page_size=${DETAIL_SIZE}&start_timestamp=${fromSec}&end_timestamp=${toSec}&type=2`
+          const dt0 = performance.now()
+          const { status, json, isJson: isJ } = await fetchJson(dUrl)
+          const dDt = performance.now() - dt0
+          if (!status || status >= 400 || !isJ || !json) {
+            recordDiag('usage', dUrl, status || 0, '', Math.round(dDt), null, `明细通道 p=${p} 失败`)
+            break
+          }
+          const d = unwrap(json)
+          if (!d) break
+          recordDiag('usage', dUrl, status, 'application/json', Math.round(dDt), d, `明细通道 p=${p}`)
+          const arr: any[] = findList(d) ?? []
+          if (serverTotal == null) {
+            const t = toNumber((d as any).total)
+            if (!Number.isNaN(t) && t >= 0) serverTotal = t
+          }
+          if (arr.length === 0) {
+            if (serverTotal == null || fetched >= serverTotal) complete = true
+            break
+          }
+          if (arr.length > DETAIL_SIZE) anomaly = true
+          let oldestToday: number | null = null
+          for (const item of arr) {
+            if (!isRecord(item)) continue
+            const rawTs = (item as any).created_at ?? (item as any).timestamp ?? (item as any).time
+            const numeric = typeof rawTs === 'number' ? rawTs : Number(String(rawTs ?? '').replace(/,/g, ''))
+            if (!Number.isFinite(numeric)) continue
+            const ts = numeric < 1e12 ? numeric * 1000 : numeric
+            if (ts < fromMs || ts > toMs) { if (ts < fromMs) anomaly = true; continue }
+            if (prevMinTs != null && ts > prevMinTs) anomaly = true
+            const rawId = (item as any).id ?? (item as any).log_id
+            const key = typeof rawId === 'number' || typeof rawId === 'string'
+              ? `rl:${rawId}`
+              : `rlx:${String((item as any).model_name ?? '')}|${ts}`
+            if (seenIds.has(key)) { anomaly = true; continue }
+            seenIds.add(key)
+            const pt = toNumber((item as any).prompt_tokens ?? (item as any).input_tokens)
+            const ct = toNumber((item as any).completion_tokens ?? (item as any).output_tokens)
+            const tk = toNumber((item as any).token_used ?? (item as any).total_tokens ?? (item as any).tokens)
+            const split = (!Number.isNaN(pt) ? pt : 0) + (!Number.isNaN(ct) ? ct : 0)
+            const used = split > 0 || Number.isNaN(tk) ? split : tk
+            const c = extractCost(item)
+            let cacheRead: number | null = null
+            const other = (item as any).other
+            if (typeof other === 'string') {
+              try {
+                const o = JSON.parse(other)
+                const v = isRecord(o) ? toNumber((o as any).cache_tokens) : Number.NaN
+                if (!Number.isNaN(v) && v >= 0) cacheRead = v
+              } catch { /* 非 JSON 忽略 */ }
+            }
+            const rawModel = (item as any).model_name ?? (item as any).model
+            recs.push({
+              id: key,
+              ts,
+              model: typeof rawModel === 'string' && rawModel.trim() ? rawModel.trim().slice(0, 64) : '(unknown)',
+              promptTokens: Number.isNaN(pt) ? 0 : pt,
+              completionTokens: Number.isNaN(ct) ? 0 : ct,
+              tokens: used,
+              cacheReadTokens: cacheRead,
+              cacheCreationTokens: null,
+              cost: c,
+              actualCost: c,
+              actualCostCurrency: c != null ? stratCurrency : null,
+              standardCost: null,
+              standardCostCurrency: null,
+              costCurrency: stratCurrency,
+              endpoint: null,
+              apiKeyId: null,
+              apiKeyLabel: null,
+              ipHash: null,
+              reasoningEffort: null,
+              group: null,
+              type: 'consume',
+              billingMode: null,
+              granularity: 'call',
+            })
+            fetched++
+            if (oldestToday == null || ts < oldestToday) oldestToday = ts
+            if (recs.length >= 500) break
+          }
+          if (oldestToday != null) prevMinTs = oldestToday
+          if (recs.length >= 500) break
+          if (serverTotal != null && fetched >= serverTotal) { complete = true; break }
+          if (arr.length < DETAIL_SIZE) { complete = serverTotal == null; break }
+        }
+        if (anomaly) complete = false
+        if (serverTotal != null && fetched < serverTotal) complete = false
+        if (recs.length > 0) {
+          callRecords = recs
+          callSource = 'raw_logs'
+          callComplete = complete
+          callServerTotal = serverTotal
+          callFetched = fetched
+          callAnomaly = anomaly
+        }
+      }
+    }
+
     // ===== 当日用量明细列表（usage_list）：采集 /api/v1/usage 等，供详情页「当日使用趋势」画图 =====
     // 完全自包含；仅白名单字段落账（P0-2）；按业务日过滤；分页读到终点或上限（P1：完整性）。
-    // 站点是否具备统计端点：决定 24 小时口径是否需要走明细兜底（方案 035 R2）。
-    const hasUsageStatsEndpoint = endpoints.some((e: any) => e.role === 'usage_stats' && e.path)
+    // 站点是否具备**双区间**统计端点（Hubway dashboard_stats）：决定 24 小时口径是否需要走明细兜底（方案 035 R2）。
+    // 方案 056：logStat（New API 单区间日志统计）不提供 24h 双区间，故不参与该判定，避免误关兜底。
+    const hasUsageStatsEndpoint = endpoints.some(
+      (e: any) => e.role === 'usage_stats' && e.endpointId === 'usageDashboardStats' && e.path,
+    )
     const configuredUsageListEps = endpoints.filter((e: any) => e.role === 'usage_list' && e.path)
     const usageListCandidates = [...configuredUsageListEps]
     const candidatePaths = new Set(usageListCandidates.map((e: any) => e.path))
@@ -2347,8 +2782,15 @@ export async function collectInPage(
         if (!more) break
       }
       recList.sort((a, b) => a.ts - b.ts) // 升序，便于画图
-      usageRecords = recList
-      usageRecordsComplete = recComplete
+      // 方案 057：usage_list 只登记为「逐条候选」，不直接提交（末尾统一择一）。
+      if (recList.length > 0 && callRecords == null) {
+        callRecords = recList
+        callSource = 'usage_list'
+        callComplete = recComplete
+        callServerTotal = null
+        callFetched = recList.length
+        callAnomaly = false
+      }
       usageRecordsTruncatedReason = recTruncated
       // 透出聚合值：未从其它用量端点获得今日用量时，用明细汇总回填（丰富概览）
       if (recList.length > 0) {
@@ -2356,6 +2798,7 @@ export async function collectInPage(
         todayRequests = todayRequests ?? recTotalReqs
         if (recCostByCurrency[stratCurrency] != null) todayCost = todayCost ?? recCostByCurrency[stratCurrency]
         usageSource = usageSource ?? 'usage_list'
+        todayUsageSource = todayUsageSource ?? 'usage_list'
       }
 
       // ── 24 小时口径兜底（方案 035 R2）──────────────────────────────
@@ -2412,8 +2855,8 @@ export async function collectInPage(
       const isProvider = e.role === 'usage_stats' || e.role === 'account_snapshot' || e.role === 'range_usage' || e.role === 'billing_config'
       // 余额主链路已读取到单位时，不重复请求 /api/status；这也避免后置 provider 覆盖已验证结果。
       if (e.role === 'billing_config' && billingConfig?.quotaPerUnit != null) return false
-      // refresh 会轮换会话并可能改变服务端状态，只能由用户主动同步触发。
-      return isProvider && (manualCollect || !isSessionRefresh)
+      // refresh 会轮换会话并可能改变服务端状态；后台采集只在受控门控放行时执行。
+      return isProvider && (refreshGate || !isSessionRefresh)
     })
     // billing 配置必须先于账户/区间 provider，确保 quota 使用站点实际单位和汇率转换。
     const orderedStatsEps = [...statsEps].sort((a: any, b: any) => {
@@ -2430,6 +2873,41 @@ export async function collectInPage(
         const isJson = base ? base.isJson : false
         const elapsedMs = base ? base.elapsedMs : 0
         if (ep.role === 'usage_stats') {
+          // 方案 056：New API 日志统计端点（/api/log/self/stat）。与 Hubway 的
+          // start_date/end_date 体系不同：它使用秒级 start_timestamp/end_timestamp，
+          // 且此处只取「今日」一个区间（24h 口径由 range_usage 聚合桶承担）。
+          // 端点由 buildStrategy 按 capability 注册，这里不判断 hostname（GPT P0-6）。
+          if (ep.endpointId === 'logStat') {
+            const st = await requestEndpoint({
+              ...ep,
+              queryTemplate: { p: 1, page_size: 1, start_timestamp: fromSec, end_timestamp: toSec },
+            })
+            if (st.status >= 200 && st.status < 400 && st.isJson && st.json) {
+              // 显式一步解包（实测体为 { success, data: { quota, rpm, tpm } }），不做递归搜索
+              const root = unwrapStats(st.json)
+              const quota = toFiniteNonNegative(getPath(root, 'quota'))
+              recordDiag('usage', `${origin}${ep.path}`, st.status, 'application/json', st.elapsedMs, root, '日志统计端点响应（今日）')
+              if (quota != null) {
+                const conv = quotaToCurrency(
+                  quota,
+                  billingConfig ?? { quotaPerUnit: null, usdExchangeRate: null, customCurrencyExchangeRate: null },
+                  stratCurrency,
+                )
+                if (conv.unitAssumed) unitAssumed = true
+                if (conv.value != null && dsTodayCost == null) {
+                  // 该端点是站点自身「用量统计」卡片的口径，作为今日花费权威值；
+                  // 若已有更早的 dashboard_stats（Hubway 双区间）结果则**不覆盖**，避免同类端点互相踩。
+                  // 与聚合桶合计的差异由调用方按 ≥10% 记一条脱敏诊断（不存金额）。
+                  dsTodayCost = conv.value
+                  usageStatsSource = 'dashboard_stats'
+                  usageWindowVal = 'calendar_day'
+                }
+              }
+            } else {
+              recordDiag('usage', `${origin}${ep.path}`, st.status || 0, 'application/json', st.elapsedMs, null, '日志统计端点不可用（按无此能力处理）')
+            }
+            continue
+          }
           // 区间统计接口的两种口径**都靠 start_date/end_date 区分**，两者都必须显式传参：
           //   今日    → start_date=TODAY     & end_date=TODAY
           //   24 小时 → start_date=YESTERDAY & end_date=TODAY（站点 UI 上「近 24 小时」就是这个区间）
@@ -2570,7 +3048,7 @@ export async function collectInPage(
           }
           if ((!parsed || !extractAccountSnapshot(parsed)) && refreshSnapshotRaw) parsed = refreshSnapshotRaw
           // 账户快照优先用 GET 用户接口；缺失必要字段且为受控手动流程时，再尝试 POST refresh（有副作用，方案 §4.6）
-          if ((!parsed || !extractAccountSnapshot(parsed)) && manualCollect && !refreshAttempted) {
+          if ((!parsed || !extractAccountSnapshot(parsed)) && refreshGate && !refreshAttempted) {
             refreshAttempted = true
             try {
               const ref = await requestEndpoint({ ...ep, path: '/api/user/auth/refresh', method: 'POST', bodyTemplate: null })
@@ -2600,6 +3078,9 @@ export async function collectInPage(
               ruTodayCost = ru.costSum
               ruTodayTokens = ru.tokenSum
               ruTodayRequests = ru.requestSum
+              // 方案 056/057：同一解析顺带保留聚合桶，供模型均价与模型分布使用。
+              // 候选制：与 hourly_aggregate 共享同一份响应，首次成功者为准，不重复请求。
+              takeBucketCandidate(ru.buckets, 'range_usage')
               // 自然日口径：页面已按 Asia/Shanghai 自然日过滤；rolling 24h 由同一接口另一窗口产生，此处不覆盖
               usageWindowVal = usageWindowVal ?? 'calendar_day'
             }
@@ -2706,8 +3187,112 @@ export async function collectInPage(
       usageWindow: null,
       todayCostSource: null,
       usageStatsSource: null,
+      todayCacheReadTokens: null,
+      todayUsageSource: null,
+      usageDetailSource: null,
+      usageDetailCoverage: null,
+      usageDetailRecords: undefined,
     }
   }
+
+  // ===== 方案 057：明细候选的唯一提交点 =====
+  // 桶记录显式标注 granularity='bucket' 与 requestCount，任何消费方都不得把它当作「一次调用」。
+  // 金额只由该桶自身的 quota 换算（GPT Q1：不允许把全局 stat.quota 分摊到模型）。
+  // 口径契约（GPT P0-4）：
+  //   detailSource  = 明细表「实际展示」的来源（call 优先，无 call 时退回 bucket）
+  //   detailCoverage= full_day_aggregate（桶：服务端全量聚合）/ all_day_exact（逐条且已抓齐）/ recent_incomplete（只抓到最近若干条）
+  //   records       = 喂趋势 / 分布 / **模型均价** 的那一份（桶优先：全天精确口径）
+  let usageDetailSource: 'bucket' | 'call' | null = null
+  let usageDetailCoverage: 'full_day_aggregate' | 'all_day_exact' | 'recent_incomplete' | null = null
+  let usageDetailRecords: UsageRecord[] = []
+
+  const bucketRecs: UsageRecord[] = []
+  if (bucketRows.length > 0) {
+    const billing = billingConfig ?? { quotaPerUnit: null, usdExchangeRate: null, customCurrencyExchangeRate: null }
+    const byModel = new Map<string, { tokens: number; cost: number }>()
+    let cacheSum = 0
+    let cacheKnown = false
+    for (const b of bucketRows) {
+      const conv = b.quota != null
+        ? quotaToCurrency(b.quota, billing, stratCurrency)
+        : { value: null as number | null, unitAssumed: false }
+      if (conv.unitAssumed) unitAssumed = true
+      const cost = conv.value
+      const model = b.model || '(unknown)'
+      // 稳定 id：模型 + 桶起点（同日重复采集得到同一 id，天然幂等）
+      const seed = `${model}|${b.ts}`
+      let h = 0x811c9dc5
+      for (let i = 0; i < seed.length; i++) {
+        h ^= seed.charCodeAt(i)
+        h = Math.imul(h, 0x01000193)
+      }
+      bucketRecs.push({
+        id: `b${(h >>> 0).toString(16)}`,
+        ts: b.ts,
+        model,
+        // GPT P0-2：服务端只给总量，不得伪造成 prompt/completion 拆分
+        promptTokens: 0,
+        completionTokens: 0,
+        tokens: b.tokens,
+        cacheReadTokens: b.cacheRead,
+        cacheCreationTokens: b.cacheCreate,
+        cost,
+        actualCost: cost,
+        actualCostCurrency: cost != null ? stratCurrency : null,
+        standardCost: null,
+        standardCostCurrency: null,
+        costCurrency: stratCurrency,
+        endpoint: null,
+        apiKeyId: null,
+        apiKeyLabel: null,
+        ipHash: null,
+        reasoningEffort: null,
+        group: null,
+        type: 'aggregate',
+        billingMode: null,
+        granularity: 'bucket',
+        requestCount: b.requests,
+      })
+      if (b.cacheRead != null) {
+        cacheSum += b.cacheRead
+        cacheKnown = true
+      }
+      const prev = byModel.get(model) ?? { tokens: 0, cost: 0 }
+      prev.tokens += b.tokens
+      if (cost != null) prev.cost += cost
+      byModel.set(model, prev)
+    }
+    // 桶为主口径：records 用桶（服务端全天聚合，complete 由构造保证）
+    usageRecords = bucketRecs
+    usageRecordsComplete = true
+    usageDetailSource = 'bucket'
+    usageDetailCoverage = 'full_day_aggregate'
+    usageCollected = true
+    usageFailed = false
+    if (cacheKnown) todayCacheReadTokens = cacheSum
+    if (byModel.size > 0) {
+      modelUsages = [...byModel.entries()]
+        .map(([model, v]) => ({ model, tokens: v.tokens, cost: v.cost }))
+        .sort((a, b) => b.tokens - a.tokens)
+    }
+    if (!todayUsageSource) todayUsageSource = 'data_self'
+    // 逐条候选仅作「明细展示」补充（不进均价、不进趋势，避免与桶重复计数）
+    if (callRecords && callRecords.length > 0) {
+      usageDetailSource = 'call'
+      usageDetailRecords = callRecords
+      usageDetailCoverage = callComplete ? 'all_day_exact' : 'recent_incomplete'
+    }
+  } else if (callRecords && callRecords.length > 0) {
+    // 无桶可用：逐条候选即唯一来源，均价按完整性标记（不完整时由 handler 标「样本均价」）
+    usageRecords = callRecords
+    usageRecordsComplete = callComplete
+    usageDetailSource = 'call'
+    usageDetailCoverage = callComplete ? 'all_day_exact' : 'recent_incomplete'
+    usageCollected = true
+  }
+  void usageDetailSource
+  void usageDetailCoverage
+  void bucketSource
 
   // Task #24：若余额端点未拿到累计Token/平均响应，但用量端点拿到了 → 回填
   // 统计接口（dashboard_stats）优先：其 total_tokens 是权威累计值，不得被输入+输出相加或今日 Token 覆盖。
@@ -2815,10 +3400,17 @@ export async function collectInPage(
     usageWindow: usageWindowVal,
     todayCostSource: finalTodayCostSource,
     usageStatsSource,
+    // 方案 056：今日缓存命中与今日用量来源（与 todayTokens 同源同窗口）
+    todayCacheReadTokens,
+    todayUsageSource: todayUsageSource ?? null,
     diags,
     usageRecords,
     usageRecordsComplete,
     usageRecordsTruncatedReason,
+    // 方案 057：明细来源与覆盖（records 主口径之外的「逐条展示」通道）
+    usageDetailSource,
+    usageDetailCoverage,
+    usageDetailRecords: usageDetailRecords.length > 0 ? usageDetailRecords : undefined,
   }
 }
 
@@ -2954,7 +3546,7 @@ export async function probeSessionInPage(
       const userOk = !!user &&
         user.id !== undefined && user.id !== null &&
         typeof user.username === 'string' && user.username.trim().length > 0 &&
-        typeof user.role === 'string' && user.role.trim().length > 0
+        ((typeof user.role === 'string' && user.role.trim().length > 0) || (typeof user.role === 'number' && Number.isFinite(user.role)))
       const sessionOk = !!session &&
         typeof session.sid === 'string' && session.sid.trim().length > 0 &&
         session.current !== undefined && session.current !== null &&
@@ -3165,13 +3757,22 @@ export async function probeSessionInPage(
         }
         return { response, contentType, json }
       }
-      let refreshed = await fetchRefresh(headers)
-      if (
-        (refreshed.response.status === 401 || refreshed.response.status === 403 || isBusinessAuthFailure(refreshed.json)) &&
-        tokenHeaders.Authorization && pageAuthContext.provider !== 'new_api_user_object'
-      ) {
-        refreshed = await fetchRefresh(tokenHeaders)
+      // 方案 052 v2：与 collectInPage、页面前端共用同名 Web Lock，
+      // 避免「授权探测」与「采集」/「页面自身 refresh」并发轮换会话（GPT 评审 §9.2 第 3 项）。
+      const runRefresh = async () => {
+        let refreshed = await fetchRefresh(headers)
+        if (
+          (refreshed.response.status === 401 || refreshed.response.status === 403 || isBusinessAuthFailure(refreshed.json)) &&
+          tokenHeaders.Authorization && pageAuthContext.provider !== 'new_api_user_object'
+        ) {
+          refreshed = await fetchRefresh(tokenHeaders)
+        }
+        return refreshed
       }
+      const probeLocks: any = typeof navigator !== 'undefined' ? (navigator as any).locks : null
+      const refreshed = probeLocks && typeof probeLocks.request === 'function'
+        ? await probeLocks.request('new-api:auth-refresh', { mode: 'exclusive' }, runRefresh)
+        : await runRefresh()
       clearTimeout(timer)
       lastStatus = refreshed.response.status
       if (refreshed.response.status >= 200 && refreshed.response.status < 400 && refreshed.contentType.includes('json')) {

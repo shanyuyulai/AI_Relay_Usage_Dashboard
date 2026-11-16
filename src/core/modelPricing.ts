@@ -170,7 +170,13 @@ export function computeModelPrices(
       continue
     }
     // P1-3：逐条换算成 RMB 后才允许相加；比例缺失时 rmb 不累计（rows 仍统计 tokens）
-    const rmb = missingRate ? null : realRmb(amount, rate)
+    // 方案 056：记录币种本身已是人民币（固定人民币结算站点）时无需充值比例，金额即人民币，
+    // 否则 cnyOnly 站点因 rechargeRate 为空导致均价恒为 null。
+    const rmb = cur && cur.toUpperCase() === 'CNY'
+      ? amount
+      : missingRate
+        ? null
+        : realRmb(amount, rate)
 
     const model = (r.model ?? '').trim() || '(unknown)'
     let acc = accs.get(model)
@@ -178,9 +184,12 @@ export function computeModelPrices(
       acc = { tokens: 0, requests: 0, rmb: 0, rmbKnown: false, listPriceBased: false, rangeStart: null, rangeEnd: null, rawRecords: [] }
       accs.set(model, acc)
     }
-    const tk = (r.promptTokens ?? 0) + (r.completionTokens ?? 0)
+    // 方案 056（GPT P0-2）：优先用记录自带的总量 tokens（聚合桶只提供总量，无 prompt/completion 拆分）；
+    // 缺失时才回退 prompt+completion（逐次调用记录的既有口径）。
+    const tkDirect = Number.isFinite(r.tokens) && r.tokens > 0 ? r.tokens : 0
+    const tk = tkDirect > 0 ? tkDirect : (r.promptTokens ?? 0) + (r.completionTokens ?? 0)
     acc.tokens += Number.isFinite(tk) && tk > 0 ? tk : 0
-    acc.requests += 1
+    acc.requests += r.granularity === 'bucket' ? Math.max(0, r.requestCount ?? 0) : 1
     if (rmb != null) {
       acc.rmb += rmb
       acc.rmbKnown = true
@@ -207,8 +216,10 @@ export function computeModelPrices(
   const models: ModelComputation[] = []
   for (const [model, acc] of accs) {
     // tokens>0 才有意义；tokens=0（如纯图片/异常记录）保留行但价格置 null
+    // 方案 056：rmbKnown 已在逐条换算时判定（CNY 记录无需比例即可计入），
+    // 这里不再用全局 missingRate 一票否决，否则固定人民币站点均价恒为 null。
     const pricePerM =
-      !missingRate && acc.rmbKnown && acc.tokens > 0 ? (acc.rmb / acc.tokens) * 1_000_000 : null
+      acc.rmbKnown && acc.tokens > 0 ? (acc.rmb / acc.tokens) * 1_000_000 : null
     models.push({
       model,
       tokens: acc.tokens,

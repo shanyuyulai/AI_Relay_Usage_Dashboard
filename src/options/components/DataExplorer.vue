@@ -8,6 +8,7 @@ import type {
   CollectSilentResponse,
   LabZeroTabResponse,
   LabCorsResponse,
+  LabBearerAutoRefreshResponse,
   LabShowDashboardResponse,
   ClickBehaviorResponse,
   UpdateCheckStatusResponse,
@@ -24,6 +25,7 @@ import {
   loadDashboardSettings,
   setCalcRealCost,
   setShowTodayCostInPopup,
+  setShowTodayUsageInPopup,
   setCostWindow,
   setBalanceRmbMode,
   setShowModelAvgPrice,
@@ -62,6 +64,8 @@ const silentMode = ref<boolean>(true)
 const labEnabled = ref<boolean>(false)
 // 实验室：动态 CORS 放行开关（默认关闭）
 const labCorsEnabled = ref<boolean>(false)
+// 实验室：新版 New API Bearer 会话后台自动刷新开关（方案 052 v2，默认关闭）
+const labBearerAutoRefresh = ref<boolean>(false)
 // 实验室：图标点击弹极简用量看板开关（默认关闭）
 const labShowDashboard = ref<boolean>(false)
 // 配置界面：单击图标行为（默认「极简面板」）
@@ -94,6 +98,13 @@ const showTodayCostInPopup = computed({
   get: () => dashboardSettings.showTodayCostInPopup,
   set: (v: boolean) => {
     void setShowTodayCostInPopup(v)
+  },
+})
+// 极简面板显示今日用量（方案 056）
+const showTodayUsageInPopup = computed({
+  get: () => dashboardSettings.showTodayUsageInPopup !== false,
+  set: (v: boolean) => {
+    void setShowTodayUsageInPopup(v)
   },
 })
 // 余额显示真实人民币（全局开关，方案 036）
@@ -407,6 +418,31 @@ async function saveLabCors() {
   }
 }
 
+async function loadLabBearerAutoRefresh() {
+  try {
+    const res = await send<LabBearerAutoRefreshResponse>('GET_LAB_BEARER_AUTO_REFRESH')
+    labBearerAutoRefresh.value = res.enabled
+  } catch {
+    /* 忽略，默认关闭 */
+  }
+}
+
+async function saveLabBearerAutoRefresh() {
+  try {
+    const res = await send<LabBearerAutoRefreshResponse>('SET_LAB_BEARER_AUTO_REFRESH', {
+      enabled: labBearerAutoRefresh.value,
+    })
+    labBearerAutoRefresh.value = res.enabled
+    showMsg(
+      res.enabled
+        ? '已开启：新版 New API 站点允许后台自动刷新会话（仍需通过只读协议确认与 Web Locks 门控）'
+        : '已关闭后台自动刷新会话：定时采集不再发起 refresh，手动「立即同步」仍可正常采集',
+    )
+  } catch (e) {
+    showMsg(e instanceof MessagingError ? e.message : String(e))
+  }
+}
+
 async function loadLabShowDashboard() {
   try {
     const res = await send<LabShowDashboardResponse>('GET_LAB_SHOWDASHBOARD')
@@ -496,7 +532,7 @@ async function checkUpdateNow(): Promise<void> {
   upd.value.checking = true
   try {
     applyUpdStatus(await send<UpdateCheckStatusResponse>('CHECK_UPDATE_NOW'))
-    showMsg(upd.value.hasUpdate ? `版本不一致：远端最新 ${upd.value.latestVersion}，本地 ${upd.value.currentVersion}` : '版本一致，当前已是最新')
+    showMsg(upd.value.hasUpdate ? `检测到新版本 ${upd.value.latestVersion}（本地 ${upd.value.currentVersion}）` : '当前已是最新版本')
   } catch (e) {
     showMsg(e instanceof MessagingError ? e.message : String(e))
   } finally {
@@ -688,6 +724,7 @@ onMounted(() => {
   loadSilent()
   loadLab()
   loadLabCors()
+  loadLabBearerAutoRefresh()
   loadLabShowDashboard()
   loadClickBehavior()
   loadNotify()
@@ -1079,7 +1116,7 @@ onMounted(() => {
     <details class="settings-card" :open="upd.hasUpdate && !upd.dismissed">
       <summary>⬆️ 更新检测</summary>
       <p class="settings-desc">
-        定期访问 GitHub 版本页（tags）检查插件新版本（每 12 小时一次），对比远端最新版本与本地版本是否一致，不一致即提醒。
+        定期访问 GitHub 版本页（tags）检查插件新版本（每 12 小时一次），远端最新版本比本地新时才提醒。
         发现新版本时通过系统通知与看板横幅提醒，点击即可打开版本页手动下载更新。
         检测只读取公开的版本信息，<b>不下载任何文件、不上传任何本地数据</b>。
       </p>
@@ -1098,7 +1135,7 @@ onMounted(() => {
           <button class="btn" @click="openReleasesPage()">打开版本页</button>
         </div>
         <small v-if="upd.hasUpdate && !upd.dismissed" class="upd-new">
-          🆕 版本不一致：远端最新 v{{ upd.latestVersion }}，本地 v{{ upd.currentVersion }}，点击「打开版本页」下载更新
+          🆕 有新版本 v{{ upd.latestVersion }} 可用（本地 v{{ upd.currentVersion }}），点击「打开版本页」下载更新
         </small>
         <small v-else-if="upd.err" class="upd-err">{{ upd.err }}</small>
       </div>
@@ -1118,6 +1155,10 @@ onMounted(() => {
       <label class="lab-toggle">
         <input type="checkbox" v-model="showTodayCostInPopup" />
         <span>极简面板显示今日花费（在余额正下方显示花费行）</span>
+      </label>
+      <label class="lab-toggle">
+        <input type="checkbox" v-model="showTodayUsageInPopup" />
+        <span>极简面板显示今日用量（token 总量 · 请求数，并标注缓存命中占比）</span>
       </label>
       <label class="lab-toggle">
         <input type="checkbox" v-model="balanceRmbMode" />
@@ -1217,6 +1258,31 @@ onMounted(() => {
         </p>
         <p class="lab-warn">
           关于「悬浮(hover)」：Chrome 扩展的工具栏图标没有「鼠标悬停弹出自定义浮层」的原生 API（只有系统自带的 tooltip 文字）。极简面板是单击触发的原生 popup，这是 MV3 下能做成的形态。
+        </p>
+
+        <hr class="lab-hr" />
+
+        <label class="lab-toggle">
+          <input type="checkbox" v-model="labBearerAutoRefresh" @change="saveLabBearerAutoRefresh" />
+          <span>新版 New API 站点 · 后台自动刷新会话（方案 052 · 默认关闭）</span>
+        </label>
+        <p class="lab-warn">
+          <b>这是什么：</b>部分公司自部署的新版 New API 站点把登录态换成短期
+          <code>Bearer access_token</code>（只存在页面内存里），余额与用量接口一律要求该令牌。插件只能通过
+          <code>POST /api/user/auth/refresh</code> 换取认证包。<b>手动「立即同步」始终可用，不受本开关影响</b>；本开关只决定
+          <strong>定时自动采集</strong>是否也允许发起这次有副作用的 refresh。
+        </p>
+        <p class="lab-warn">
+          <b>风险（请务必知悉）：</b>refresh 会轮换会话；若会话恰好已失效，服务端可能<strong>清空登录 Cookie</strong>，导致已打开的站点页面被判为登出、跳转登录页。
+        </p>
+        <p class="lab-warn">
+          <b>三重保护：</b>开启后仍需同时满足 ① 检测到 <code>new_api_has_session</code> 会话标记；② 只读
+          <code>/api/status</code> 返回版本头与版本字段（协议确认）；③ 浏览器支持 Web Locks，插件与页面共用
+          <code>new-api:auth-refresh</code> 独占锁且单站单次刷新。任一不满足即<strong>放弃后台刷新（fail closed）</strong>，定时采集返回空值而非冒险操作。
+          令牌仅在本次采集的内存中使用，<strong>绝不写入数据库或导出</strong>。
+        </p>
+        <p class="lab-warn">
+          若开启后发现站点被踢下线，请<strong>立即关闭本选项</strong>并重新登录站点；关闭后定时采集不再发起 refresh，行为与旧版完全一致。
         </p>
       </div>
     </details>

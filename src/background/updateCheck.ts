@@ -5,7 +5,7 @@ import { settingsRepo } from '../storage/config'
  *
  * - 数据源：GitHub Tags API（公开只读，不带凭证、不上传本地数据）。仓库以 tags 标记版本，
  *   不使用 GitHub Releases，因此取标签列表中语义化版本号最大的一个作为「最新版本」。
- * - 判定：远端最新版本与本地版本**不一致**即视为需要更新（用户指定的口径）。
+ * - 判定：远端最新版本**比本地新**才提醒（逐段数值比较；仅版本号不同但更旧时不提示）。
  * - 节奏：12h 周期 alarm 唤醒 SW 检查；SW 启动也检查，但两次真实网络请求最小间隔 6h。
  * - 提示：系统通知（每版本仅一次，点击打开版本页）+ 极简面板/侧边栏页内横幅（可忽略）。
  * - 不自动下载/安装：点击只打开版本页（tags）由用户手动下载更新。
@@ -101,15 +101,15 @@ async function readStatus(): Promise<UpdateCheckStatus> {
     settingsRepo.get<string>(DISMISSED_KEY).catch(() => null),
   ])
   const cur = currentVersion()
-  // 口径：远端最新版本与本地**不一致**即视为需要更新（用户指定，'v' 前缀差异归一化后忽略）
-  const curNorm = normalizeVersion(cur)
-  const latNorm = latest ? normalizeVersion(latest) : null
-  const hasUpdate = !!latNorm && !!curNorm && latNorm !== curNorm
+  // 口径：远端最新版本比本地新才提醒（0.5.0 < 0.5.1 这类「远端更旧」不提示）
+  const hasUpdate = !!latest && isNewerVersion(latest, cur)
+  // 兼容清洗：旧版逻辑存过 releases 页地址（…/releases/tag/x.y.z），非 tags 地址一律回退版本页
+  const safeUrl = url && /\/tags(\/|$|\?)/.test(url) ? url : TAGS_URL
   return {
     enabled,
     currentVersion: cur,
     latestVersion: latest ?? null,
-    latestUrl: url ?? null,
+    latestUrl: safeUrl,
     latestPublishedAt: typeof published === 'number' ? published : null,
     hasUpdate,
     dismissed: hasUpdate && dismissed === latest,
@@ -191,8 +191,7 @@ export async function checkForUpdate(force = false): Promise<UpdateCheckStatus> 
     await settingsRepo.set(LATEST_URL_KEY, url) // 允许 null：回退到 TAGS_URL
     await settingsRepo.set(LATEST_PUBLISHED_KEY, published)
     const cur = currentVersion()
-    const hasUpdate = !!normalizeVersion(latest) && normalizeVersion(latest) !== normalizeVersion(cur)
-    if (hasUpdate && (await isUpdateCheckEnabled())) {
+    if (isNewerVersion(latest, cur) && (await isUpdateCheckEnabled())) {
       const notified = await settingsRepo.get<string>(NOTIFIED_KEY).catch(() => null)
       if (notified !== latest) {
         await settingsRepo.set(NOTIFIED_KEY, latest)
@@ -210,6 +209,24 @@ export function setupUpdateCheck(): void {
     if (id !== NOTIFY_ID) return
     void chrome.tabs.create({ url: TAGS_URL }).catch(() => {})
   })
+  // 一次性迁移：旧版（Releases API 时代）遗留的缓存（latest=旧版本 + …/releases/tag/… 地址）
+  // 会导致节流期内显示错误状态并跳旧地址 → 检测到即清空，下轮检查重新拉取 tags 数据。
+  void (async () => {
+    try {
+      const url = await settingsRepo.get<string>(LATEST_URL_KEY).catch(() => null)
+      if (typeof url === 'string' && /github\.com\/.+\/releases/.test(url)) {
+        await Promise.all([
+          settingsRepo.remove(LATEST_KEY),
+          settingsRepo.remove(LATEST_URL_KEY),
+          settingsRepo.remove(LATEST_PUBLISHED_KEY),
+          settingsRepo.remove(NOTIFIED_KEY),
+          settingsRepo.remove(DISMISSED_KEY),
+        ])
+      }
+    } catch {
+      /* 迁移失败不影响主流程 */
+    }
+  })()
 }
 
 /** 使更新检查 alarm 与开关/插件启用态一致（幂等，SW 启动与开关切换时调用）。 */
