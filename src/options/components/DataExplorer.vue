@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import { send, MessagingError } from '../../core/messaging/client'
 import type {
   GetSiteDataResponse,
@@ -491,7 +491,9 @@ const upd = ref({
   currentVersion: '',
   latestVersion: null as string | null,
   latestUrl: null as string | null,
+  // 默认仍是 GitHub 版本页（Gitee 镜像未就绪时不会跳到 404）；命中 Gitee 源后由后台状态切换
   tagsUrl: 'https://github.com/shanyuyulai/AI_Relay_Usage_Dashboard/tags',
+  source: null as 'gitee' | 'github' | null,
   hasUpdate: false,
   dismissed: false,
   lastCheckedAt: null as number | null,
@@ -505,6 +507,7 @@ function applyUpdStatus(r: UpdateCheckStatusResponse): void {
   upd.value.latestVersion = r.latestVersion
   upd.value.latestUrl = r.latestUrl
   if (r.tagsUrl) upd.value.tagsUrl = r.tagsUrl
+  upd.value.source = r.source
   upd.value.hasUpdate = r.hasUpdate
   upd.value.dismissed = r.dismissed
   upd.value.lastCheckedAt = r.lastCheckedAt
@@ -549,6 +552,29 @@ function openReleasesPage(url?: string | null): void {
 function fmtUpdTime(ts: number | null): string {
   return ts ? fmtDateTime(ts) : '—'
 }
+
+// 058：顶部版本号入口定位用。两层 details 的展开状态改为可控 ref；
+// 发现新版本时仍自动展开（原行为），用户手动折叠后也能被版本号按钮重新打开。
+const generalSettingsOpen = ref(false)
+const updateCardOpen = ref(false)
+const updateCardRef = ref<HTMLDetailsElement | null>(null)
+watch(
+  () => upd.value.hasUpdate && !upd.value.dismissed,
+  (hasNew) => {
+    if (hasNew) {
+      generalSettingsOpen.value = true
+      updateCardOpen.value = true
+    }
+  },
+  { immediate: true },
+)
+async function focusUpdateSection(): Promise<void> {
+  generalSettingsOpen.value = true
+  updateCardOpen.value = true
+  await nextTick()
+  updateCardRef.value?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+defineExpose({ focusUpdateSection })
 
 // 把后台返回的间隔值同步到视图（处理预设 / 自定义 / 关闭三种形态）
 function syncInterval(v: number | 'off') {
@@ -1072,7 +1098,7 @@ onMounted(() => {
 
     <div v-else class="state-msg">选择站点并点击「刷新」查看已采集数据</div>
 
-    <details class="settings-group" :open="upd.hasUpdate && !upd.dismissed">
+    <details class="settings-group" :open="generalSettingsOpen">
       <summary>⚙️ 通用设置 <span class="settings-summary-hint">（采集通知 · 单击图标行为 · 真实花费 · 更新检测 · 实验室；与数据表无关，默认折叠）</span></summary>
       <div class="settings-group-body">
     <details class="settings-card">
@@ -1113,11 +1139,11 @@ onMounted(() => {
       </div>
     </details>
 
-    <details class="settings-card" :open="upd.hasUpdate && !upd.dismissed">
+    <details class="settings-card" ref="updateCardRef" :open="updateCardOpen">
       <summary>⬆️ 更新检测</summary>
       <p class="settings-desc">
-        定期访问 GitHub 版本页（tags）检查插件新版本（每 12 小时一次），远端最新版本比本地新时才提醒。
-        发现新版本时通过系统通知与看板横幅提醒，点击即可打开版本页手动下载更新。
+        优先访问 Gitee 镜像仓库的 tags（国内可达），不可用时自动回退 GitHub（每 12 小时一次），远端最新版本比本地新时才提醒。
+        发现新版本时通过系统通知与看板横幅提醒，点击即可打开命中源的版本页手动下载更新。
         检测只读取公开的版本信息，<b>不下载任何文件、不上传任何本地数据</b>。
       </p>
       <label class="lab-toggle">
@@ -1127,7 +1153,8 @@ onMounted(() => {
       <div class="upd-status">
         <small class="upd-line">
           当前版本 <b>v{{ upd.currentVersion || '—' }}</b><template v-if="upd.latestVersion">
-          · 最新版本 <b>v{{ upd.latestVersion }}</b></template><template v-if="upd.lastCheckedAt">
+          · 最新版本 <b>v{{ upd.latestVersion }}</b></template><template v-if="upd.source">
+          · 检测源 <b>{{ upd.source === 'gitee' ? 'Gitee' : 'GitHub' }}</b></template><template v-if="upd.lastCheckedAt">
           · 上次检查 {{ fmtUpdTime(upd.lastCheckedAt) }}</template>
         </small>
         <div class="upd-acts">

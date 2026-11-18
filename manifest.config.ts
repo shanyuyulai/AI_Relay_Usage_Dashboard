@@ -28,8 +28,8 @@ export default defineManifest({
     '128': 'icon-128.png',
   },
   // 站点域不在此静态声明，由 ADD_SITE 时动态 chrome.permissions.request(origin + '/*')（P0-5 逐站授权）
-  // api.github.com 为自动检测更新的固定基础设施域（方案 051，公开只读 Releases API）
-  host_permissions: ['https://api.github.com/*'],
+  // 自动检测更新的固定基础设施域（方案 051 + 058）：Gitee 镜像优先、GitHub 回退，公开只读 tags API
+  host_permissions: ['https://gitee.com/*', 'https://api.github.com/*'],
   // 运行时可申请的域白名单：<all_urls> 仅作为「可申请范围」，实际只申请用户填入的具体 origin
   optional_host_permissions: ['<all_urls>'],
   background: {

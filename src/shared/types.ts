@@ -517,6 +517,15 @@ export interface ModelAvgRawRecord {
   model: string
   promptTokens: number
   completionTokens: number
+  /**
+   * 本条参与均价分母的**有效总量 tokens**（方案 A）。
+   * - bucket（服务端小时聚合桶）= token_used，含缓存命中；此时 promptTokens/completionTokens 为 0 属预期；
+   * - call（逐条调用）= 服务端 tokens 或 prompt+completion。
+   * 旧档案可能无此字段（undefined），消费方须按「—」兼容，绝不臆造。
+   */
+  tokens?: number
+  /** 记录粒度：bucket=服务端聚合桶；call/缺省=逐条调用。旧档案可能无此字段。 */
+  granularity?: 'call' | 'bucket'
   /** 参与计算的金额（本币）：实扣 actualCost 优先，缺失回退标价 cost */
   amount: number | null
   /** true = 金额回退标价口径（actualCost 缺失） */

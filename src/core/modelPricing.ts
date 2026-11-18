@@ -36,7 +36,7 @@ export function normalizeModelAvgMaxRecords(v: unknown): number {
 /** 单模型均价行（hover 浮窗列表；已按用量倒序排好）。 */
 export interface ModelPriceRow {
   model: string
-  /** 输入+输出 tokens 合计（与看板既有口径一致，不含 cache）。 */
+  /** 参与均价分母的有效总量 tokens：bucket=token_used（含缓存）；call=输入+输出。 */
   tokens: number
   requests: number
   /** ¥/百万 tokens；null → UI 显「—」（缺比例或无有效金额）。 */
@@ -203,6 +203,10 @@ export function computeModelPrices(
       model,
       promptTokens: r.promptTokens ?? 0,
       completionTokens: r.completionTokens ?? 0,
+      // 方案 A：把真正的分母落进投影，解决「输入/输出全 0 却有均价」的误读。
+      // tk 已在此行上方按 tokens 优先算出（bucket=token_used 含缓存），绝不再用 prompt+completion 覆写。
+      tokens: Number.isFinite(tk) && tk > 0 ? tk : 0,
+      granularity: r.granularity === 'bucket' ? 'bucket' : 'call',
       amount,
       listPrice,
       currency: cur,

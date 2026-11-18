@@ -96,6 +96,33 @@ const rows = computed<DetailRow[]>(() =>
 const viewer = ref<null | { title: string; algo: string[]; loading: boolean; records: ModelAvgRawRecord[] }>(null)
 let srcLoading = false
 
+/**
+ * 方案 A：弹窗合计口径——仅当**全部**记录都有该字段时才合计；缺一显「—」，绝不臆造。
+ * 这一行就是「输入/输出全 0 却有均价」的直接反证：合计总量是真正的分母。
+ */
+function calcTotals(records: readonly ModelAvgRawRecord[]): { tokens: number | null; rmb: number | null } {
+  const tokens = records.length > 0 && records.every((r) => r.tokens != null)
+    ? records.reduce((s, r) => s + (r.tokens ?? 0), 0)
+    : null
+  const rmb = records.length > 0 && records.every((r) => r.rmb != null)
+    ? records.reduce((s, r) => s + (r.rmb ?? 0), 0)
+    : null
+  return { tokens, rmb }
+}
+const viewerTotals = computed(() => (viewer.value ? calcTotals(viewer.value.records) : null))
+
+/** 方案 A：聚合桶/旧档案的口径注记——输入/输出为 0 是预期，不是除零。 */
+function bucketNote(records: readonly ModelAvgRawRecord[]): string[] {
+  const notes: string[] = []
+  if (records.some((r) => r.granularity === 'bucket')) {
+    notes.push('说明：标「桶」的记录来自服务端小时聚合，只提供 token 总量（含缓存命中），不提供输入/输出拆分，故这两列显示 0 属预期；均价分母取「总量」列，并非除以 0。')
+  }
+  if (records.length > 0 && records.every((r) => r.tokens == null)) {
+    notes.push('说明：这些记录来自旧版本档案，未保存总量字段（表格显「—」）；重新采集后即可看到分母明细。')
+  }
+  return notes
+}
+
 /** 整站口径：当前批次现算（口径=最近 N 条），数据已在手。 */
 function openSiteViewer(r: DetailRow): void {
   const d = r.detail
@@ -105,7 +132,8 @@ function openSiteViewer(r: DetailRow): void {
     algo: [
       `数据口径：该站点逐条用量明细，取${maxRecordsText.value}（按时间倒序）；本次实际参与 ${d.usedCount} 条${d.skippedCount ? `，跳过 ${d.skippedCount} 条（缺金额或币种与站点计价币种不符）` : ''}；价格来自历史档案的模型以「档」标注。`,
       `逐条金额：优先取「实扣」，缺失时回退「标价」（行内标「标」）；人民币折算 = 金额 × 充值比例 ${d.rechargeRate ?? '未填充'}${d.siteCurrency ? `（站点按 ${d.siteCurrency} 计价）` : ''}。`,
-      '模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ（输入 + 输出 tokens）× 1,000,000。',
+      '模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ **总量 tokens**（见表格「总量」列）× 1,000,000。',
+      ...bucketNote(d.records),
       `看板默认展示的价格 = 用量最大模型的价格；模型列表按用量倒序${d.partial ? '；明细超上限（≈），按已采集部分计算' : ''}。`,
     ],
     loading: false,
@@ -127,6 +155,7 @@ async function openDetailViewer(r: DetailRow): Promise<void> {
         res.detailCoverage === 'all_day_exact'
           ? '覆盖范围：今日全部调用记录（已抓齐）。'
           : '覆盖范围：仅最近若干条记录（受采集页数预算限制），**不代表全天**，不可与「今日总量」相加或对账。',
+        '「总量」列 = 该条参与统计的 token 总数（服务端 token_used 或输入+输出）；仅供核对，不参与均价。',
         '提示：模型均价的计算基础是「全天小时聚合」，与本明细表口径不同，二者不互为校验依据。',
       ],
       loading: false,
@@ -154,7 +183,8 @@ async function openDetailViewer(r: DetailRow): Promise<void> {
         algo: [
           `数据口径：该模型参与计算的原始记录 ${p.usedCount} 条（时间范围 ${fmtRange(p.rangeStart, p.rangeEnd, p.usedCount) || '—'}）；采集批次${p.partial ? '超上限（≈），按已采集部分计算' : '完整'}。`,
           `逐条金额：优先取「实扣」，缺失时回退「标价」（行内标「标」）；人民币折算 = 金额 × 充值比例 ${p.rechargeRate ?? '未填充'}${p.missingRate ? '（未填充，无法折算人民币）' : ''}。`,
-          `该模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ（输入 + 输出 tokens）× 1,000,000 = ${fmtRowPrice(p.pricePerM)}${p.pricePerM != null ? `（精确值 ¥${fmtExact(p.pricePerM)}）` : ''}；档案计算于 ${fmtTs(p.computedAt)}${row.fromHistory ? '（价格来自历史档案）' : ''}。`,
+          `该模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ 总量 tokens（见「总量」列）× 1,000,000 = ${fmtRowPrice(p.pricePerM)}${p.pricePerM != null ? `（精确值 ¥${fmtExact(p.pricePerM)}）` : ''}；档案计算于 ${fmtTs(p.computedAt)}${row.fromHistory ? '（价格来自历史档案）' : ''}。`,
+          ...bucketNote(p.records),
         ],
         loading: false,
         records: p.records,
@@ -194,11 +224,11 @@ async function openHistoryViewer(h: ModelAvgHistory): Promise<void> {
   const algoBase = [
     `数据口径：该模型参与本次计算的原始记录 ${h.usedCount} 条（时间范围 ${fmtRange(h.rangeStart, h.rangeEnd, h.usedCount) || '—'}）；采集批次${h.partial ? '超上限（≈），按已采集部分计算' : '完整'}。`,
     `逐条金额：优先取「实扣」，缺失时回退「标价」（行内标「标」）；人民币折算 = 金额 × 充值比例 ${h.rechargeRate ?? '未填充'}${h.missingRate ? '（未填充，无法折算人民币）' : ''}。`,
-    `该模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ（输入 + 输出 tokens）× 1,000,000 = ${fmtRowPrice(h.pricePerM)}${h.pricePerM != null ? `（精确值 ¥${fmtExact(h.pricePerM)}）` : ''}；计算于 ${fmtTs(h.computedAt)}。`,
+    `该模型价格（¥/百万 tokens）= Σ 人民币折算 ÷ Σ 总量 tokens（见「总量」列）× 1,000,000 = ${fmtRowPrice(h.pricePerM)}${h.pricePerM != null ? `（精确值 ¥${fmtExact(h.pricePerM)}）` : ''}；计算于 ${fmtTs(h.computedAt)}。`,
   ]
   const own = Array.isArray(h.records) ? h.records : []
   if (own.length) {
-    viewer.value = { title, algo: algoBase, loading: false, records: own }
+    viewer.value = { title, algo: [...algoBase, ...bucketNote(own)], loading: false, records: own }
     srcLoading = false
     return
   }
@@ -389,6 +419,7 @@ onMounted(() => {
                     <th class="h-model">模型</th>
                     <th class="h-num">输入</th>
                     <th class="h-num">输出</th>
+                    <th class="h-num" title="参与均价分母的有效 token 总量：聚合桶=token_used（含缓存），逐条=输入+输出">总量</th>
                     <th class="h-num">金额</th>
                     <th class="h-num">¥折算</th>
                   </tr>
@@ -402,8 +433,28 @@ onMounted(() => {
                     </td>
                     <td class="c-num">{{ fmtTokens(rec.promptTokens) }}</td>
                     <td class="c-num">{{ fmtTokens(rec.completionTokens) }}</td>
+                    <td
+                      class="c-num"
+                      :class="{ 'is-null': rec.tokens == null }"
+                      :title="rec.tokens != null ? `参与均价分母的总 tokens${rec.granularity === 'bucket' ? '（token_used，含缓存）' : ''}` : '旧档案未保存总量，重新采集后可显示'"
+                    >
+                      {{ rec.tokens == null ? '—' : fmtTokens(rec.tokens) }}<i v-if="rec.granularity === 'bucket'" class="lp" title="服务端聚合桶：只提供总量，输入/输出为 0 属预期">桶</i>
+                    </td>
                     <td class="c-num" :title="rec.amount != null ? fmtExact(rec.amount) : ''">{{ fmtAmount(rec.amount ?? 0) }}<span class="cur">{{ rec.currency ?? '' }}</span></td>
                     <td class="c-num" :class="{ 'is-null': rec.rmb == null }" :title="rec.rmb != null ? `¥${fmtExact(rec.rmb)}` : ''">{{ rec.rmb == null ? '—' : fmtRowPrice(rec.rmb) }}</td>
+                  </tr>
+                  <!-- 方案 A：合计行——总量即均价分母，金额合计即分子，直观反证「输入/输出 0 却有均价」 -->
+                  <tr v-if="!viewer.loading && viewer.records.length" class="sum-row">
+                    <td colspan="2">合计（{{ viewer.records.length }} 条）</td>
+                    <td class="c-num">—</td>
+                    <td class="c-num">—</td>
+                    <td class="c-num" :class="{ 'is-null': viewerTotals?.tokens == null }" :title="viewerTotals?.tokens != null ? `Σ 总量 = ${viewerTotals.tokens} tokens（均价分母）` : '部分记录缺总量字段，无法合计'">
+                      {{ viewerTotals?.tokens == null ? '—' : fmtTokens(viewerTotals.tokens) }}
+                    </td>
+                    <td class="c-num">—</td>
+                    <td class="c-num" :class="{ 'is-null': viewerTotals?.rmb == null }" :title="viewerTotals?.rmb != null ? `Σ 人民币折算 = ¥${fmtExact(viewerTotals.rmb)}（均价分子）` : '部分记录缺金额，无法合计'">
+                      {{ viewerTotals?.rmb == null ? '—' : `¥${fmtAmount(viewerTotals.rmb)}` }}
+                    </td>
                   </tr>
                 </tbody>
               </table>
@@ -681,6 +732,7 @@ onMounted(() => {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: auto;
   padding: 10px 14px 14px;
 }
 .rm-sec {
@@ -730,6 +782,13 @@ onMounted(() => {
 }
 .c-num.is-null {
   opacity: 0.45;
+}
+/* 方案 A：合计行——分母/分子一眼可见 */
+.sum-row td {
+  font-weight: 600;
+  color: var(--text);
+  border-top: 1px solid var(--line);
+  border-bottom: none;
 }
 /* 数据范围列（050）：可点击查看该模型数据来源；050r2 起左对齐 */
 .h-range {

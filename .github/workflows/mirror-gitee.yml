@@ -1,0 +1,60 @@
+# 方案 058：GitHub → Gitee 仓库镜像（含全部 tag），供国内用户检测更新与下载源码包。
+# 一次性配置见 AI_documentation/058_2026_1117_设置页问题交流与版本入口及Gitee镜像更新源方案.md 第 3.3 节。
+# ⚠️ 部署前把 GITEE_REPO 改成你的实际 Gitee 仓库 owner/repo，并在 GitHub Secrets 建 GITEE_TOKEN。
+name: Mirror to Gitee
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '首次同步可勾选：强制覆盖 Gitee 分支与 tag（日常勿勾选）'
+        type: boolean
+        default: false
+
+env:
+  # 与 src/background/updateCheck.ts 的 GITEE_REPO 保持一致
+  GITEE_REPO: shanyuyulai/AI_Relay_Usage_Dashboard
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main with full history and tags
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name "GitHub Actions Mirror"
+          git config --global user.email "actions@github.com"
+
+      - name: Add Gitee remote
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          if [ -z "$GITEE_TOKEN" ]; then
+            echo "::error::Missing GitHub secret GITEE_TOKEN. Create it in Settings > Secrets > Actions."
+            exit 1
+          fi
+          git remote add gitee "https://oauth2:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
+
+      - name: Push main branch
+        if: ${{ !inputs.force }}
+        run: git push gitee HEAD:main
+
+      - name: Push all tags
+        if: ${{ !inputs.force }}
+        run: git push gitee --tags
+
+      - name: Force push main branch (first sync only)
+        if: ${{ inputs.force }}
+        run: git push --force gitee HEAD:main
+
+      - name: Force push all tags (first sync only)
+        if: ${{ inputs.force }}
+        run: git push --force gitee --tags

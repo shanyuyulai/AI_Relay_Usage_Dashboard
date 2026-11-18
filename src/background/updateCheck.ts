@@ -1,21 +1,37 @@
 import { settingsRepo } from '../storage/config'
 
 /**
- * 自动检测更新（方案 051）。
+ * 自动检测更新（方案 051；方案 058 增加 Gitee 国内镜像源）。
  *
- * - 数据源：GitHub Tags API（公开只读，不带凭证、不上传本地数据）。仓库以 tags 标记版本，
- *   不使用 GitHub Releases，因此取标签列表中语义化版本号最大的一个作为「最新版本」。
+ * - 数据源：Gitee 镜像仓库 Tags API 优先（国内可达），不可达时回退 GitHub Tags API；
+ *   两者均为公开只读，不带凭证、不上传本地数据。仓库以 tags 标记版本，
+ *   不使用 Releases，因此取标签列表中语义化版本号最大的一个作为「最新版本」。
  * - 判定：远端最新版本**比本地新**才提醒（逐段数值比较；仅版本号不同但更旧时不提示）。
  * - 节奏：12h 周期 alarm 唤醒 SW 检查；SW 启动也检查，但两次真实网络请求最小间隔 6h。
  * - 提示：系统通知（每版本仅一次，点击打开版本页）+ 极简面板/侧边栏页内横幅（可忽略）。
- * - 不自动下载/安装：点击只打开版本页（tags）由用户手动下载更新。
+ * - 不自动下载/安装：点击只打开命中源的版本页（tags）由用户手动下载更新。
  * - 开关 `aihub.updateCheckEnabled` 默认开启；插件整体停用时不建 alarm、不检查。
  */
 
 export const REPO = 'shanyuyulai/AI_Relay_Usage_Dashboard'
-/** 版本页（tags，列出所有版本）：横幅 / 通知 / 「打开版本页」统一跳这里。 */
+/** GitHub 版本页（tags，列出所有版本）：Gitee 不可用时的回退地址。 */
 export const TAGS_URL = `https://github.com/${REPO}/tags`
 const API_TAGS = `https://api.github.com/repos/${REPO}/tags?per_page=100`
+/**
+ * Gitee 镜像（方案 058）：与 .github/workflows/mirror-gitee.yml 的 GITEE_REPO 保持一致。
+ * Gitee 仓库尚不存在时该源会失败并自动回退 GitHub，不影响主链路。
+ */
+export const GITEE_REPO = 'shanyuyulai/AI_Relay_Usage_Dashboard'
+export const GITEE_TAGS_URL = `https://gitee.com/${GITEE_REPO}/tags`
+const API_GITEE_TAGS = `https://gitee.com/api/v5/repos/${GITEE_REPO}/tags?per_page=100`
+
+/** 命中源：gitee=国内镜像，github=原始仓库，null=尚未成功检查。 */
+export type UpdateSource = 'gitee' | 'github'
+const SOURCES: Array<{ id: UpdateSource; api: string; tagsUrl: string; accept?: string }> = [
+  { id: 'gitee', api: API_GITEE_TAGS, tagsUrl: GITEE_TAGS_URL },
+  { id: 'github', api: API_TAGS, tagsUrl: TAGS_URL, accept: 'application/vnd.github+json' },
+]
+const SOURCE_TIMEOUT_MS = 5000
 export const UPDATE_CHECK_ALARM = 'aihub-update-check'
 const CHECK_PERIOD_MIN = 720 // 12 小时
 const MIN_CHECK_GAP_MS = 6 * 3600 * 1000 // 两次真实网络检查最小间隔（节流）
@@ -25,6 +41,7 @@ const LAST_CHECK_KEY = 'aihub.updateLastCheckAt'
 const LATEST_KEY = 'aihub.updateLatestVersion'
 const LATEST_URL_KEY = 'aihub.updateLatestUrl'
 const LATEST_PUBLISHED_KEY = 'aihub.updateLatestPublishedAt'
+const SOURCE_KEY = 'aihub.updateSource'
 const NOTIFIED_KEY = 'aihub.updateNotifiedVersion'
 const DISMISSED_KEY = 'aihub.updateDismissedVersion'
 
@@ -87,24 +104,34 @@ export interface UpdateCheckStatus {
   /** 用户已忽略当前最新版本（横幅不显示，状态仍如实返回）。 */
   dismissed: boolean
   lastCheckedAt: number | null
-  /** 版本页地址（tags，列出所有版本）。 */
+  /** 版本页地址（tags，列出所有版本）：随命中源切换。 */
   tagsUrl: string
+  /** 命中源：gitee / github / null（方案 058）。 */
+  source: UpdateSource | null
+}
+
+/** 只接受 github.com / gitee.com 的 tags 页地址，清洗旧版 releases 链接或其他来源。 */
+function safeTagsUrl(url: string | null | undefined): string | null {
+  if (!url) return null
+  return /^https:\/\/(?:github|gitee)\.com\/[^/]+\/[^/]+\/tags(?:[/?#]|$)/.test(url) ? url : null
 }
 
 async function readStatus(): Promise<UpdateCheckStatus> {
-  const [enabled, last, latest, url, published, dismissed] = await Promise.all([
+  const [enabled, last, latest, url, published, srcRaw, dismissed] = await Promise.all([
     isUpdateCheckEnabled().catch(() => false),
     settingsRepo.get<number>(LAST_CHECK_KEY).catch(() => null),
     settingsRepo.get<string>(LATEST_KEY).catch(() => null),
     settingsRepo.get<string>(LATEST_URL_KEY).catch(() => null),
     settingsRepo.get<number>(LATEST_PUBLISHED_KEY).catch(() => null),
+    settingsRepo.get<string>(SOURCE_KEY).catch(() => null),
     settingsRepo.get<string>(DISMISSED_KEY).catch(() => null),
   ])
   const cur = currentVersion()
   // 口径：远端最新版本比本地新才提醒（0.5.0 < 0.5.1 这类「远端更旧」不提示）
   const hasUpdate = !!latest && isNewerVersion(latest, cur)
-  // 兼容清洗：旧版逻辑存过 releases 页地址（…/releases/tag/x.y.z），非 tags 地址一律回退版本页
-  const safeUrl = url && /\/tags(\/|$|\?)/.test(url) ? url : TAGS_URL
+  const source: UpdateSource | null = srcRaw === 'gitee' || srcRaw === 'github' ? srcRaw : null
+  const safeUrl = safeTagsUrl(url)
+  const tagsUrl = safeUrl ?? (source === 'gitee' ? GITEE_TAGS_URL : TAGS_URL)
   return {
     enabled,
     currentVersion: cur,
@@ -114,7 +141,8 @@ async function readStatus(): Promise<UpdateCheckStatus> {
     hasUpdate,
     dismissed: hasUpdate && dismissed === latest,
     lastCheckedAt: typeof last === 'number' ? last : null,
-    tagsUrl: TAGS_URL,
+    tagsUrl,
+    source,
   }
 }
 
@@ -160,36 +188,54 @@ export async function checkForUpdate(force = false): Promise<UpdateCheckStatus> 
 
   let latest: string | null = null
   let url: string | null = null
-  let published: number | null = null
-  try {
-    const res = await fetch(API_TAGS, { headers: { Accept: 'application/vnd.github+json' } })
-    if (res.ok) {
+  let source: UpdateSource | null = null
+  // Tags API 不含发布日期，published 仅为状态兼容字段
+  const published: number | null = null
+
+  // 058：Gitee 优先（国内可达），失败/超时回退 GitHub；两源都失败才静默保留旧状态
+  for (const s of SOURCES) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), SOURCE_TIMEOUT_MS)
+    try {
+      const res = await fetch(s.api, {
+        signal: controller.signal,
+        ...(s.accept ? { headers: { Accept: s.accept } } : {}),
+      })
+      if (!res.ok) continue
       // Tags API 返回数组（不含日期/发布说明），取语义化版本号最大的标签为「最新版本」
       const arr = (await res.json()) as unknown
-      if (Array.isArray(arr)) {
-        let bestVer: number[] | null = null
-        for (const item of arr) {
-          const name = (item as { name?: unknown })?.name
-          if (typeof name !== 'string' || !name.trim()) continue
-          const v = parseVersion(name)
-          if (!v) continue
-          if (!bestVer || compareVersions(v, bestVer) > 0) {
-            bestVer = v
-            latest = name.trim()
-          }
+      if (!Array.isArray(arr)) continue
+      let bestVer: number[] | null = null
+      let bestName: string | null = null
+      for (const item of arr) {
+        const name = (item as { name?: unknown })?.name
+        if (typeof name !== 'string' || !name.trim()) continue
+        const v = parseVersion(name)
+        if (!v) continue
+        if (!bestVer || compareVersions(v, bestVer) > 0) {
+          bestVer = v
+          bestName = name.trim()
         }
       }
-      if (latest) url = TAGS_URL // tags 无单独页面地址，统一跳版本页
+      if (bestName) {
+        latest = bestName
+        url = s.tagsUrl
+        source = s.id
+        break
+      }
+    } catch {
+      /* 当前源不可达/超时：继续尝试下一源 */
+    } finally {
+      clearTimeout(timer)
     }
-  } catch {
-    /* GitHub 不可达：静默，下轮再试 */
   }
 
   await settingsRepo.set(LAST_CHECK_KEY, Date.now())
-  if (latest) {
+  if (latest && source) {
     await settingsRepo.set(LATEST_KEY, latest)
-    await settingsRepo.set(LATEST_URL_KEY, url) // 允许 null：回退到 TAGS_URL
+    await settingsRepo.set(LATEST_URL_KEY, url)
     await settingsRepo.set(LATEST_PUBLISHED_KEY, published)
+    await settingsRepo.set(SOURCE_KEY, source)
     const cur = currentVersion()
     if (isNewerVersion(latest, cur) && (await isUpdateCheckEnabled())) {
       const notified = await settingsRepo.get<string>(NOTIFIED_KEY).catch(() => null)
@@ -219,6 +265,7 @@ export function setupUpdateCheck(): void {
           settingsRepo.remove(LATEST_KEY),
           settingsRepo.remove(LATEST_URL_KEY),
           settingsRepo.remove(LATEST_PUBLISHED_KEY),
+          settingsRepo.remove(SOURCE_KEY),
           settingsRepo.remove(NOTIFIED_KEY),
           settingsRepo.remove(DISMISSED_KEY),
         ])
