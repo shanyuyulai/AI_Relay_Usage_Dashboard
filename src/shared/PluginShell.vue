@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, type Component } from 'vue'
 import { send } from '../core/messaging/client'
-import type { ExportConfig } from '../core/messaging/protocol'
+import type { ExportSessionMeta, ExportChunkResponse } from '../core/messaging/protocol'
 import { PLUGIN_ENABLED_CHANGED, type PluginState } from './pluginState'
 
 /** compact：popup 专用（方案 041）——确认状态期间只显示一行占位，卡片改用紧凑间距。options / sidepanel 不传。 */
@@ -39,14 +39,31 @@ async function openSettings(): Promise<void> {
 async function exportBackup(): Promise<void> {
   busy.value = true
   try {
-    const data = await send<ExportConfig>('EXPORT_CONFIG', {}, 120_000)
-    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
+    // 方案 060：导出统一走分块（START 只返回轻量 meta），避免大备份撞 64MiB 消息上限。
+    const meta = await send<ExportSessionMeta>('EXPORT_CONFIG_START', {}, 120_000)
+    const parts: string[] = []
+    try {
+      for (let i = 0; i < meta.totalChunks; i++) {
+        const chunk = await send<ExportChunkResponse>('EXPORT_CONFIG_CHUNK', { sessionId: meta.sessionId, index: i }, 60_000)
+        parts.push(chunk.data)
+      }
+    } finally {
+      await send('EXPORT_CONFIG_END', { sessionId: meta.sessionId }, 30_000).catch(() => {})
+    }
+    const json = parts.join('')
+    const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }))
     const a = document.createElement('a')
     a.href = url
     a.download = `aihub-backup-${new Date().toISOString().slice(0, 10)}.json`
     a.click()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
-  } catch (e) { error.value = e instanceof Error ? e.message : '备份导出失败' }
+  } catch (e) {
+    // 固定文案，不透传跨层异常原文（P0-1）
+    const kind = (e as { kind?: string })?.kind
+    error.value = kind === 'SESSION_INVALID' ? '备份传输已失效，请重新发起'
+      : kind === 'BACKUP_TOO_LARGE' ? '备份文件超出上限，请调小数据保留天数后重试'
+        : '备份导出失败'
+  }
   finally { busy.value = false }
 }
 function listener(message: { type?: string; state?: PluginState }): void {

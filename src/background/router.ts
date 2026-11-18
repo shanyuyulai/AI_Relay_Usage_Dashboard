@@ -112,7 +112,13 @@ export function registerMessageRouter(): void {
     const release = acquireKeepAlive()
     Promise.resolve()
       .then(() => {
-        const control = ['GET_PLUGIN_ENABLED', 'SET_PLUGIN_ENABLED', 'EXPORT_CONFIG'].includes(req.type)
+        // 备份分块消息（方案 060）与配置控制类同属 control：避开 runPluginTask 并发闸，
+        // 防止大文件多轮往返被采集任务阻塞或互相抢占。
+        const control = [
+          'GET_PLUGIN_ENABLED', 'SET_PLUGIN_ENABLED', 'EXPORT_CONFIG',
+          'EXPORT_CONFIG_START', 'EXPORT_CONFIG_CHUNK', 'EXPORT_CONFIG_END',
+          'IMPORT_CONFIG_START', 'IMPORT_CONFIG_CHUNK', 'IMPORT_CONFIG_COMMIT', 'BACKUP_ABORT',
+        ].includes(req.type)
         return control ? handler(req.payload, req) : runPluginTask(() => handler(req.payload, req))
       })
       .then((data) => {

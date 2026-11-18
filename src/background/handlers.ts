@@ -29,6 +29,7 @@ import {
   authStateRepo,
   exportAll,
   importAll,
+  assertNoForbiddenKeys,
 } from '../storage'
 import { applyCorsRules, refreshCorsRules } from './corsRules'
 import { getLabBearerAutoRefresh, setLabBearerAutoRefresh } from '../storage/autoRefreshLabConfig'
@@ -122,6 +123,11 @@ import type {
   GetModelAvgSourceResponse,
   GetSiteModelAvgHistoryPayload,
   GetSiteModelAvgHistoryResponse,
+  ExportSessionMeta,
+  ExportChunkPayload,
+  ExportChunkResponse,
+  ImportSessionStartPayload,
+  ImportChunkPayload,
 } from '../core/messaging/protocol'
 import type { Req } from '../core/messaging/protocol'
 import type { SiteConfig, SiteCollectionProfile, AccountSemantics, ModelAvgPrice, ModelAvgRawRecord } from '../shared/types'
@@ -134,6 +140,8 @@ import { classifySite, type SiteFingerprint, type EndpointSignal } from '../core
 import { discoverNetworkRequests, type NetDiscoveryRequest } from './netDiscovery'
 import { checkForUpdate, dismissUpdate, getUpdateStatus, reconcileUpdateCheckAlarm, setUpdateCheckEnabled } from './updateCheck'
 import { effectiveSiteCurrency } from '../shared/settlement'
+import { estimateUtf8Bytes, sliceBackupText } from '../shared/backupTransfer'
+import { createSession, setExportParts, getChunk, putChunk, joinImport, abort } from './backupSession'
 
 type Handler = (payload: any, req: Req) => Promise<unknown>
 
@@ -1112,6 +1120,9 @@ export const handlers: Record<string, Handler> = {
         model: r.model,
         promptTokens: r.promptTokens ?? 0,
         completionTokens: r.completionTokens ?? 0,
+        // 方案 A：与均价档案投影同构，供「逐条明细」弹窗展示同一套总量列
+        tokens: Number.isFinite(r.tokens) && r.tokens > 0 ? r.tokens : 0,
+        granularity: r.granularity === 'bucket' ? 'bucket' : 'call',
         amount,
         listPrice: r.actualCost == null && r.cost != null,
         currency: cur,
@@ -1391,6 +1402,83 @@ export const handlers: Record<string, Handler> = {
   // 全量备份导出（v2：站点 + 采集数据 + 设置）；零凭证/私密（红线 P0-2 排除 credentials/usageCache）
   async EXPORT_CONFIG() {
     return exportAll()
+  },
+
+  // ── 全量备份分块传输（方案 060）────────────────────────────
+  // 导出 START：exportAll → 序列化 → 切片入会话，只返回轻量 meta（大数据不进消息通道）。
+  async EXPORT_CONFIG_START(): Promise<ExportSessionMeta> {
+    const config = await exportAll()
+    const json = JSON.stringify(config)
+    const totalBytes = estimateUtf8Bytes(json)
+    const parts = sliceBackupText(json)
+    const sessionId = createSession('export', totalBytes, parts.length)
+    setExportParts(sessionId, parts)
+    return {
+      sessionId,
+      totalChunks: parts.length,
+      totalChars: json.length,
+      totalBytes,
+      version: config.version,
+      siteCount: config.sites.length,
+      exportedAt: config.exportedAt,
+      appVersion: config.appVersion,
+    }
+  },
+
+  // 导出 CHUNK：按 index 取块；SESSION_INVALID / 越界由 backupSession 抛出带 kind 的错误。
+  async EXPORT_CONFIG_CHUNK(payload: ExportChunkPayload): Promise<ExportChunkResponse> {
+    const { data, done } = getChunk(payload.sessionId, payload.index)
+    return { sessionId: payload.sessionId, index: payload.index, data, done }
+  },
+
+  // 导出 END：释放会话（幂等）。
+  async EXPORT_CONFIG_END(payload: { sessionId: string }): Promise<{ ok: true }> {
+    abort(payload.sessionId)
+    return { ok: true }
+  },
+
+  // 通用释放：导入中途失败时兜底释放会话（幂等，无 kind 校验）。
+  async BACKUP_ABORT(payload: { sessionId: string }): Promise<{ ok: true }> {
+    abort(payload.sessionId)
+    return { ok: true }
+  },
+
+  // 导入 START：只建会话，不传数据（权限请求已在 UI 同步手势内完成）。
+  async IMPORT_CONFIG_START(payload: ImportSessionStartPayload): Promise<{ sessionId: string }> {
+    const sessionId = createSession('import', payload.totalBytes, payload.totalChunks)
+    return { sessionId }
+  },
+
+  // 导入 CHUNK：逐块写入，返回已收块数。
+  async IMPORT_CONFIG_CHUNK(payload: ImportChunkPayload): Promise<{ received: number }> {
+    return { received: putChunk(payload.sessionId, payload.index, payload.data) }
+  },
+
+  // 导入 COMMIT：拼接 → parse → P0 安全校验 → importAll → 运行时重建；异常走 fatalError 文案。
+  async IMPORT_CONFIG_COMMIT(payload: { sessionId: string }): Promise<ImportResult> {
+    try {
+      const json = joinImport(payload.sessionId)
+      const config = JSON.parse(json) as ExportConfig
+      assertNoForbiddenKeys(config)
+      const result = await importAll(config)
+      await reconcilePluginRuntime()
+      return result
+    } catch (e) {
+      if (e instanceof Error && 'kind' in e && (e as { kind?: string }).kind === 'SESSION_INVALID') throw e
+      console.error('[AI Relay] IMPORT_CONFIG_COMMIT 致命错误', e)
+      return {
+        imported: 0,
+        updated: 0,
+        skipped: [],
+        skippedByReason: {},
+        data: {},
+        operationId: crypto.randomUUID(),
+        fatalError:
+          '备份解析或校验失败，请确认文件完整且未被篡改后重试',
+      }
+    } finally {
+      abort(payload.sessionId)
+    }
   },
 
   // 全量还原（v1 仅站点 / v2 含采集数据 + 设置）。委托 backup.importAll：

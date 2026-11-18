@@ -379,8 +379,10 @@ export interface UpdateCheckStatusResponse {
   hasUpdate: boolean
   dismissed: boolean
   lastCheckedAt: number | null
-  /** 版本页地址（tags，列出所有版本）。 */
+  /** 版本页地址（tags，列出所有版本）：随命中源切换。 */
   tagsUrl: string
+  /** 命中源：gitee（国内镜像）/ github / null（方案 058）。 */
+  source: 'gitee' | 'github' | null
 }
 export interface UpdateCheckEnabledPayload {
   enabled: boolean
@@ -621,6 +623,41 @@ export interface ResetAllDataPayload {
 }
 export interface ResetDataResponse {
   deleted: { snapshots: number; dailyStats: number; captures: number }
+}
+
+// ── 全量备份分块传输（方案 060）────────────────────────────
+/** 导出会话元信息：START 返回，UI 据此循环取块；siteCount/version 供原 toast 展示。 */
+export interface ExportSessionMeta {
+  sessionId: string
+  totalChunks: number
+  totalChars: number
+  totalBytes: number
+  version: number
+  siteCount: number
+  exportedAt: number
+  appVersion?: string
+}
+/** EXPORT_CONFIG_CHUNK 的载荷与回包。 */
+export interface ExportChunkPayload {
+  sessionId: string
+  index: number
+}
+export interface ExportChunkResponse {
+  sessionId: string
+  index: number
+  data: string
+  done: boolean
+}
+/** 导入会话：START 仅带元数据（不含数据），CHUNK 逐块推送，COMMIT 落库。 */
+export interface ImportSessionStartPayload {
+  totalChunks: number
+  totalChars: number
+  totalBytes: number
+}
+export interface ImportChunkPayload {
+  sessionId: string
+  index: number
+  data: string
 }
 
 export type { CustomCaptureRecord, DailyStat, DiagnosticEntry, UsageRecordBatch }

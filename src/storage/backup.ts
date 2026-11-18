@@ -96,7 +96,7 @@ const FORBIDDEN_KEY = /^(cookie|token|authorization|session|password|secret|apik
 // - fieldFingerprint：DiagnosticEntry 脱敏指纹，按设计只存字段路径+类型，绝不存值（P0-1/P0-4），
 //   其 key 是用户站点的 JSON 顶层字段名，本身可能是 session/token 等；扫描器看到 key 即抛错是误报。
 const SKIP_SUBTREE_KEYS = new Set(['json', 'fieldFingerprint'])
-function assertNoForbiddenKeys(value: unknown, path = ''): void {
+export function assertNoForbiddenKeys(value: unknown, path = ''): void {
   if (Array.isArray(value)) {
     value.forEach((v, i) => assertNoForbiddenKeys(v, `${path}[${i}]`))
   } else if (value && typeof value === 'object') {

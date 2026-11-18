@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import SiteAvatar from '../shared/SiteAvatar.vue'
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { send, MessagingError } from '../core/messaging/client'
-import type { ExportConfig, ImportResult, ReorderSitesResponse } from '../core/messaging/protocol'
+import type { ExportConfig, ImportResult, ReorderSitesResponse, ExportSessionMeta, ExportChunkResponse } from '../core/messaging/protocol'
+import { estimateUtf8Bytes, sliceBackupText, shouldChunk, BACKUP_MAX_BYTES } from '../shared/backupTransfer'
 import type { SiteConfig, SiteStatus, CustomCaptureRecord, DiagnosticEntry, SiteCollectionProfile } from '../shared/types'
 import type { ProbeResult } from '../content/probe'
 import type { NetDiscoveryRequest } from '../background/netDiscovery'
@@ -26,6 +27,9 @@ function safeUiError(_e: unknown): string {
     if (_e.kind === 'TIMEOUT') return '请求超时，请稍后重试'
     if (_e.kind === 'NO_HANDLER') return '当前操作不可用'
     if (_e.kind === 'BAD_REQUEST') return '请求参数无效'
+    // 方案 060：分块传输的固定 kind 文案（不透传原文）
+    if (_e.kind === 'SESSION_INVALID') return '备份传输已失效，请重新发起'
+    if (_e.kind === 'BACKUP_TOO_LARGE') return '备份文件超出上限，请调小数据保留天数后重试'
   }
   // 本地或跨层错误一律回退到通用文案；导入/解析错误的固定文案由调用方在 catch 旁显式传入
   return '操作失败，请检查站点状态后重试'
@@ -97,8 +101,18 @@ const systemDark = ref(helpMediaQuery ? helpMediaQuery.matches : false)
 const onSystemThemeChange = (e: MediaQueryListEvent) => {
   systemDark.value = e.matches
 }
-const groupQrVisible = ref(false)
+// 058：顶部「问题•交流」hover 弹层（原交流群二维码并入此处，三个信息行：提示 / 群号 / 二维码）
+const feedbackQrVisible = ref(false)
 const groupQrUrl = chrome.runtime.getURL('qrcode_1102575547.png')
+
+// 058：顶部版本号来自 manifest，与后台 updateCheck.currentVersion() 同源；点击定位到设置页「更新检测」
+const pluginVersion = chrome.runtime.getManifest().version
+const dataExplorerRef = ref<InstanceType<typeof DataExplorer> | null>(null)
+async function gotoUpdateSection() {
+  if (activeTab.value !== 'settings') activeTab.value = 'settings'
+  await nextTick()
+  dataExplorerRef.value?.focusUpdateSection()
+}
 
 // 排序开关：临时编辑态，默认关闭、不持久化（GPT R1：排序结果已落库，无需持久化开关）
 const sortMode = ref(false)
@@ -469,15 +483,27 @@ async function discoverViaNetwork(site: SiteConfig) {
 
 async function exportConfig() {
   try {
-    const config = await send<ExportConfig>('EXPORT_CONFIG')
-    const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' })
+    // 方案 060：导出统一走分块——页面无法在请求前预估导出体积，START 永远只返回轻量 meta。
+    const meta = await send<ExportSessionMeta>('EXPORT_CONFIG_START', {}, 120_000)
+    const parts: string[] = []
+    try {
+      for (let i = 0; i < meta.totalChunks; i++) {
+        const chunk = await send<ExportChunkResponse>('EXPORT_CONFIG_CHUNK', { sessionId: meta.sessionId, index: i }, 60_000)
+        parts.push(chunk.data)
+      }
+    } finally {
+      // 正常/异常/超时都释放会话（幂等）；失败时不留悬挂会话
+      await send('EXPORT_CONFIG_END', { sessionId: meta.sessionId }, 30_000).catch(() => {})
+    }
+    const json = parts.join('')
+    const blob = new Blob([json], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
     a.download = `ai-hub-backup-${new Date().toISOString().slice(0, 10)}.json`
     a.click()
     URL.revokeObjectURL(url)
-    showToast(`全量备份已导出（v${config.version}，${config.sites.length} 个站点，不含任何凭证）`)
+    showToast(`全量备份已导出（v${meta.version}，${meta.siteCount} 个站点，不含任何凭证）`)
   } catch (e) {
     showToast(safeUiError(e))
   }
@@ -490,6 +516,8 @@ function triggerImport() {
 // 导入流程拆两步：选文件→解析暂存→用户点"授权并导入"→request 权限→IMPORT_CONFIG
 // （MV3：chrome.permissions.request 须在用户手势同步路径中，不能在 await file.text() 之后）
 const pendingImport = ref<ExportConfig | null>(null)
+/** 备份文件原文（方案 060）：分块上传时按字符切片，JSON.parse 后原始文本会丢失，故单独暂存。 */
+const pendingRaw = ref<string>('')
 const pendingOrigins = computed(() => {
   if (!pendingImport.value) return []
   return pendingImport.value.sites
@@ -509,7 +537,8 @@ async function handleFile(e: Event) {
     }
     // 只暂存，不在此处请求权限（异步 file.text() 后用户手势已丢失）
     pendingImport.value = config
-    console.info('[AI Relay] 导入：文件解析成功', { siteN: config.sites.length })
+    pendingRaw.value = text
+    console.info('[AI Relay] 导入：文件解析成功', { siteN: config.sites.length, bytes: estimateUtf8Bytes(text) })
   } catch {
     showToast(ERR_INVALID_CONFIG)
   } finally {
@@ -517,11 +546,35 @@ async function handleFile(e: Event) {
   }
 }
 
-// 发送 IMPORT_CONFIG（超时放宽到 60s，应对全量还原的大事务）。
-// 不自动重试：导入为单事务原子且幂等，超时后用户可手动重导；自动重试会触发重复事务（虽幂等但浪费）。
+// 发送导入（方案 060）：按序列化大小确定性分流——小包走原单发，大包走分块。
+// 权限请求已在 confirmImport 同步手势内完成；这里只搬运数据。
+// 不自动重试：导入为单事务原子且幂等，超时后用户可手动重导。
 async function sendImport(cfg: ExportConfig): Promise<ImportResult> {
-  console.info('[AI Relay] 导入：发送 IMPORT_CONFIG（超时 60s）')
-  return send<ImportResult>('IMPORT_CONFIG', { config: cfg }, 60_000)
+  const raw = pendingRaw.value
+  const bytes = estimateUtf8Bytes(raw)
+  if (!shouldChunk(bytes)) {
+    console.info('[AI Relay] 导入：单发 IMPORT_CONFIG', { bytes })
+    return send<ImportResult>('IMPORT_CONFIG', { config: cfg }, 60_000)
+  }
+  if (bytes > BACKUP_MAX_BYTES) {
+    throw new MessagingError('BACKUP_TOO_LARGE', '备份文件超出上限')
+  }
+  const parts = sliceBackupText(raw)
+  console.info('[AI Relay] 导入：分块上传', { bytes, chunks: parts.length })
+  const { sessionId } = await send<{ sessionId: string }>('IMPORT_CONFIG_START', {
+    totalChunks: parts.length,
+    totalChars: raw.length,
+    totalBytes: bytes,
+  }, 60_000)
+  try {
+    for (let i = 0; i < parts.length; i++) {
+      await send('IMPORT_CONFIG_CHUNK', { sessionId, index: i, data: parts[i] }, 60_000)
+    }
+    return await send<ImportResult>('IMPORT_CONFIG_COMMIT', { sessionId }, 120_000)
+  } finally {
+    // COMMIT 内部已 abort；此处兜底释放（幂等），防中途失败留悬挂会话
+    await send('BACKUP_ABORT', { sessionId }, 30_000).catch(() => {})
+  }
 }
 
 async function confirmImport() {
@@ -546,6 +599,7 @@ async function confirmImport() {
     if (res.fatalError) {
       showToast(`导入失败：${res.fatalError}`)
       pendingImport.value = null
+      pendingRaw.value = ''
       return
     }
     const parts: string[] = []
@@ -566,6 +620,7 @@ async function confirmImport() {
     msg += '。导入后请重新登录各站点以恢复采集。'
     showToast(msg)
     pendingImport.value = null
+    pendingRaw.value = ''
     await loadSites()
   } catch (e) {
     // 仅记录固定 kind（不记录 message，避免泄露内部细节）；完整堆栈见控制台
@@ -577,6 +632,7 @@ async function confirmImport() {
 
 function cancelImport() {
   pendingImport.value = null
+  pendingRaw.value = ''
 }
 
 function statusText(site: SiteConfig): string {
@@ -825,17 +881,19 @@ onUnmounted(() => {
         >{{ dashboardTabLabel }}</button>
       </nav>
       <div class="topbar-actions">
-        <a
-          class="btn feedback-btn"
-          href="https://docs.qq.com/sheet/DZG1GaENEc2pFYVJy?tab=BB08J2"
-          target="_blank"
-          rel="noopener noreferrer"
-          title="打开问题反馈表"
-        >📝 问题反馈</a>
-        <div class="group-wrap" @mouseenter="groupQrVisible = true" @mouseleave="groupQrVisible = false">
-          <button class="btn group-btn" title="加入 QQ 交流群（鼠标悬停显示二维码）">👥 交流群：1102575547</button>
-          <div v-if="groupQrVisible" class="group-pop" @mouseenter="groupQrVisible = true" @mouseleave="groupQrVisible = false">
-            <img :src="groupQrUrl" alt="AI Hub 插件交流群二维码" class="group-qr-img" />
+        <button class="btn version-btn" title="查看版本与更新检测" @click="gotoUpdateSection">版本：{{ pluginVersion }}</button>
+        <div class="group-wrap" @mouseenter="feedbackQrVisible = true" @mouseleave="feedbackQrVisible = false">
+          <a
+            class="btn feedback-btn"
+            href="https://docs.qq.com/sheet/DZG1GaENEc2pFYVJy?tab=BB08J2"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="打开问题反馈表（鼠标悬停查看交流群二维码）"
+          >📝 问题•交流</a>
+          <div v-if="feedbackQrVisible" class="group-pop" @mouseenter="feedbackQrVisible = true" @mouseleave="feedbackQrVisible = false">
+            <small class="qr-tip">点击当前按钮跳转到问题反馈页面</small>
+            <div class="qr-title">👥 交流群：1102575547</div>
+            <img :src="groupQrUrl" alt="AI 中转站用量看板交流群二维码" class="group-qr-img" />
           </div>
         </div>
         <button class="btn help-btn" title="查看使用说明" @click="openHelp">❔ 使用说明</button>
@@ -1121,7 +1179,7 @@ onUnmounted(() => {
         </div>
       </template>
 
-      <DataExplorer :sites="sites" />
+      <DataExplorer ref="dataExplorerRef" :sites="sites" />
       </template>
 
       <template v-else>
@@ -1871,12 +1929,17 @@ body {
   gap: 8px;
   margin-left: auto;
 }
-.group-btn {
-  white-space: nowrap;
-}
 .feedback-btn {
   white-space: nowrap;
   text-decoration: none;
+}
+/* 058：版本号入口（次要视觉，点击定位到更新检测） */
+.version-btn {
+  white-space: nowrap;
+  color: var(--sub);
+}
+.version-btn:hover {
+  color: var(--text);
 }
 .tabs {
   display: inline-flex;
@@ -1954,6 +2017,19 @@ body {
   align-items: center;
   gap: 4px;
   width: 300px;
+}
+/* 058：三行弹层——提示 / 群号 / 二维码 */
+.qr-tip {
+  color: var(--sub);
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: center;
+}
+.qr-title {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
 }
 .group-qr-img {
   display: block;
